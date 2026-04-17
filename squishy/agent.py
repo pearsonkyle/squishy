@@ -144,6 +144,7 @@ class Agent:
                 if completion.text:
                     self.messages.append({"role": "assistant", "content": completion.text})
                 if self.display:
+                    self.display.stats.tokens = tokens
                     self.display.summary(turn, time.monotonic() - start)
                 result.success = True
                 result.final_text = completion.text
@@ -205,6 +206,7 @@ class Agent:
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:
             self.display.warn(msg)
+            self.display.stats.tokens = tokens
             self.display.summary(self.config.max_turns, time.monotonic() - start)
         result.error = msg
         result.turns_used = self.config.max_turns

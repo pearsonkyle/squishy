@@ -170,9 +170,14 @@ class Client:
         text_parts: list[str] = []
         tc_buf: dict[int, dict[str, str]] = {}
         finish_reason = ""
- 
+        usage: dict[str, int] = {}
+
         async for chunk in stream:
             if not chunk.choices:
+                # Some providers send a final chunk with usage but no choices.
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = _usage_dict(chunk_usage)
                 continue
             delta = chunk.choices[0].delta
             content = getattr(delta, "content", None)
@@ -193,7 +198,11 @@ class Client:
                     slot["arguments"] += tc.function.arguments
             if chunk.choices[0].finish_reason:
                 finish_reason = chunk.choices[0].finish_reason
- 
+            # Capture usage from the final chunk if the provider includes it.
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = _usage_dict(chunk_usage)
+
         calls = [
             _parse_tool_call(
                 tc_buf[i]["id"] or f"call_{i}",
@@ -206,6 +215,7 @@ class Client:
             text="".join(text_parts),
             tool_calls=calls,
             finish_reason=finish_reason,
+            usage=usage,
         )
  
  

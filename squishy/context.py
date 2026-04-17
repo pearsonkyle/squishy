@@ -131,7 +131,7 @@ def _index_header(cwd: str) -> str:
     Silently returns empty string when no `.squishy/index.json` exists.
     """
     try:
-        from squishy.index.store import load_meta, load_index
+        from squishy.index.store import load_index, load_meta
     except Exception:  # noqa: BLE001
         return ""
     meta = load_meta(cwd)

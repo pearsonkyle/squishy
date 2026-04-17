@@ -19,7 +19,7 @@ class Symbol:
     start_line: int
     end_line: int
     docstring: str = ""
-    children: list["Symbol"] | None = None
+    children: list[Symbol] | None = None
  
  
 def _end_line(node: ast.AST, fallback: int) -> int:
