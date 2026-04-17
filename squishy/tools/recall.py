@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
  
-from squishy.index.model import Index, Node
+from squishy.index.model import Node
 from squishy.index.store import load_index
 from squishy.tools.base import Tool, ToolContext, ToolResult
  

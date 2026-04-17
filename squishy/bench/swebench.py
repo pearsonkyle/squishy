@@ -19,6 +19,7 @@ from __future__ import annotations
  
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Any
  
@@ -137,6 +138,7 @@ async def _git(args: list[str], *, cwd: str | Path | None = None) -> tuple[int, 
     proc = await asyncio.create_subprocess_exec(
         "git", *args,
         cwd=str(cwd) if cwd else None,
+        env=os.environ.copy(),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

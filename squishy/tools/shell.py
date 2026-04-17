@@ -3,6 +3,7 @@
 from __future__ import annotations
  
 import asyncio
+import os
 import shutil
 from typing import Any
  
@@ -44,6 +45,7 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         proc = await asyncio.create_subprocess_exec(
             *exec_args,
             cwd=exec_cwd,
+            env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
