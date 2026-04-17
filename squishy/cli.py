@@ -38,6 +38,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--edits", action="store_true", help="Start in edits mode (default)")
     p.add_argument("--yolo", action="store_true", help="Start in yolo mode (no prompts)")
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
+    p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
     p.add_argument("--thinking", action="store_true", help="Allow <think> blocks")
     p.add_argument("--message", "-m", help="Non-interactive: send one message, print result, exit")
     p.add_argument("--init", action="store_true", help="Build .squishy/index.json before the REPL")
@@ -66,6 +67,8 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.permission_mode = "edits"
     if args.no_sandbox:
         cfg.use_sandbox = False
+    if args.sandbox:
+        cfg.use_sandbox = True
     if args.thinking:
         cfg.thinking = True
     if args.init:
@@ -124,7 +127,6 @@ async def _amain() -> None:
             await _run_init(cfg, client, display, summaries=cfg.index_summaries)
  
         async def prompt_fn(tool: Tool, args_: dict) -> bool:
-            display.warn(f"{tool.name}: {_summarize(tool, args_)}")
             try:
                 reply = await asyncio.to_thread(input, "  approve? [y/N] ")
             except (EOFError, KeyboardInterrupt):
@@ -208,13 +210,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             continue
  
         await _run_one(cfg, client, display, prompt_fn, line, timeout)
- 
- 
-def _summarize(tool: Tool, args: dict) -> str:
-    if tool.name == "run_command":
-        cmd = str(args.get("command", ""))
-        return cmd[:120] + ("…" if len(cmd) > 120 else "")
-    return str(args)[:120]
+
  
  
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:

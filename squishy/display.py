@@ -46,10 +46,34 @@ class Display:
     def turn_header(self, turn: int, max_turns: int, tool_name: str, brief: str) -> None:
         icon = ICONS.get(tool_name, "•")
         self.console.print(f"[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]")
+
+    def command_line(self, command: str) -> None:
+        """Show the full shell command on its own line (markup-safe)."""
+        t = Text(f"! {command}")
+        t.stylize("yellow")
+        self.console.print(t)
  
     def tool_result(self, success: bool, display: str, duration_ms: float) -> None:
         mark = "[green]✓[/]" if success else "[red]✗[/]"
         self.console.print(f"  {mark} {display} [dim]({duration_ms:.1f}ms)[/]")
+
+    def command_output(self, data: dict[str, object]) -> None:
+        """Show a compact preview of command stdout/stderr."""
+        max_lines = 30
+        stdout = str(data.get("stdout", "")).rstrip()
+        stderr = str(data.get("stderr", "")).rstrip()
+        if stdout:
+            lines = stdout.splitlines()
+            for line in lines[:max_lines]:
+                self.console.print(Text(f"    {line}"))
+            if len(lines) > max_lines:
+                self.console.print(f"    [dim]… {len(lines) - max_lines} more lines[/]")
+        if stderr:
+            lines = stderr.splitlines()
+            for line in lines[:10]:
+                self.console.print(Text(f"    {line}", style="dim red"))
+            if len(lines) > 10:
+                self.console.print(f"    [dim red]… {len(lines) - 10} more lines[/]")
  
     def edit_diff(self, path: str, old: str, new: str) -> None:
         diff = list(

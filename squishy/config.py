@@ -33,7 +33,7 @@ class Config:
     sandbox_image: str = field(
         default_factory=lambda: os.environ.get("SQUISHY_SANDBOX_IMAGE", "python:3.11-slim")
     )
-    use_sandbox: bool = True
+    use_sandbox: bool = False
     thinking: bool = False
     index_concurrency: int = 4
     max_tokens_per_index: int = 100_000
