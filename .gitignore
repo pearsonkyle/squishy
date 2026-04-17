@@ -1,0 +1,35 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+.env
+.venv/
+env/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.installed.cfg
+pip-log.txt
+
+# Test coverage
+.coverage
+htmlcov/
+.tox/
+
+# Cache and temporary files
+*.log
+tmp/
+temp/
