@@ -61,7 +61,6 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         await proc.wait()
         return ToolResult(False, error=f"command timed out after {timeout}s")
 
-    stderr_text = stderr_b.decode("utf-8", errors="replace")[-OUTPUT_CAP_STDERR:]
     hint = ""
     if sandboxed and proc.returncode == 127:
         hint = (
@@ -69,13 +68,16 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             "try --no-sandbox or install the tool in the sandbox image)"
         )
 
+    stderr_cap = OUTPUT_CAP_STDERR - len(hint)
+    stderr_text = stderr_b.decode("utf-8", errors="replace")[-stderr_cap:] + hint
+
     return ToolResult(
         True,
         data={
             "command": command,
             "exit_code": proc.returncode,
             "stdout": stdout_b.decode("utf-8", errors="replace")[-OUTPUT_CAP_STDOUT:],
-            "stderr": stderr_text + hint,
+            "stderr": stderr_text,
             "sandboxed": sandboxed,
         },
         # Escape brackets so Rich does not swallow the sandbox tag
