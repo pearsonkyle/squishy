@@ -26,7 +26,7 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     cwd = args.get("cwd") or ctx.working_dir
  
     sandboxed = ctx.use_sandbox and _docker_available()
- 
+
     if sandboxed:
         exec_args = [
             "docker", "run", "--rm",
@@ -37,38 +37,49 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             "sh", "-c", command,
         ]
         exec_cwd = ctx.working_dir
+        exec_env = os.environ.copy()
     else:
         exec_args = ["sh", "-c", command]
         exec_cwd = cwd
- 
+        exec_env = None  # inherit parent environment naturally
+
     try:
         proc = await asyncio.create_subprocess_exec(
             *exec_args,
             cwd=exec_cwd,
-            env=os.environ.copy(),
+            env=exec_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except FileNotFoundError as e:
         return ToolResult(False, error=str(e))
- 
+
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
         proc.kill()
         await proc.wait()
         return ToolResult(False, error=f"command timed out after {timeout}s")
- 
+
+    stderr_text = stderr_b.decode("utf-8", errors="replace")[-OUTPUT_CAP_STDERR:]
+    hint = ""
+    if sandboxed and proc.returncode == 127:
+        hint = (
+            " (command not found in sandbox — "
+            "try --no-sandbox or install the tool in the sandbox image)"
+        )
+
     return ToolResult(
         True,
         data={
             "command": command,
             "exit_code": proc.returncode,
             "stdout": stdout_b.decode("utf-8", errors="replace")[-OUTPUT_CAP_STDOUT:],
-            "stderr": stderr_b.decode("utf-8", errors="replace")[-OUTPUT_CAP_STDERR:],
+            "stderr": stderr_text + hint,
             "sandboxed": sandboxed,
         },
-        display=f"exit={proc.returncode}{' [sandbox]' if sandboxed else ''}",
+        # Escape brackets so Rich does not swallow the sandbox tag
+        display=f"exit={proc.returncode}" + (" \\[sandbox]" if sandboxed else ""),
     )
  
  
