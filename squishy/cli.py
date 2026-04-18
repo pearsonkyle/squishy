@@ -17,7 +17,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display
+from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tools.base import Tool
  
@@ -80,15 +80,20 @@ def _build_config(args: argparse.Namespace) -> Config:
     return cfg
  
  
-def _bottom_toolbar(cfg: Config):
+def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
+        # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder
+        tokens = display.stats.tokens
+        full_k = tokens // 1000
+        bar = "o" * full_k + ("." if tokens % 1000 else "")
+        token_str = f"tokens: {bar} {tokens:,}" if tokens else "tokens: 0"
         return FormattedText([
             ("", " "),
             (f"class:{color}", f"[{cfg.permission_mode}]"),
-            ("", "  shift-tab: cycle mode  |  ctrl-d: exit"),
+            ("", f"  {token_str}  |  shift-tab: cycle mode  |  ctrl-d: exit"),
         ])
- 
+
     return _render
  
  
@@ -116,7 +121,7 @@ async def _amain() -> None:
     )
  
     try:
-        display.banner(cfg.base_url, cfg.model, cfg.permission_mode)
+        display.banner(cfg.base_url, cfg.model)
  
         if not await client.health():
             display.error(f"Cannot reach OpenAI endpoint at {cfg.base_url}.")
@@ -170,7 +175,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
  
     session: PromptSession[str] = PromptSession(
         key_bindings=kb,
-        bottom_toolbar=_bottom_toolbar(cfg),
+        bottom_toolbar=_bottom_toolbar(cfg, display),
     )
  
     while True:
@@ -186,7 +191,18 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         if line in ("/quit", "/exit", "/q"):
             return
         if line == "/help":
-            display.info("slash commands: /quit, /mode <plan|edits|yolo>, /status, /init [--no-summaries], /help")
+            display.info(
+                "  /help                     — show this help\n"
+                "  /mode <plan|edits|yolo>   — switch permission mode\n"
+                "  /status                   — show current config\n"
+                "  /clear, /new              — reset session (clear history & stats)\n"
+                "  /init [--no-summaries]    — build/refresh repo index\n"
+                "  /quit, /exit, /q          — exit squishy"
+            )
+            continue
+        if line in ("/clear", "/new"):
+            display.stats = Stats()
+            display.info("session cleared.")
             continue
         if line == "/status":
             display.info(f"mode={cfg.permission_mode}  model={cfg.model}  url={cfg.base_url}")

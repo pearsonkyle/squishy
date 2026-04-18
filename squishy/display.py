@@ -32,13 +32,12 @@ class Display:
         self.console = Console()
         self.stats = Stats()
  
-    def banner(self, base_url: str, model: str, mode: str) -> None:
+    def banner(self, base_url: str, model: str) -> None:
         self.console.print(
             Panel.fit(
                 f"[bold]squishy[/] — local coding agent\n"
                 f"endpoint: [cyan]{base_url}[/]\n"
-                f"model:    [cyan]{model}[/]\n"
-                f"mode:     [magenta]{mode}[/]",
+                f"model:    [cyan]{model}[/]",
                 border_style="blue",
             )
         )
