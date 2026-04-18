@@ -83,10 +83,11 @@ def _build_config(args: argparse.Namespace) -> Config:
 def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
-        # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder
+        # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder, capped at 20
         tokens = display.stats.tokens
         full_k = tokens // 1000
-        bar = "o" * full_k + ("." if tokens % 1000 else "")
+        dots = min(full_k, 20)
+        bar = "o" * dots + ("+" if full_k > 20 else ("." if tokens % 1000 else ""))
         token_str = f"tokens: {bar} {tokens:,}" if tokens else "tokens: 0"
         return FormattedText([
             ("", " "),
@@ -195,7 +196,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 "  /help                     — show this help\n"
                 "  /mode <plan|edits|yolo>   — switch permission mode\n"
                 "  /status                   — show current config\n"
-                "  /clear, /new              — reset session (clear history & stats)\n"
+                "  /clear, /new              — reset session stats\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
                 "  /quit, /exit, /q          — exit squishy"
             )
