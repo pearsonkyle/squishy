@@ -1,12 +1,8 @@
 # squishy
 
-Minimal local-LLM coding agent. OpenAI-compatible. ATLAS-inspired.
+Minimal local-LLM coding agent. OpenAI-compatible.
 
 A small async Python CLI + library that turns any OpenAI-compatible endpoint (LM Studio, vLLM, llama.cpp with `--api`) into a tool-calling coding assistant. Six tools, one agent loop, no Docker stack, no Go proxy. Ships with SWE-bench and Terminal-bench harnesses.
-
-## Why
-
-ATLAS is a beast: Go proxy, V3 pipeline, Geometric Lens, sandbox service, docker-compose. Excellent research stack, but overkill when you just want "read/write/edit files, run commands, talk to a local model". `squishy` keeps ATLAS's *CLI experience* — tool calls, read-before-edit discipline, explore-then-write budget, diff previews — and throws out everything else.
 
 ## Install
 
