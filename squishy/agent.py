@@ -27,8 +27,8 @@ from squishy.tools import PromptFn, ToolContext, dispatch, openai_schemas
 log = logging.getLogger("squishy.agent")
  
 READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files"}
-MAX_READS_BEFORE_WARN = 4
-MAX_READS_BEFORE_REFUSE = 5
+MAX_READS_BEFORE_WARN = 8
+MAX_READS_BEFORE_REFUSE = 10
 MAX_CONSECUTIVE_ERRORS = 3
  
  
@@ -164,7 +164,7 @@ class Agent:
                 if tc.name in READ_ONLY_TOOLS:
                     consecutive_reads += 1
                     if consecutive_reads == MAX_READS_BEFORE_WARN and self.display:
-                        self.display.warn("4 consecutive reads — nudging model to write.")
+                        self.display.warn(f"{MAX_READS_BEFORE_WARN} consecutive reads — nudging model to write.")
                     if consecutive_reads >= MAX_READS_BEFORE_REFUSE:
                         msg = "You have enough context. Write or edit now. Further reads refused."
                         if self.display:
@@ -222,23 +222,28 @@ class Agent:
         brief = _brief(tc)
         if self.display:
             self.display.turn_header(turn, self.config.max_turns, tc.name, brief)
- 
+
+        if tc.name == "run_command" and self.display:
+            self.display.command_line(str(tc.args.get("command", "")))
+
         if tc.name == "edit_file" and self.display:
             old_str = str(tc.args.get("old_str", ""))
             new_str = str(tc.args.get("new_str", ""))
             if old_str and new_str:
                 self.display.edit_diff(str(tc.args.get("path", "")), old_str, new_str)
- 
+
         t0 = time.monotonic()
         outcome = await dispatch(tc.name, tc.args, self.tool_ctx, prompt_fn=self.prompt_fn)
         dt_ms = (time.monotonic() - t0) * 1000
- 
+
         if self.display:
             self.display.tool_result(outcome.success, outcome.display or outcome.error, dt_ms)
             if outcome.success and tc.name == "write_file":
                 self.display.write_preview(
                     str(tc.args.get("path", "?")), str(tc.args.get("content", ""))
                 )
+            if outcome.success and tc.name == "run_command":
+                self.display.command_output(outcome.data)
             if outcome.success:
                 if tc.name == "write_file":
                     self.display.stats.files_created.add(str(tc.args.get("path", "?")))
@@ -246,7 +251,7 @@ class Agent:
                     self.display.stats.files_edited.add(str(tc.args.get("path", "?")))
                 elif tc.name == "run_command":
                     self.display.stats.commands_run += 1
- 
+
         self._append_tool_result(tc, message=outcome.to_message())
         return {"success": outcome.success}
  
@@ -286,7 +291,5 @@ def _brief(tc: ToolCall) -> str:
         return str(a.get("path", ""))
     if tc.name == "search_files":
         return f'"{a.get("pattern", "")}"'
-    if tc.name == "run_command":
-        cmd = str(a.get("command", ""))
-        return cmd[:60] + ("…" if len(cmd) > 60 else "")
+    # run_command brief is empty; the full command is shown via display.command_line()
     return ""

@@ -17,7 +17,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display
+from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tools.base import Tool
  
@@ -38,6 +38,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--edits", action="store_true", help="Start in edits mode (default)")
     p.add_argument("--yolo", action="store_true", help="Start in yolo mode (no prompts)")
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
+    p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
     p.add_argument("--thinking", action="store_true", help="Allow <think> blocks")
     p.add_argument("--message", "-m", help="Non-interactive: send one message, print result, exit")
     p.add_argument("--init", action="store_true", help="Build .squishy/index.json before the REPL")
@@ -66,6 +67,8 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.permission_mode = "edits"
     if args.no_sandbox:
         cfg.use_sandbox = False
+    if args.sandbox:
+        cfg.use_sandbox = True
     if args.thinking:
         cfg.thinking = True
     if args.init:
@@ -77,15 +80,21 @@ def _build_config(args: argparse.Namespace) -> Config:
     return cfg
  
  
-def _bottom_toolbar(cfg: Config):
+def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
+        # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder, capped at 20
+        tokens = display.stats.tokens
+        full_k = tokens // 1000
+        dots = min(full_k, 20)
+        bar = "o" * dots + ("+" if full_k > 20 else ("." if tokens % 1000 else ""))
+        token_str = f"tokens: {bar} {tokens:,}" if tokens else "tokens: 0"
         return FormattedText([
             ("", " "),
             (f"class:{color}", f"[{cfg.permission_mode}]"),
-            ("", "  shift-tab: cycle mode  |  ctrl-d: exit"),
+            ("", f"  {token_str}  |  shift-tab: cycle mode  |  ctrl-d: exit"),
         ])
- 
+
     return _render
  
  
@@ -113,7 +122,7 @@ async def _amain() -> None:
     )
  
     try:
-        display.banner(cfg.base_url, cfg.model, cfg.permission_mode)
+        display.banner(cfg.base_url, cfg.model)
  
         if not await client.health():
             display.error(f"Cannot reach OpenAI endpoint at {cfg.base_url}.")
@@ -124,7 +133,6 @@ async def _amain() -> None:
             await _run_init(cfg, client, display, summaries=cfg.index_summaries)
  
         async def prompt_fn(tool: Tool, args_: dict) -> bool:
-            display.warn(f"{tool.name}: {_summarize(tool, args_)}")
             try:
                 reply = await asyncio.to_thread(input, "  approve? [y/N] ")
             except (EOFError, KeyboardInterrupt):
@@ -168,7 +176,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
  
     session: PromptSession[str] = PromptSession(
         key_bindings=kb,
-        bottom_toolbar=_bottom_toolbar(cfg),
+        bottom_toolbar=_bottom_toolbar(cfg, display),
     )
  
     while True:
@@ -184,7 +192,18 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         if line in ("/quit", "/exit", "/q"):
             return
         if line == "/help":
-            display.info("slash commands: /quit, /mode <plan|edits|yolo>, /status, /init [--no-summaries], /help")
+            display.info(
+                "  /help                     — show this help\n"
+                "  /mode <plan|edits|yolo>   — switch permission mode\n"
+                "  /status                   — show current config\n"
+                "  /clear, /new              — reset session stats\n"
+                "  /init [--no-summaries]    — build/refresh repo index\n"
+                "  /quit, /exit, /q          — exit squishy"
+            )
+            continue
+        if line in ("/clear", "/new"):
+            display.stats = Stats()
+            display.info("session cleared.")
             continue
         if line == "/status":
             display.info(f"mode={cfg.permission_mode}  model={cfg.model}  url={cfg.base_url}")
@@ -208,13 +227,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             continue
  
         await _run_one(cfg, client, display, prompt_fn, line, timeout)
- 
- 
-def _summarize(tool: Tool, args: dict) -> str:
-    if tool.name == "run_command":
-        cmd = str(args.get("command", ""))
-        return cmd[:120] + ("…" if len(cmd) > 120 else "")
-    return str(args)[:120]
+
  
  
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:

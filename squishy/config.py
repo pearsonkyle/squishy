@@ -27,13 +27,13 @@ class Config:
     )
     temperature: float = 0.3
     max_tokens: int = 8192
-    max_turns: int = 20
+    max_turns: int = 30
     permission_mode: PermissionMode = "edits"
     working_dir: str = field(default_factory=os.getcwd)
     sandbox_image: str = field(
         default_factory=lambda: os.environ.get("SQUISHY_SANDBOX_IMAGE", "python:3.11-slim")
     )
-    use_sandbox: bool = True
+    use_sandbox: bool = False
     thinking: bool = False
     index_concurrency: int = 4
     max_tokens_per_index: int = 100_000
