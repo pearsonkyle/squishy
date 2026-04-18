@@ -142,7 +142,12 @@ class _Stats:
     files_created: set[str] = field(default_factory=set)
     files_edited: set[str] = field(default_factory=set)
     commands_run: int = 0
-    tokens: int = 0
- 
- 
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
 __all__ = ["Squishy", "TaskResult"]

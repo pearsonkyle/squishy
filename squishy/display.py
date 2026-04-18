@@ -1,14 +1,23 @@
 """Terminal output — turn headers, tool status lines, diff previews, summary box."""
- 
+
 from __future__ import annotations
- 
+
 import difflib
+import math
 from dataclasses import dataclass, field
- 
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
- 
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate token count using ~4 chars per token heuristic."""
+    if not text:
+        return 0
+    return math.ceil(len(text) / 4)
+
+
 ICONS = {
     "read_file": "[cyan]📖[/]",
     "write_file": "[green]✎[/]",
@@ -17,16 +26,21 @@ ICONS = {
     "search_files": "[cyan]🔍[/]",
     "run_command": "[magenta]🔧[/]",
 }
- 
- 
+
+
 @dataclass
 class Stats:
     files_created: set[str] = field(default_factory=set)
     files_edited: set[str] = field(default_factory=set)
     commands_run: int = 0
-    tokens: int = 0
- 
- 
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+    @property
+    def tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
 class Display:
     def __init__(self) -> None:
         self.console = Console()
@@ -113,7 +127,7 @@ class Display:
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats
         lines = [
-            f"turns: {turns}  |  elapsed: {elapsed_s:.1f}s  |  tokens: {s.tokens}",
+            f"turns: {turns}  |  elapsed: {elapsed_s:.1f}s  |  prompt: {s.prompt_tokens:,}  |  completion: {s.completion_tokens:,}",
         ]
         if s.files_created:
             lines.append(f"created: {', '.join(sorted(s.files_created))}")

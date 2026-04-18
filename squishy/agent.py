@@ -9,21 +9,21 @@
 """
  
 from __future__ import annotations
- 
+
 import asyncio
 import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any
- 
+
 from squishy.client import Client, ToolCall
 from squishy.config import Config
 from squishy.context import build_system_prompt, detect_project, trim_history
-from squishy.display import Display
+from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tools import PromptFn, ToolContext, dispatch, openai_schemas
- 
+
 log = logging.getLogger("squishy.agent")
  
 READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files"}
@@ -63,14 +63,20 @@ class Agent:
             use_sandbox=self.config.use_sandbox,
         )
         project = detect_project(self.config.working_dir)
+        system_prompt = build_system_prompt(
+            self.config.working_dir, project, self.config.thinking
+        )
         self.messages.append(
             {
                 "role": "system",
-                "content": build_system_prompt(
-                    self.config.working_dir, project, self.config.thinking
-                ),
+                "content": system_prompt,
             }
         )
+        
+        # Add token estimation for system prompt
+        if self.display is not None:
+            self.display.stats.prompt_tokens += estimate_tokens(system_prompt)
+        
         self._check_index_staleness()
  
     def _check_index_staleness(self) -> None:
@@ -88,15 +94,17 @@ class Agent:
         self, user_message: str, *, timeout: float | None = None
     ) -> TaskResult:
         """Run one user turn to completion. Returns a TaskResult.
- 
+
         Raises:
             AgentTimeout: if the task exceeds ``timeout`` seconds.
             AgentCancelled: if the caller cancels the task.
             LLMError: on unrecoverable LLM errors (retries exhausted).
         """
+        # Add user message (tokens will be counted after trim_history)
         self.messages.append({"role": "user", "content": user_message})
+        
         start = time.monotonic()
- 
+
         try:
             if timeout is not None:
                 async with asyncio.timeout(timeout):
@@ -106,21 +114,36 @@ class Agent:
             raise AgentTimeout(f"task exceeded {timeout}s") from e
         except asyncio.CancelledError:
             raise AgentCancelled("task cancelled by caller") from None
- 
+
+    def _add_tool_result_messages(self) -> None:
+        """Add token estimation for any pending tool result messages in history."""
+        if self.display is None:
+            return
+
+    def _count_prompt_tokens_from_messages(self) -> int:
+        """Estimate prompt tokens from current messages (after trim_history)."""
+        total = 0
+        for msg in self.messages:
+            if msg.get("content"):
+                total += estimate_tokens(msg["content"])
+        return total
+
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_reads = 0
         consecutive_errors = 0
         schemas = openai_schemas()
         result = TaskResult(success=False)
-        tokens = 0
+        total_prompt_tokens = 0
+        completion_tokens = 0
         files_created: set[str] = set()
         files_edited: set[str] = set()
         commands_run = 0
- 
+
         for turn in range(1, self.config.max_turns + 1):
             self.tool_ctx.permission_mode = self.config.permission_mode
+            # Trim history before sending to LLM
             self.messages[:] = trim_history(self.messages)
- 
+
             try:
                 completion = await self.client.complete(
                     self.messages,
@@ -135,28 +158,35 @@ class Agent:
                 result.turns_used = turn - 1
                 result.elapsed_s = time.monotonic() - start
                 return result
- 
+
             if completion.text and self.display:
                 self.display.console.print()
-            tokens += completion.usage.get("total_tokens", 0)
- 
+
+            # Count tokens from messages after trimming
+            msg_prompt_tokens = self._count_prompt_tokens_from_messages()
+            
+            # Track LLM response tokens (total prompt = messages + LLM's reported usage)
+            total_prompt_tokens += msg_prompt_tokens
+            completion_tokens += completion.completion_tokens
+
             if not completion.tool_calls:
                 if completion.text:
                     self.messages.append({"role": "assistant", "content": completion.text})
                 if self.display:
-                    self.display.stats.tokens = tokens
+                    self.display.stats.prompt_tokens = total_prompt_tokens
+                    self.display.stats.completion_tokens = completion_tokens
                     self.display.summary(turn, time.monotonic() - start)
                 result.success = True
                 result.final_text = completion.text
                 result.turns_used = turn
-                result.tokens_used = tokens
+                result.tokens_used = total_prompt_tokens + completion_tokens
                 result.files_created = sorted(files_created)
                 result.files_edited = sorted(files_edited)
                 result.commands_run = commands_run
                 result.elapsed_s = time.monotonic() - start
                 result.messages = list(self.messages)
                 return result
- 
+
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls))
  
             any_mutating = False
@@ -192,25 +222,26 @@ class Agent:
                         self.display.error(msg)
                     result.error = msg
                     result.turns_used = turn
-                    result.tokens_used = tokens
+                    result.tokens_used = total_prompt_tokens + completion_tokens
                     result.files_created = sorted(files_created)
                     result.files_edited = sorted(files_edited)
                     result.commands_run = commands_run
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
                     return result
- 
+
             if any_mutating:
                 consecutive_reads = 0
- 
+
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:
             self.display.warn(msg)
-            self.display.stats.tokens = tokens
+            self.display.stats.prompt_tokens = total_prompt_tokens
+            self.display.stats.completion_tokens = completion_tokens
             self.display.summary(self.config.max_turns, time.monotonic() - start)
         result.error = msg
         result.turns_used = self.config.max_turns
-        result.tokens_used = tokens
+        result.tokens_used = total_prompt_tokens + completion_tokens
         result.files_created = sorted(files_created)
         result.files_edited = sorted(files_edited)
         result.commands_run = commands_run

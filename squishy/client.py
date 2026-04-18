@@ -48,7 +48,19 @@ class CompletionResult:
     text: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
-    usage: dict[str, int] = field(default_factory=dict)
+    usage: dict[str, int] | None = field(default_factory=dict)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return (self.usage or {}).get("prompt_tokens", 0)
+
+    @property
+    def completion_tokens(self) -> int:
+        return (self.usage or {}).get("completion_tokens", 0)
+
+    @property
+    def total_tokens(self) -> int:
+        return (self.usage or {}).get("total_tokens", 0)
  
  
 OnTextFn = Callable[[str], Awaitable[None] | None]

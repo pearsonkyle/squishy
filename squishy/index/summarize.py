@@ -85,6 +85,8 @@ class Summarizer:
     token_budget: int = DEFAULT_TOKEN_BUDGET
     model_name: str = ""
     _tokens_used: int = 0
+    _prompt_tokens: int = 0
+    _completion_tokens: int = 0
     _budget_exhausted: bool = False
  
     async def summarize(
@@ -173,7 +175,17 @@ class Summarizer:
             # If one summary fails, don't torpedo the whole index.
             return ""
         usage = getattr(res, "usage", {}) or {}
-        self._tokens_used += int(usage.get("total_tokens", 0) or 0)
+        prompt_tok = int(usage.get("prompt_tokens", 0) or 0)
+        completion_tok = int(usage.get("completion_tokens", 0) or 0)
+        
+        # If only total_tokens is provided (old-style API), split it
+        if not prompt_tok and not completion_tok:
+            total = int(usage.get("total_tokens", 0) or 0)
+            prompt_tok, completion_tok = total // 2, total - (total // 2)
+        
+        self._prompt_tokens += prompt_tok
+        self._completion_tokens += completion_tok
+        self._tokens_used = self._prompt_tokens + self._completion_tokens
         if self.token_budget and self._tokens_used >= self.token_budget:
             self._budget_exhausted = True
         return getattr(res, "text", "") or ""

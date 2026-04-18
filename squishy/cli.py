@@ -5,22 +5,23 @@ Claude Code's in-session mode switching.
 """
  
 from __future__ import annotations
- 
+
 import argparse
 import asyncio
+import os
 import sys
- 
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
- 
+
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
 from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tools.base import Tool
- 
+
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
  
  
@@ -83,12 +84,17 @@ def _build_config(args: argparse.Namespace) -> Config:
 def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
+        s = display.stats
         # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder, capped at 20
-        tokens = display.stats.tokens
-        full_k = tokens // 1000
+        total_tokens = s.tokens
+        full_k = total_tokens // 1000
         dots = min(full_k, 20)
-        bar = "o" * dots + ("+" if full_k > 20 else ("." if tokens % 1000 else ""))
-        token_str = f"tokens: {bar} {tokens:,}" if tokens else "tokens: 0"
+        bar = "o" * dots + ("+" if full_k > 20 else ("." if total_tokens % 1000 else ""))
+        token_str = (
+            f"tokens: {bar} prompt:{s.prompt_tokens:,} comp:{s.completion_tokens:,}"
+            if total_tokens
+            else "tokens: 0"
+        )
         return FormattedText([
             ("", " "),
             (f"class:{color}", f"[{cfg.permission_mode}]"),
@@ -154,6 +160,29 @@ async def _amain() -> None:
         await client.aclose()
  
  
+async def _run_direct_command(cmd: str) -> int:
+    """Execute a shell command directly (not via LLM tool).
+
+    Returns the exit code.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "sh", "-c", cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    
+    stdout, stderr = await proc.communicate()
+    
+    if stdout:
+        sys.stdout.write(stdout.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+    if stderr:
+        sys.stderr.write(stderr.decode("utf-8", errors="replace"))
+        sys.stderr.flush()
+    
+    return proc.returncode
+
+
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
     try:
@@ -189,6 +218,15 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         line = line.strip()
         if not line:
             continue
+        if line.startswith("!"):
+            # Direct shell command execution (like IPython/Jupyter)
+            cmd = line[1:].strip()
+            if cmd:
+                display.info(f"[shell] {cmd}")
+                exit_code = await _run_direct_command(cmd)
+                if exit_code != 0:
+                    display.warn(f"[shell] exited with code {exit_code}")
+            continue
         if line in ("/quit", "/exit", "/q"):
             return
         if line == "/help":
@@ -198,7 +236,10 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 "  /status                   — show current config\n"
                 "  /clear, /new              — reset session stats\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
-                "  /quit, /exit, /q          — exit squishy"
+                "  /quit, /exit, /q          — exit squishy\n"
+                "\n"
+                "  !command                  — run shell command directly\n"
+                "  (e.g., !ls -la, !pip install requests)"
             )
             continue
         if line in ("/clear", "/new"):
@@ -263,6 +304,12 @@ async def _run_init(cfg: Config, client: Client, display: Display, *, summaries:
             except Exception as e:  # noqa: BLE001
                 display.warn(f"[index] summarize failed: {e}")
             index.meta.model = cfg.model
+            # Show token usage from summarization
+            display.info(
+                f"[index] summarization used {summarizer._prompt_tokens} prompt + "
+                f"{summarizer._completion_tokens} completion tokens "
+                f"({summarizer._tokens_used} total)"
+            )
         else:
             display.info("[index] no new files to summarize")
  
