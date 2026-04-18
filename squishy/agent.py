@@ -27,8 +27,8 @@ from squishy.tools import PromptFn, ToolContext, dispatch, openai_schemas
 log = logging.getLogger("squishy.agent")
  
 READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files"}
-MAX_READS_BEFORE_WARN = 4
-MAX_READS_BEFORE_REFUSE = 5
+MAX_READS_BEFORE_WARN = 8
+MAX_READS_BEFORE_REFUSE = 10
 MAX_CONSECUTIVE_ERRORS = 3
  
  
@@ -164,7 +164,7 @@ class Agent:
                 if tc.name in READ_ONLY_TOOLS:
                     consecutive_reads += 1
                     if consecutive_reads == MAX_READS_BEFORE_WARN and self.display:
-                        self.display.warn("4 consecutive reads — nudging model to write.")
+                        self.display.warn(f"{MAX_READS_BEFORE_WARN} consecutive reads — nudging model to write.")
                     if consecutive_reads >= MAX_READS_BEFORE_REFUSE:
                         msg = "You have enough context. Write or edit now. Further reads refused."
                         if self.display:
