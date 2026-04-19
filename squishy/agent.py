@@ -52,12 +52,20 @@ class Agent:
     messages: list[dict[str, Any]] = field(default_factory=list)
  
     def __post_init__(self) -> None:
+        # Import here to avoid circular dependency
+        from squishy.plan_tracker import PlanTracker
+
         self.tool_ctx = ToolContext(
             working_dir=self.config.working_dir,
             permission_mode=self.config.permission_mode,
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
         )
+        # Set up tracker for plan mode
+        self.tool_ctx.tracker = PlanTracker()
+        # Reference back to config for mode switching
+        self.tool_ctx.cfg_ref = self.config
+
         project = detect_project(self.config.working_dir)
         system_prompt = build_system_prompt(
             self.config.working_dir, project, self.config.thinking
@@ -68,11 +76,6 @@ class Agent:
                 "content": system_prompt,
             }
         )
-        
-        # Add token estimation for system prompt
-        if self.display is not None:
-            self.display.stats.prompt_tokens += estimate_tokens(system_prompt)
-        
         self._check_index_staleness()
  
     def _check_index_staleness(self) -> None:
@@ -111,21 +114,7 @@ class Agent:
         except asyncio.CancelledError:
             raise AgentCancelled("task cancelled by caller") from None
 
-    def _add_tool_result_messages(self) -> None:
-        """Add token estimation for any pending tool result messages in history."""
-        if self.display is None:
-            return
-
-    def _count_prompt_tokens_from_messages(self) -> int:
-        """Estimate prompt tokens from current messages (after trim_history)."""
-        total = 0
-        for msg in self.messages:
-            if msg.get("content"):
-                total += estimate_tokens(msg["content"])
-        return total
-
     async def _run_loop(self, start: float) -> TaskResult:
-        consecutive_errors = 0
         schemas = openai_schemas()
         result = TaskResult(success=False)
         total_prompt_tokens = 0
@@ -157,24 +146,21 @@ class Agent:
             if completion.text and self.display:
                 self.display.console.print()
 
-            # Count tokens from messages after trimming
-            msg_prompt_tokens = self._count_prompt_tokens_from_messages()
-
-            # Track LLM response tokens (total prompt = messages + LLM's reported usage)
-            total_prompt_tokens += msg_prompt_tokens
-            completion_tokens += completion.completion_tokens
+            # Use real token usage from LLM API response
+            total_prompt_tokens = (total_prompt_tokens or 0) + completion.prompt_tokens
+            completion_tokens = (completion_tokens or 0) + completion.completion_tokens
 
             if not completion.tool_calls:
                 if completion.text:
                     self.messages.append({"role": "assistant", "content": completion.text})
                 if self.display:
-                    self.display.stats.prompt_tokens = total_prompt_tokens
-                    self.display.stats.completion_tokens = completion_tokens
+                    self.display.stats.prompt_tokens = total_prompt_tokens or 0
+                    self.display.stats.completion_tokens = completion_tokens or 0
                     self.display.summary(turn, time.monotonic() - start)
                 result.success = True
                 result.final_text = completion.text
                 result.turns_used = turn
-                result.tokens_used = total_prompt_tokens + completion_tokens
+                result.tokens_used = (total_prompt_tokens or 0) + (completion_tokens or 0)
                 result.files_created = sorted(files_created)
                 result.files_edited = sorted(files_edited)
                 result.commands_run = commands_run
@@ -203,7 +189,7 @@ class Agent:
                         self.display.error(msg)
                     result.error = msg
                     result.turns_used = turn
-                    result.tokens_used = total_prompt_tokens + completion_tokens
+                    result.tokens_used = (total_prompt_tokens or 0) + (completion_tokens or 0)
                     result.files_created = sorted(files_created)
                     result.files_edited = sorted(files_edited)
                     result.commands_run = commands_run
@@ -219,7 +205,7 @@ class Agent:
             self.display.summary(self.config.max_turns, time.monotonic() - start)
         result.error = msg
         result.turns_used = self.config.max_turns
-        result.tokens_used = total_prompt_tokens + completion_tokens
+        result.tokens_used = (total_prompt_tokens or 0) + (completion_tokens or 0)
         result.files_created = sorted(files_created)
         result.files_edited = sorted(files_edited)
         result.commands_run = commands_run
@@ -260,6 +246,9 @@ class Agent:
                     self.display.stats.files_edited.add(str(tc.args.get("path", "?")))
                 elif tc.name == "run_command":
                     self.display.stats.commands_run += 1
+                # Show plan status on update_plan_step success
+                elif tc.name == "update_plan_step":
+                    self.display.plan_status()
 
         self._append_tool_result(tc, message=outcome.to_message())
         return {"success": outcome.success}
