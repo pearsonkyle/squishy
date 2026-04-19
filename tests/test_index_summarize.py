@@ -1,42 +1,41 @@
 """Summarizer: skips files with existing summaries, respects token budget."""
- 
+
 from __future__ import annotations
- 
+
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
- 
+
 import pytest
- 
-from squishy.index import build_index
+
+from squishy.index import _build_index_async, build_index
 from squishy.index.summarize import Summarizer
- 
-pytestmark = pytest.mark.asyncio
- 
- 
+
+
 @dataclass
 class _FakeResp:
     text: str = "ok"
     usage: dict[str, int] | None = None
- 
- 
+
+
 class _FakeClient:
     def __init__(self, *, tokens_per_call: int = 100) -> None:
         self.calls: list[list[dict[str, Any]]] = []
         self._tokens = tokens_per_call
- 
+
     async def complete(self, messages, tools, *, stream: bool = False):
         self.calls.append(messages)
         label = f"call{len(self.calls)}"
         return _FakeResp(text=f"sum {label}", usage={"total_tokens": self._tokens})
- 
- 
+
+
 def _make_repo(root: Path) -> None:
     (root / "with_doc.py").write_text('"""Already has a summary."""\ndef f(): pass\n')
     (root / "no_doc.py").write_text("def g(): return 1\n")
     (root / "tiny.js").write_text("function hi() {}\n")
- 
- 
+
+
 async def test_skips_files_with_existing_summary(tmp_path: Path) -> None:
     _make_repo(tmp_path)
     idx = build_index(str(tmp_path))

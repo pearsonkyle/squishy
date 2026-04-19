@@ -1,23 +1,24 @@
 """LLM summaries for index nodes.
- 
+
 Deterministic-first: files that already ship with a docstring or header
 comment skip the LLM entirely. Everything else is batched with a bounded
 `asyncio.Semaphore` and capped by `max_tokens` budget so a large repo can't
 silently burn the model's context window.
- 
+
 Dir-level summaries roll up their children with one compact call each.
 """
- 
+
 from __future__ import annotations
- 
+
 import asyncio
 import contextlib
+import hashlib
 import os
 from dataclasses import dataclass
 from typing import Any, Protocol
- 
+
 from squishy.index.model import Index, Node
- 
+
 DEFAULT_CONCURRENCY = 4
 DEFAULT_TOKEN_BUDGET = 100_000
 FILE_SUMMARY_MAX_TOKENS = 120
@@ -88,6 +89,8 @@ class Summarizer:
     _prompt_tokens: int = 0
     _completion_tokens: int = 0
     _budget_exhausted: bool = False
+    _files_summarized: int = 0
+    _dirs_summarized: int = 0
  
     async def summarize(
         self,
@@ -96,16 +99,19 @@ class Summarizer:
         progress: Any = None,
     ) -> None:
         """Summarize file and dir nodes in-place.
- 
+
         Files whose `summary` is already non-empty (docstring / header comment
         / reused from prior index) are skipped.
+
+        Directory summaries use hash-based caching: if children's summaries
+        haven't changed, the dir summary is reused.
         """
         files_needing = [n for n in index.root.walk() if n.kind == "file" and not n.summary]
         total = len(files_needing)
         sem = asyncio.Semaphore(max(1, self.concurrency))
         done = 0
         lock = asyncio.Lock()
- 
+
         async def _one(node: Node) -> None:
             nonlocal done
             async with sem:
@@ -117,12 +123,18 @@ class Summarizer:
                     if progress is not None:
                         with contextlib.suppress(Exception):
                             progress(ProgressEvent(done=done, total=total, label=node.path))
- 
+
         if files_needing:
             await asyncio.gather(*[_one(n) for n in files_needing])
- 
+
         # Dir rollups after files are settled.
         await self._summarize_dirs(index.root)
+        
+        # Update meta with summary stats
+        index.meta.summary_stats = {
+            "files_summarized": self._files_summarized,
+            "dirs_summarized": self._dirs_summarized,
+        }
  
     async def _summarize_file(self, node: Node) -> None:
         abs_path = os.path.join(self.cwd, node.path)
@@ -137,12 +149,31 @@ class Summarizer:
         summary = await self._ask(prompt, FILE_SUMMARY_MAX_TOKENS)
         if summary:
             node.summary = _first_line(summary)[:240]
+            self._files_summarized += 1
  
     async def _summarize_dirs(self, node: Node) -> None:
         if node.kind not in ("repo", "dir"):
             return
         for child in node.children:
             await self._summarize_dirs(child)
+        
+        # Compute summary hash from children to detect changes
+        child_summary_hashes = []
+        for c in node.children:
+            if c.kind in ("file", "dir"):
+                child_summary_hashes.append(f"{c.path}:{c.summary_hash or c.summary}")
+        
+        current_hash = hashlib.md5(
+            "|".join(sorted(child_summary_hashes)).encode()
+        ).hexdigest()[:16]
+        
+        # Reuse existing dir summary if children haven't changed
+        if node.summary and current_hash == node.summary_hash:
+            return
+        
+        # Update hash and regenerate summary if needed
+        node.summary_hash = current_hash
+        
         if node.summary or self._budget_exhausted:
             return
         child_summaries = []
@@ -161,6 +192,7 @@ class Summarizer:
         summary = await self._ask(prompt, DIR_SUMMARY_MAX_TOKENS)
         if summary:
             node.summary = _first_line(summary)[:240]
+            self._dirs_summarized += 1
  
     async def _ask(self, prompt: str, max_tokens: int) -> str:
         if self._budget_exhausted:

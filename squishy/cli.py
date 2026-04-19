@@ -273,25 +273,39 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
  
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:
     """Build/refresh the repo index at cfg.working_dir."""
-    from squishy.index import Summarizer, build_index, load_index, save_index
- 
+    from squishy.index import (
+        Summarizer,
+        _build_index_async,
+        describe_deep_staleness,
+        load_index,
+        save_agents_md,
+        save_index,
+    )
+
     display.info("[index] walking…")
     prior = load_index(cfg.working_dir)
-    index = await asyncio.to_thread(build_index, cfg.working_dir, prior=prior)
+    index = await _build_index_async(cfg.working_dir, prior=prior)
     stats = index.meta.stats
     display.info(f"[index] {stats.get('files', 0)} files, {stats.get('symbols', 0)} symbols")
- 
+
+    # Show staleness info for new/changed files
+    if prior:
+        stale_info = describe_deep_staleness(cfg.working_dir)
+        if stale_info.get("stale"):
+            reason = stale_info.get("reason", "")
+            display.info(f"[index] {reason}")
+
     if summaries:
         total = sum(1 for n in index.root.walk() if n.kind == "file" and not n.summary)
         if total:
             display.info(f"[index] summarizing {total} file(s)…")
             last = [0]
- 
+
             def _progress(ev):  # type: ignore[no-untyped-def]
                 if ev.done - last[0] >= max(1, total // 10) or ev.done == ev.total:
                     display.info(f"[index] {ev.done}/{ev.total}")
                     last[0] = ev.done
- 
+
             summarizer = Summarizer(
                 client=client,
                 cwd=cfg.working_dir,
@@ -312,7 +326,23 @@ async def _run_init(cfg: Config, client: Client, display: Display, *, summaries:
             )
         else:
             display.info("[index] no new files to summarize")
- 
+
+    # Update last_summarized timestamps
+    import time
+
+    now = time.time()
+    for node in index.root.walk():
+        if node.summary:
+            node.last_summarized = now
+
     save_index(cfg.working_dir, index)
+
+    # Generate AGENTS.md
+    try:
+        save_agents_md(index, cfg.working_dir)
+    except Exception:  # noqa: BLE001
+        pass  # Non-critical
+
     from squishy.index.store import index_path
+
     display.info(f"[index] saved → {index_path(cfg.working_dir)}")

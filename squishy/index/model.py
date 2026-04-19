@@ -25,6 +25,8 @@ class Node:
     end_line: int = 0
     hash: str = ""  # blake2 of file contents (files only)
     summary: str = ""
+    summary_hash: str = ""  # hash of children's summaries for dir caching
+    last_summarized: float = 0.0  # unix timestamp
     children: list[Node] = field(default_factory=list)
  
     def to_dict(self) -> dict[str, Any]:
@@ -41,6 +43,10 @@ class Node:
             d["hash"] = self.hash
         if self.summary:
             d["summary"] = self.summary
+        if self.summary_hash:
+            d["summary_hash"] = self.summary_hash
+        if self.last_summarized:
+            d["last_summarized"] = self.last_summarized
         if self.children:
             d["children"] = [c.to_dict() for c in self.children]
         return d
@@ -56,6 +62,8 @@ class Node:
             end_line=int(d.get("end_line", 0)),
             hash=str(d.get("hash", "")),
             summary=str(d.get("summary", "")),
+            summary_hash=str(d.get("summary_hash", "")),
+            last_summarized=float(d.get("last_summarized", 0.0)),
             children=[cls.from_dict(c) for c in d.get("children", [])],
         )
  
@@ -72,6 +80,7 @@ class IndexMeta:
     model: str = ""  # summarizer model id, empty if no summaries
     squishy_version: str = ""
     stats: dict[str, int] = field(default_factory=dict)  # {files, symbols, by_ext}
+    summary_stats: dict[str, int] = field(default_factory=dict)  # {files_summarized, dirs_summarized}
  
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -80,6 +89,7 @@ class IndexMeta:
             "model": self.model,
             "squishy_version": self.squishy_version,
             "stats": self.stats,
+            "summary_stats": self.summary_stats,
         }
  
     @classmethod
@@ -90,6 +100,7 @@ class IndexMeta:
             model=str(d.get("model", "")),
             squishy_version=str(d.get("squishy_version", "")),
             stats=dict(d.get("stats", {})),
+            summary_stats=dict(d.get("summary_stats", {}) or {}),
         )
  
  

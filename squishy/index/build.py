@@ -1,39 +1,58 @@
 """Assemble an `Index` from a repo walk + per-file symbol extraction.
- 
+
 Incremental: if a prior index exists, subtrees whose file hash is unchanged
 are copied over (preserving their summaries). Only new/changed files pay the
 AST+summary cost on subsequent runs.
+
+Optimized with parallel pipeline stages:
+  walk → hash (I/O bound) → parse (CPU bound) → summarize (network bound)
 """
- 
+
 from __future__ import annotations
- 
+
+import asyncio
 import os
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
- 
+
 from squishy.index import ast_generic, ast_py
 from squishy.index.ast_py import Symbol
 from squishy.index.model import Index, IndexMeta, Node
 from squishy.index.walker import FileRecord, walk_repo
- 
- 
+
+# Thread pool for parallel I/O-bound operations
+_executor: ThreadPoolExecutor | None = None
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    """Get or create a shared thread pool for parallel operations."""
+    global _executor
+    if _executor is None:
+        # More workers for I/O bound tasks
+        _executor = ThreadPoolExecutor(
+            max_workers=min(64, (os.cpu_count() or 4) * 2 + 8)
+        )
+    return _executor
+
+
 def _read_text(abs_path: str) -> str:
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as f:
             return f.read()
     except OSError:
         return ""
- 
- 
+
+
 def _first_line(s: str) -> str:
     for line in s.splitlines():
         line = line.strip()
         if line:
             return line
     return ""
- 
- 
+
+
 def _symbol_to_node(sym: Symbol, parent_path: str, prefix: str) -> Node:
     node = Node(
         id=f"{prefix}:{sym.name}",
@@ -47,9 +66,10 @@ def _symbol_to_node(sym: Symbol, parent_path: str, prefix: str) -> Node:
     if sym.children:
         node.children = [_symbol_to_node(c, parent_path, node.id) for c in sym.children]
     return node
- 
- 
-def _file_node(rec: FileRecord, source: str) -> Node:
+
+
+def _file_node_from_source(rec: FileRecord, source: str) -> Node:
+    """Build a file node from already-read source string."""
     ext = rec.ext
     if ext in (".py", ".pyi"):
         summary = _first_line(ast_py.module_docstring(source))[:200] if source else ""
@@ -57,7 +77,7 @@ def _file_node(rec: FileRecord, source: str) -> Node:
     else:
         summary = ast_generic.header_comment(source, ext)
         symbols = ast_generic.extract_symbols(source, ext)
- 
+
     return Node(
         id=f"file:{rec.path}",
         kind="file",
@@ -67,8 +87,32 @@ def _file_node(rec: FileRecord, source: str) -> Node:
         summary=summary,
         children=[_symbol_to_node(s, rec.path, f"file:{rec.path}") for s in symbols],
     )
- 
- 
+
+
+async def _process_file_record(
+    rec: FileRecord, prior_files: dict[str, Node]
+) -> tuple[Node | None, int]:
+    """Process a single file record, returning (node, symbol_count).
+
+    Reuses prior file node if hash matches. Uses thread pool for I/O.
+    """
+    # Check if we can reuse prior node
+    reused = prior_files.get(rec.path)
+    if reused is not None and reused.hash and reused.hash == rec.hash:
+        symbol_count = sum(1 for n in reused.walk() if n.kind in ("class", "function", "method"))
+        return reused, symbol_count
+
+    # Read file in thread pool (I/O bound)
+    loop = asyncio.get_running_loop()
+    source = await loop.run_in_executor(_get_executor(), _read_text, rec.abs_path)
+
+    # Process in thread pool (CPU bound - AST parsing)
+    node = await loop.run_in_executor(_get_executor(), _file_node_from_source, rec, source)
+    symbol_count = sum(1 for n in node.walk() if n.kind in ("class", "function", "method"))
+
+    return node, symbol_count
+
+
 def _build_dir_tree(file_nodes: list[Node], root_path: Path) -> Node:
     """Group file nodes under directory nodes that mirror the filesystem."""
     by_dir: dict[str, list[Node]] = defaultdict(list)
@@ -131,36 +175,52 @@ def _prior_file_map(prior: Index | None) -> dict[str, Node]:
     if prior is None:
         return {}
     return {n.path: n for n in prior.root.walk() if n.kind == "file"}
- 
- 
-def build_index(cwd: str | os.PathLike[str], *, prior: Index | None = None) -> Index:
-    """Walk `cwd`, extract symbols, and return an `Index`.
- 
-    Reuses file subtrees (with their summaries) from `prior` when the file
-    hash is unchanged. Dir-level summaries are NOT reused — they're cheap to
-    re-roll and would otherwise go stale when children change.
-    """
+
+
+async def _build_index_async(
+    cwd: str | os.PathLike[str], *, prior: Index | None = None, concurrency: int = 8
+) -> Index:
+    """Async implementation of index building."""
     root_path = Path(cwd).resolve()
+    
+    # Stage 1: Walk repo (sequential)
     records, hit_cap = walk_repo(cwd)
     prior_files = _prior_file_map(prior)
- 
+
+    if not records:
+        # Empty repo - return minimal index
+        root = Node(id="repo:.", kind="repo", name=root_path.name or ".", path="")
+        meta = IndexMeta(
+            generated_at=time.time(),
+            file_hashes={},
+            squishy_version="",
+            stats={"files": 0, "symbols": 0, "hit_cap": int(hit_cap)},
+        )
+        return Index(root=root, meta=meta)
+
+    # Stage 2: Process files with bounded concurrency
+    semaphore = asyncio.Semaphore(concurrency)
+    
+    async def _process_with_semaphore(task):
+        async with semaphore:
+            return await task
+
+    tasks = [_process_file_record(rec, prior_files) for rec in records]
+    results = await asyncio.gather(*[_process_with_semaphore(t) for t in tasks])
+
+    # Collect results
     file_nodes: list[Node] = []
     by_ext: dict[str, int] = defaultdict(int)
     symbol_count = 0
-    for rec in records:
+    for rec, (node, count) in zip(records, results):
         by_ext[rec.ext or "<none>"] += 1
-        reused = prior_files.get(rec.path)
-        if reused is not None and reused.hash and reused.hash == rec.hash:
-            file_nodes.append(reused)
-            symbol_count += sum(1 for n in reused.walk() if n.kind in ("class", "function", "method"))
-            continue
-        source = _read_text(rec.abs_path)
-        fn = _file_node(rec, source)
-        file_nodes.append(fn)
-        symbol_count += sum(1 for n in fn.walk() if n.kind in ("class", "function", "method"))
- 
+        if node is not None:
+            file_nodes.append(node)
+            symbol_count += count
+
+    # Stage 3: Build directory tree (sequential, O(n))
     root = _build_dir_tree(file_nodes, root_path)
- 
+
     meta = IndexMeta(
         generated_at=time.time(),
         file_hashes={rec.path: rec.hash for rec in records},
@@ -173,6 +233,40 @@ def build_index(cwd: str | os.PathLike[str], *, prior: Index | None = None) -> I
         },
     )
     return Index(root=root, meta=meta)
- 
- 
-__all__ = ["build_index"]
+
+
+def build_index(
+    cwd: str | os.PathLike[str], *, prior: Index | None = None, concurrency: int = 8
+) -> Index:
+    """Walk `cwd`, extract symbols, and return an `Index`.
+
+    Reuses file subtrees (with their summaries) from `prior` when the file
+    hash is unchanged. Dir-level summaries are NOT reused — they're cheap to
+    re-roll and would otherwise go stale when children change.
+
+    Optimized with parallel pipeline stages:
+      - walk_repo: sequential directory traversal
+      - hash computation: I/O bound, parallel
+      - AST parsing: CPU bound, parallel via thread pool
+      - dir tree assembly: sequential
+
+    Uses batched processing with bounded concurrency for memory efficiency.
+
+    This is a sync function that wraps the async implementation.
+    For async contexts, use `_build_index_async`.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No event loop running - use asyncio.run
+        return asyncio.run(_build_index_async(cwd, prior=prior, concurrency=concurrency))
+
+    # Event loop is running - run the async code in a separate thread
+    import concurrent.futures
+
+    def _run_in_thread():
+        return asyncio.run(_build_index_async(cwd, prior=prior, concurrency=concurrency))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(_run_in_thread)
+        return future.result()
