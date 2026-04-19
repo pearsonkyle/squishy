@@ -28,6 +28,9 @@ class Config:
     temperature: float = 0.3
     max_tokens: int = 8192
     max_turns: int = 30
+    context_window: int = field(
+        default_factory=lambda: int(os.environ.get("SQUISHY_CONTEXT_WINDOW", "128000"))
+    )
     permission_mode: PermissionMode = "edits"
     working_dir: str = field(default_factory=os.getcwd)
     sandbox_image: str = field(

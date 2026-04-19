@@ -36,7 +36,8 @@ class TestEstimateTokens:
 
 @pytest.mark.asyncio
 class TestAgentTokenCounting:
-    async def test_agent_counts_system_prompt_tokens(self, tmp_path) -> None:
+    async def test_agent_starts_at_zero_before_first_turn(self, tmp_path) -> None:
+        """Display reflects real usage from the API, not pre-request estimates."""
         from squishy.agent import Agent
         from squishy.config import Config
         from squishy.display import Display
@@ -45,33 +46,19 @@ class TestAgentTokenCounting:
             async def health(self) -> bool:
                 return True
 
-            async def complete(
-                self,
-                messages: list[dict],
-                tools: list[dict],
-                *,
-                stream: bool = True,
-                on_text=None,
-            ) -> CompletionResult:
-                return CompletionResult(
-                    text="done",
-                    tool_calls=[],
-                    usage={"prompt_tokens": 50, "completion_tokens": 10},
-                )
-
-        from dataclasses import dataclass
-
         cfg = Config()
         cfg.working_dir = str(tmp_path)
         cfg.permission_mode = "yolo"
         cfg.max_turns = 5
 
         display = Display()
-        agent = Agent(cfg, FakeClient(), display)  # type: ignore[arg-type]
+        _ = Agent(cfg, FakeClient(), display)  # type: ignore[arg-type]
 
-        assert display.stats.prompt_tokens > 0  # System prompt was counted
+        # No turn has run, so no real usage yet.
+        assert display.stats.prompt_tokens == 0
+        assert display.stats.completion_tokens == 0
 
-    async def test_agent_counts_user_message_tokens(self, tmp_path) -> None:
+    async def test_agent_uses_real_prompt_tokens_from_api(self, tmp_path) -> None:
         from squishy.agent import Agent
         from squishy.client import CompletionResult
         from squishy.config import Config
@@ -92,7 +79,7 @@ class TestAgentTokenCounting:
                 return CompletionResult(
                     text="done",
                     tool_calls=[],
-                    usage={"prompt_tokens": 10, "completion_tokens": 5},
+                    usage={"prompt_tokens": 123, "completion_tokens": 45},
                 )
 
         cfg = Config()
@@ -103,16 +90,50 @@ class TestAgentTokenCounting:
         display = Display()
         agent = Agent(cfg, FakeClient(), display)  # type: ignore[arg-type]
 
-        initial_tokens = display.stats.prompt_tokens
         await agent.run("hello world")
 
-        # After run, prompt tokens should include system + user message
-        assert display.stats.prompt_tokens > initial_tokens
+        # prompt_tokens reflects the last turn's real API usage.
+        assert display.stats.prompt_tokens == 123
+        # completion_tokens accumulate across turns.
+        assert display.stats.completion_tokens == 45
 
-        # Run again to verify user messages are counted each time
-        initial_tokens = display.stats.prompt_tokens
         await agent.run("second message")
-        assert display.stats.prompt_tokens > initial_tokens
+        # Both reflect the latest run (completion accumulates within a run).
+        assert display.stats.prompt_tokens == 123
+        assert display.stats.completion_tokens == 45
+
+    async def test_agent_falls_back_to_estimate_when_no_usage(self, tmp_path) -> None:
+        """When the provider omits usage, fall back to char-based estimation."""
+        from squishy.agent import Agent
+        from squishy.client import CompletionResult
+        from squishy.config import Config
+        from squishy.display import Display
+
+        class FakeClient:
+            async def health(self) -> bool:
+                return True
+
+            async def complete(
+                self,
+                messages: list[dict],
+                tools: list[dict],
+                *,
+                stream: bool = True,
+                on_text=None,
+            ) -> CompletionResult:
+                return CompletionResult(text="done", tool_calls=[], usage={})
+
+        cfg = Config()
+        cfg.working_dir = str(tmp_path)
+        cfg.permission_mode = "yolo"
+        cfg.max_turns = 5
+
+        display = Display()
+        agent = Agent(cfg, FakeClient(), display)  # type: ignore[arg-type]
+
+        await agent.run("hello world")
+        # System prompt + user message estimated via char heuristic.
+        assert display.stats.prompt_tokens > 0
 
     async def test_completion_result_has_token_properties(self) -> None:
         from squishy.client import CompletionResult

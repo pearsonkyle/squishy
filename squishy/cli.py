@@ -18,7 +18,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display, Stats
+from squishy.display import Display, Stats, format_tokens_k
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tool_restrictions import get_allowed_tools, get_denied_tools, get_tool_category
 from squishy.tools.base import Tool
@@ -33,6 +33,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--api-key", help="API key (env SQUISHY_API_KEY)")
     p.add_argument("--max-turns", type=int, default=None, help="Turn cap (default 20)")
     p.add_argument("--temperature", type=float, default=None)
+    p.add_argument("--context-window", type=int, default=None, help="Model context window in tokens (for %% readout)")
     p.add_argument("--timeout", type=float, default=None, help="Task timeout in seconds")
     p.add_argument("--request-timeout", type=float, default=120.0)
     p.add_argument("--max-retries", type=int, default=4)
@@ -61,6 +62,8 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.max_turns = args.max_turns
     if args.temperature is not None:
         cfg.temperature = args.temperature
+    if args.context_window is not None:
+        cfg.context_window = args.context_window
     if args.plan:
         cfg.permission_mode = "plan"
     elif args.yolo:
@@ -86,16 +89,15 @@ def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
         s = display.stats
-        # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder, capped at 20
-        total_tokens = s.tokens
-        full_k = total_tokens // 1000
-        dots = min(full_k, 20)
-        bar = "o" * dots + ("+" if full_k > 20 else ("." if total_tokens % 1000 else ""))
-        token_str = (
-            f"tokens: {bar} prompt:{s.prompt_tokens:,} comp:{s.completion_tokens:,}"
-            if total_tokens
-            else "tokens: 0"
-        )
+        window = cfg.context_window
+        if s.tokens == 0:
+            token_str = "tokens: 0"
+        else:
+            token_str = (
+                f"tokens: {format_tokens_k(s.tokens, window)} "
+                f"prompt: {format_tokens_k(s.prompt_tokens, 0)} "
+                f"comp: {format_tokens_k(s.completion_tokens, 0)}"
+            )
         return FormattedText([
             ("", " "),
             (f"class:{color}", f"[{cfg.permission_mode}]"),
@@ -117,7 +119,7 @@ def run() -> None:
 async def _amain() -> None:
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
-    display = Display()
+    display = Display(context_window=cfg.context_window)
     client = Client(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
@@ -147,18 +149,25 @@ async def _amain() -> None:
             except (EOFError, KeyboardInterrupt):
                 return False
             return reply.strip().lower() in ("y", "yes")
- 
+
+        async def approve_fn(question: str) -> bool:
+            try:
+                reply = await asyncio.to_thread(input, f"  {question}")
+            except (EOFError, KeyboardInterrupt):
+                return False
+            return reply.strip().lower() in ("y", "yes")
+
         if args.message:
-            await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout)
+            await _run_one(cfg, client, display, prompt_fn, approve_fn, args.message, args.timeout)
             return
- 
+
         if not sys.stdin.isatty():
             msg = sys.stdin.read().strip()
             if msg:
-                await _run_one(cfg, client, display, None, msg, args.timeout)
+                await _run_one(cfg, client, display, None, None, msg, args.timeout)
             return
- 
-        await _interactive(cfg, client, display, prompt_fn, args.timeout)
+
+        await _interactive(cfg, client, display, prompt_fn, approve_fn, args.timeout)
     finally:
         await client.aclose()
  
@@ -186,65 +195,8 @@ async def _run_direct_command(cmd: str) -> int:
     return proc.returncode
 
 
-async def _show_exit_plan(cfg: Config, display: Display) -> None:
-    """Show exit plan from plan mode and ask user to proceed."""
-    if cfg.permission_mode != "plan":
-        display.warn("/exit-plan only works in plan mode")
-        return
-
-    # Show the problem
-    display.console.rule("[bold red]PROBLEM[/]", style="red")
-    display.info("The CLI agent in plan mode doesn't recognize its restrictions and")
-    display.info("attempts to use editing tools that should be blocked. This causes")
-    display.info("errors when users try to execute commands in plan mode.\n")
-
-    # Show the solution
-    display.console.rule("[bold green]SOLUTION[/]", style="green")
-    display.info("1. Create squishy/tool_restrictions.py with mode-aware tool checking\n")
-    display.info("2. Add /exit-plan command to cli.py that shows plan and switches modes\n")
-    display.info("3. Add screen clearing to /clear and /new commands in cli.py\n")
-    display.info("4. Update Agent to check restrictions before dispatching tools\n")
-    display.info("5. Enhance Display class with status reporting methods\n")
-
-    # Show files to create/modify
-    display.console.rule("[bold blue]FILES TO CREATE/MODIFY[/]", style="blue")
-    display.info("  [bold]Create:[/]")
-    display.info("    - squishy/tool_restrictions.py")
-    display.info("")
-    display.info("  [bold]Modify:[/]")
-    display.info("    - squishy/cli.py (import, /exit-plan command, screen clearing)")
-    display.info("    - squishy/agent.py (tool restriction checks)")
-    display.info("    - squishy/display.py (status reporting)\n")
-
-    # Show implementation steps
-    display.console.rule("[bold yellow]IMPLEMENTATION STEPS[/]", style="yellow")
-    display.info("  1. Create tool_restrictions.py with mode-aware tool checking functions")
-    display.info("  2. Add /exit-plan command to cli.py that shows plan and switches modes")
-    display.info("  3. Add screen clearing to /clear /new commands in cli.py")
-    display.info("  4. Update Agent's _run_tool to check restrictions before dispatch")
-    display.info("  5. Enhance Display class with status/progress methods\n")
-
-    # Ask for approval
-    display.console.rule("[bold magenta]PROCEED?[/]", style="magenta")
-    try:
-        reply = await asyncio.to_thread(input, "  Switch to edits mode and implement? [y/N] ")
-    except (EOFError, KeyboardInterrupt):
-        display.info("Cancelled.")
-        return
-
-    if reply.strip().lower() in ("y", "yes"):
-        # Switch to edits mode
-        cfg.permission_mode = "edits"
-        display.info("[bold green]✓ Switched to edits mode![/]")
-        
-        # Clear screen for the new session
-        os.system("clear" if os.name != "nt" else "cls")
-    else:
-        display.info("Cancelled - staying in plan mode.")
-
-
-async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
-    agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+async def _run_one(cfg, client, display, prompt_fn, approve_fn, message, timeout):  # type: ignore[no-untyped-def]
+    agent = Agent(cfg, client, display, prompt_fn=prompt_fn, approve_fn=approve_fn)
     try:
         await agent.run(message, timeout=timeout)
     except AgentTimeout as e:
@@ -255,7 +207,7 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: 
         display.error(f"LLM error: {e}")
  
 
-async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignore[no-untyped-def]
+async def _interactive(cfg, client, display, prompt_fn, approve_fn, timeout):  # type: ignore[no-untyped-def]
     kb = KeyBindings()
 
     @kb.add("s-tab")
@@ -269,7 +221,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
     )
 
     # Create initial agent
-    current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+    current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, approve_fn=approve_fn)
 
     while True:
         try:
@@ -296,31 +248,33 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             display.info(
                 "  /help                     — show this help\n"
                 "  /mode <plan|edits|yolo>   — switch permission mode\n"
-                "  /status                   — show current config\n"
-                "  /exit-plan                — exit plan mode with detailed plan\n"
+                "  /status                   — show current config + plan progress\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
                 "  /quit, /exit, /q          — exit squishy\n"
                 "\n"
                 "  !command                  — run shell command directly\n"
-                "  (e.g., !ls -la, !pip install requests)"
+                "  (e.g., !ls -la, !pip install requests)\n"
+                "\n"
+                "  In plan mode, the model calls `exit_plan_mode` to submit its plan\n"
+                "  for approval. Approved plans become a live checklist."
             )
             continue
         if line in ("/clear", "/new"):
             # Clear terminal screen
             os.system("clear" if os.name != "nt" else "cls")
             display.stats = Stats()
+            display.tracker.reset()
             # Rebuild agent with fresh conversation history
-            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, approve_fn=approve_fn)
             # Show intro banner with discovered model name
             display.banner(cfg.base_url, display.model or cfg.model)
             display.info("session cleared.")
             continue
         if line == "/status":
             display.status(cfg.permission_mode)
-            continue
-        if line == "/exit-plan":
-            await _show_exit_plan(cfg, display)
+            if display.tracker.is_active():
+                display.plan_status()
             continue
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")

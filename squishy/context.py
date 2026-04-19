@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass
 from typing import Any
  
-MAX_HISTORY = 10  # system + first user + last 8 = 10
+MAX_HISTORY = 20  # system + first user + last 18
  
  
 @dataclass
@@ -88,11 +88,18 @@ def detect_project(cwd: str) -> ProjectInfo:
     return ProjectInfo()
  
  
-def build_system_prompt(cwd: str, project: ProjectInfo, thinking: bool = False) -> str:
+def build_system_prompt(
+    cwd: str,
+    project: ProjectInfo,
+    thinking: bool = False,
+    *,
+    mode: str = "edits",
+    plan_block: str = "",
+) -> str:
     files = _top_level_files(cwd)
- 
+
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
- 
+
     project_block = f"Language: {project.language}\n"
     if project.framework:
         project_block += f"Framework: {project.framework}\n"
@@ -100,9 +107,12 @@ def build_system_prompt(cwd: str, project: ProjectInfo, thinking: bool = False) 
         project_block += f"Build: {project.build_command}\n"
     if project.test_command:
         project_block += f"Test: {project.test_command}\n"
- 
+
     index_block = _index_header(cwd)
- 
+
+    mode_block = _mode_guidance(mode)
+    plan_section = f"\n{plan_block}\n" if plan_block else ""
+
     return f"""You are squishy, a local coding assistant that edits files and runs commands to complete the user's task.
 
 {thinking_line}
@@ -114,7 +124,7 @@ def build_system_prompt(cwd: str, project: ProjectInfo, thinking: bool = False) 
 - Explore thoroughly when fixing bugs or implementing features - it's better to understand the codebase than to guess.
 - When you finish the user's task, respond with plain text summarizing what you did (no tool call).
 - To locate files or symbols, prefer `recall(query=...)` over walking with `list_directory` when an index is present.
-
+{mode_block}
 ## Project
 {project_block}
 ## Working directory
@@ -122,7 +132,21 @@ def build_system_prompt(cwd: str, project: ProjectInfo, thinking: bool = False) 
 
 ## Top-level files
 {', '.join(files) if files else '(empty)'}
-{index_block}"""
+{index_block}{plan_section}"""
+
+
+def _mode_guidance(mode: str) -> str:
+    if mode == "plan":
+        return (
+            "\n## Plan mode\n"
+            "You are in plan mode: write tools are disabled. Investigate the codebase "
+            "with read-only tools, then submit your plan by calling the `exit_plan_mode` "
+            "tool with fields: plan, problem, solution_steps, files_create, files_modify, "
+            "implementation_steps. Do NOT emit a plain-text plan instead — the user can "
+            "only approve the plan via that tool. If the user declines, refine and call "
+            "the tool again.\n"
+        )
+    return ""
  
  
 def _index_header(cwd: str) -> str:
@@ -189,22 +213,76 @@ def _top_level_files(cwd: str, limit: int = 50) -> list[str]:
  
 def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY) -> list[dict[str, Any]]:
     """Keep system + first user + last (max_messages - 2) messages.
- 
+
     Ported from atlas-proxy/agent.go:41-50. Preserves initial intent while
     bounding context size.
+
+    Additionally enforces tool_call / tool_result pairing: after tail slicing,
+    any orphan tool-result message (whose matching assistant tool_call is no
+    longer present) is dropped, and any assistant tool_calls whose result was
+    dropped from the tail are kept only when their result survives. Providers
+    (OpenAI, Anthropic) reject unpaired tool messages.
     """
     if len(messages) <= max_messages:
-        return messages
- 
+        return _drop_orphan_tool_messages(list(messages))
+
     system = [m for m in messages if m.get("role") == "system"]
     non_system = [m for m in messages if m.get("role") != "system"]
     if not non_system:
         return system
- 
+
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
     remaining_budget = max_messages - len(system) - len(first_user)
     tail = non_system[-remaining_budget:] if remaining_budget > 0 else []
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
-    return system + first_user + tail
+    return _drop_orphan_tool_messages(system + first_user + tail)
+
+
+def _drop_orphan_tool_messages(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove tool messages whose tool_call_id has no matching assistant tool_call
+    in the survivor set, and drop assistant tool_calls entries whose results are
+    missing. If that leaves an assistant message with neither content nor tool_calls,
+    drop the message itself.
+    """
+    # Collect all tool_call ids present in surviving assistant messages.
+    assistant_call_ids: set[str] = set()
+    for m in msgs:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                call_id = tc.get("id")
+                if isinstance(call_id, str):
+                    assistant_call_ids.add(call_id)
+
+    # Collect all tool_call_ids present in surviving tool messages.
+    tool_result_ids: set[str] = set()
+    for m in msgs:
+        if m.get("role") == "tool":
+            tcid = m.get("tool_call_id")
+            if isinstance(tcid, str):
+                tool_result_ids.add(tcid)
+
+    out: list[dict[str, Any]] = []
+    for m in msgs:
+        role = m.get("role")
+        if role == "tool":
+            tcid = m.get("tool_call_id")
+            if not isinstance(tcid, str) or tcid not in assistant_call_ids:
+                continue  # orphan — drop
+            out.append(m)
+            continue
+        if role == "assistant" and m.get("tool_calls"):
+            kept_calls = [
+                tc for tc in m["tool_calls"]
+                if isinstance(tc.get("id"), str) and tc["id"] in tool_result_ids
+            ]
+            if kept_calls:
+                m = {**m, "tool_calls": kept_calls}
+            else:
+                # No surviving results — drop tool_calls. If no content either, drop the message.
+                if not m.get("content"):
+                    continue
+                m = {k: v for k, v in m.items() if k != "tool_calls"}
+        out.append(m)
+    return out

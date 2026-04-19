@@ -1,14 +1,23 @@
 """Tool data types. Async-native."""
- 
+
 from __future__ import annotations
- 
+
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any
- 
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from squishy.config import Config
+    from squishy.display import Display
+    from squishy.plan_tracker import PlanTracker
+
 ToolRun = Callable[[dict[str, Any], "ToolContext"], Awaitable["ToolResult"]]
- 
- 
+# Prompt function used by tools that need a free-form yes/no confirmation
+# (e.g. exit_plan_mode). Distinct from the per-tool permission prompt in
+# tools/__init__.py, which fires before dispatch.
+ApproveFn = Callable[[str], Awaitable[bool]]
+
+
 @dataclass
 class ToolContext:
     working_dir: str
@@ -16,6 +25,13 @@ class ToolContext:
     permission_mode: str = "edits"
     sandbox_image: str = "python:3.11-slim"
     use_sandbox: bool = True
+    # Optional shared state for plan-mode tools. These are set when the Agent
+    # owns a Config/Display/PlanTracker (i.e. always in CLI use, sometimes in
+    # tests). Plan tools fail gracefully when unset.
+    cfg_ref: "Config | None" = None
+    tracker: "PlanTracker | None" = None
+    display: "Display | None" = None
+    approve_fn: ApproveFn | None = None
  
  
 @dataclass

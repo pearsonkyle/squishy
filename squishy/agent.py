@@ -22,6 +22,7 @@ from squishy.context import build_system_prompt, detect_project, trim_history
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tools import PromptFn, ToolContext, dispatch, openai_schemas
+from squishy.tools.base import ApproveFn
 
 log = logging.getLogger("squishy.agent")
 
@@ -48,19 +49,29 @@ class Agent:
     client: Client
     display: Display | None = None
     prompt_fn: PromptFn | None = None
+    approve_fn: ApproveFn | None = None
     tool_ctx: ToolContext = field(init=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
- 
+
     def __post_init__(self) -> None:
         self.tool_ctx = ToolContext(
             working_dir=self.config.working_dir,
             permission_mode=self.config.permission_mode,
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
+            cfg_ref=self.config,
+            tracker=self.display.tracker if self.display is not None else None,
+            display=self.display,
+            approve_fn=self.approve_fn,
         )
         project = detect_project(self.config.working_dir)
+        self._project = project
         system_prompt = build_system_prompt(
-            self.config.working_dir, project, self.config.thinking
+            self.config.working_dir,
+            project,
+            self.config.thinking,
+            mode=self.config.permission_mode,
+            plan_block="",
         )
         self.messages.append(
             {
@@ -68,11 +79,6 @@ class Agent:
                 "content": system_prompt,
             }
         )
-        
-        # Add token estimation for system prompt
-        if self.display is not None:
-            self.display.stats.prompt_tokens += estimate_tokens(system_prompt)
-        
         self._check_index_staleness()
  
     def _check_index_staleness(self) -> None:
@@ -111,24 +117,11 @@ class Agent:
         except asyncio.CancelledError:
             raise AgentCancelled("task cancelled by caller") from None
 
-    def _add_tool_result_messages(self) -> None:
-        """Add token estimation for any pending tool result messages in history."""
-        if self.display is None:
-            return
-
-    def _count_prompt_tokens_from_messages(self) -> int:
-        """Estimate prompt tokens from current messages (after trim_history)."""
-        total = 0
-        for msg in self.messages:
-            if msg.get("content"):
-                total += estimate_tokens(msg["content"])
-        return total
-
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_errors = 0
         schemas = openai_schemas()
         result = TaskResult(success=False)
-        total_prompt_tokens = 0
+        last_prompt_tokens = 0
         completion_tokens = 0
         files_created: set[str] = set()
         files_edited: set[str] = set()
@@ -136,6 +129,9 @@ class Agent:
 
         for turn in range(1, self.config.max_turns + 1):
             self.tool_ctx.permission_mode = self.config.permission_mode
+            # Refresh the system message so permission-mode guidance and the
+            # active plan block reflect the current session state.
+            self._refresh_system_message()
             # Trim history before sending to LLM
             self.messages[:] = trim_history(self.messages)
 
@@ -157,24 +153,29 @@ class Agent:
             if completion.text and self.display:
                 self.display.console.print()
 
-            # Count tokens from messages after trimming
-            msg_prompt_tokens = self._count_prompt_tokens_from_messages()
-
-            # Track LLM response tokens (total prompt = messages + LLM's reported usage)
-            total_prompt_tokens += msg_prompt_tokens
+            # Prefer real usage from the API. Fall back to a char-based estimate
+            # if the provider didn't return usage (rare with streaming).
+            if completion.prompt_tokens:
+                last_prompt_tokens = completion.prompt_tokens
+            else:
+                last_prompt_tokens = sum(
+                    estimate_tokens(str(m.get("content") or "")) for m in self.messages
+                )
             completion_tokens += completion.completion_tokens
+
+            if self.display:
+                self.display.stats.prompt_tokens = last_prompt_tokens
+                self.display.stats.completion_tokens = completion_tokens
 
             if not completion.tool_calls:
                 if completion.text:
                     self.messages.append({"role": "assistant", "content": completion.text})
                 if self.display:
-                    self.display.stats.prompt_tokens = total_prompt_tokens
-                    self.display.stats.completion_tokens = completion_tokens
                     self.display.summary(turn, time.monotonic() - start)
                 result.success = True
                 result.final_text = completion.text
                 result.turns_used = turn
-                result.tokens_used = total_prompt_tokens + completion_tokens
+                result.tokens_used = last_prompt_tokens + completion_tokens
                 result.files_created = sorted(files_created)
                 result.files_edited = sorted(files_edited)
                 result.commands_run = commands_run
@@ -203,7 +204,7 @@ class Agent:
                         self.display.error(msg)
                     result.error = msg
                     result.turns_used = turn
-                    result.tokens_used = total_prompt_tokens + completion_tokens
+                    result.tokens_used = last_prompt_tokens + completion_tokens
                     result.files_created = sorted(files_created)
                     result.files_edited = sorted(files_edited)
                     result.commands_run = commands_run
@@ -214,12 +215,10 @@ class Agent:
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:
             self.display.warn(msg)
-            self.display.stats.prompt_tokens = total_prompt_tokens
-            self.display.stats.completion_tokens = completion_tokens
             self.display.summary(self.config.max_turns, time.monotonic() - start)
         result.error = msg
         result.turns_used = self.config.max_turns
-        result.tokens_used = total_prompt_tokens + completion_tokens
+        result.tokens_used = last_prompt_tokens + completion_tokens
         result.files_created = sorted(files_created)
         result.files_edited = sorted(files_edited)
         result.commands_run = commands_run
@@ -277,6 +276,23 @@ class Agent:
     async def _on_text(self, chunk: str) -> None:
         if self.display:
             self.display.streaming_text_chunk(chunk)
+
+    def _refresh_system_message(self) -> None:
+        """Rebuild messages[0] with current mode + active plan block."""
+        plan_block = ""
+        if self.display is not None and self.display.tracker.is_active():
+            plan_block = self.display.tracker.render_block()
+        new_system = build_system_prompt(
+            self.config.working_dir,
+            self._project,
+            self.config.thinking,
+            mode=self.config.permission_mode,
+            plan_block=plan_block,
+        )
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0] = {"role": "system", "content": new_system}
+        else:
+            self.messages.insert(0, {"role": "system", "content": new_system})
  
  
 def _assistant_msg(text: str, tool_calls: list[ToolCall]) -> dict[str, Any]:

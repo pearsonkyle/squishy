@@ -56,10 +56,20 @@ Useful flags:
 --timeout SECONDS          overall per-turn wall-clock timeout
 --request-timeout SECONDS  per-HTTP-request timeout (default 120)
 --max-retries N            transient-failure retry budget (default 4)
+--context-window N         model context size in tokens (default 128000)
 --sandbox                  wrap run_command in Docker
 --init                     build .squishy/index.json before the REPL
 --no-summaries             skip LLM summaries when indexing (docstrings only)
 --index-concurrency N      parallel summary calls (default 4)
+```
+
+The bottom toolbar reads `tokens: 12.3 K (10%)` where the percentage is
+`tokens / context_window`. Override the default for smaller local models:
+
+```bash
+SQUISHY_CONTEXT_WINDOW=32000 squishy
+# or
+squishy --context-window 8000
 ```
 
 ## Repo index (`/init`)
@@ -93,6 +103,19 @@ Three modes, cycle with **Shift+Tab** during a session:
 | `yolo` | auto | auto | auto |
 
 Set the starting mode with `--plan`, `--edits`, or `--yolo`.
+
+### Plan mode workflow
+
+In plan mode the model investigates the codebase with read-only tools, then
+submits a plan for approval by calling the `exit_plan_mode` tool. Squishy
+renders the plan (problem / solution / files / implementation steps) and
+asks the user to approve. On approval the session flips to `edits` mode and
+the implementation steps become a live checklist.
+
+As the agent executes the plan it marks progress with `update_plan_step`
+(`in_progress` → `done` → `skipped`). The current checklist is injected into
+the system prompt every turn so the model always knows where it is. Use
+`/status` to print the current plan state at any time; `/clear` resets it.
 
 ## Python API
 
@@ -196,10 +219,12 @@ Each task runs in a fresh temp workspace, the verify shell is scored pass/fail b
 | `search_files` | Regex search via ripgrep if available, Python `re` otherwise |
 | `recall` | Ranked lookup in the `/init` index — path, lines, summary |
 | `run_command` | Shell execution, sandboxed in Docker when `--sandbox` and Docker are available |
+| `exit_plan_mode` | Submit the model's plan for user approval (plan-mode only) |
+| `update_plan_step` | Mark an implementation step in_progress/done/skipped during execution |
 
 ## Safety patterns (ported from ATLAS)
 
-- **Conversation trim** to `system + first_user + last_8` messages.
+- **Conversation trim** to `system + first_user + last_18` messages, with automatic drop of orphan `tool_call` / `tool_result` halves (providers reject unpaired tool messages).
 - **Explore budget**: warns after 4 consecutive reads, refuses the 5th and nudges the model to write.
 - **Error loop breaker**: 3 consecutive tool failures → stop.
 - **Write-file guard**: rejects `write_file` on existing files >100 lines, forces the model to use `edit_file`.
@@ -244,9 +269,11 @@ squishy/
     summarize.py      # optional LLM summaries with concurrency + budget
     staleness.py      # mtime-based freshness check
     store.py          # save/load .squishy/index.json
+  plan_tracker.py # live PlanTracker / PlanStep for approved plans
   tools/
     base.py       # Tool, ToolResult, ToolContext dataclasses
     fs.py         # 5 filesystem tools (async)
+    plan.py       # exit_plan_mode + update_plan_step
     recall.py     # lexical index lookup
     shell.py      # run_command (async, optional Docker sandbox)
     __init__.py   # registry + dispatch + permission gate

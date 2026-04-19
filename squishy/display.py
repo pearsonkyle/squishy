@@ -10,6 +10,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
+from squishy.plan_tracker import PlanTracker
+
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
 
@@ -19,6 +21,23 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     return math.ceil(len(text) / 4)
+
+
+def format_tokens_k(n: int, window: int = 0) -> str:
+    """Format a token count as "1.2 K (10%)" or "847 (1%)".
+
+    When ``window`` is zero or negative, the percentage is omitted.
+    Percentage is rounded to the nearest integer; values above 999 render
+    with one decimal of K.
+    """
+    if n < 1000:
+        head = f"{n}"
+    else:
+        head = f"{n / 1000:.1f} K"
+    if window <= 0:
+        return head
+    pct = int(round((n / window) * 100))
+    return f"{head} ({pct}%)"
 
 
 ICONS = {
@@ -45,10 +64,12 @@ class Stats:
 
 
 class Display:
-    def __init__(self) -> None:
+    def __init__(self, context_window: int = 0) -> None:
         self.console = Console()
         self.stats = Stats()
         self.model: str = ""
+        self.context_window = context_window
+        self.tracker = PlanTracker()
 
     def banner(self, base_url: str, model: str) -> None:
         self.model = model
@@ -131,8 +152,12 @@ class Display:
  
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats
+        w = self.context_window
         lines = [
-            f"turns: {turns}  |  elapsed: {elapsed_s:.1f}s  |  prompt: {s.prompt_tokens:,}  |  completion: {s.completion_tokens:,}",
+            f"turns: {turns}  |  elapsed: {elapsed_s:.1f}s  |  "
+            f"tokens: {format_tokens_k(s.tokens, w)}  |  "
+            f"prompt: {format_tokens_k(s.prompt_tokens, 0)}  |  "
+            f"comp: {format_tokens_k(s.completion_tokens, 0)}",
         ]
         if s.files_created:
             lines.append(f"created: {', '.join(sorted(s.files_created))}")
@@ -152,7 +177,7 @@ class Display:
         
         lines = [
             f"mode:     {mode}",
-            f"tokens:   {self.stats.prompt_tokens + self.stats.completion_tokens:,} total",
+            f"tokens:   {format_tokens_k(self.stats.tokens, self.context_window)} total",
         ]
         
         if mode == "plan":
@@ -166,6 +191,17 @@ class Display:
             lines.append("tools:    all (unrestricted)")
         
         self.console.print("\n".join(lines))
+
+    def plan_status(self) -> None:
+        """Render the active plan's step list with status glyphs."""
+        t = self.tracker
+        if not t.is_active():
+            return
+        glyph = {"done": "[green]✓[/]", "in_progress": "[yellow]►[/]", "pending": "[dim]·[/]", "skipped": "[dim]⊘[/]"}
+        lines = ["[bold]Plan progress[/]"]
+        for s in t.steps:
+            lines.append(f"  {glyph.get(s.status, '·')} {s.index}. {s.description}")
+        self.console.print(Panel("\n".join(lines), border_style="cyan"))
 
     def progress(self, current: int, total: int, message: str = "") -> None:
         """Display progress indicator."""
