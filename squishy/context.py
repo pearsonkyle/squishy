@@ -115,6 +115,12 @@ def build_system_prompt(cwd: str, project: ProjectInfo, thinking: bool = False) 
 - When you finish the user's task, respond with plain text summarizing what you did (no tool call).
 - To locate files or symbols, prefer `recall(query=...)` over walking with `list_directory` when an index is present.
 
+## Planning
+- For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
+- The user will be asked to approve the plan before you proceed.
+- After the plan is approved, call `update_plan(step_index=N, status="done")` as you complete each step.
+- This keeps the user informed of progress through their task.
+
 ## Project
 {project_block}
 ## Working directory

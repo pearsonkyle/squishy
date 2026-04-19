@@ -20,7 +20,6 @@ from squishy.client import Client
 from squishy.config import Config
 from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
-from squishy.tool_restrictions import get_allowed_tools, get_denied_tools, get_tool_category
 from squishy.tools.base import Tool
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
@@ -86,16 +85,15 @@ def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
         s = display.stats
-        # Token usage bar: each 'o' = 1k tokens, '.' = <1k remainder, capped at 20
-        total_tokens = s.tokens
-        full_k = total_tokens // 1000
-        dots = min(full_k, 20)
-        bar = "o" * dots + ("+" if full_k > 20 else ("." if total_tokens % 1000 else ""))
-        token_str = (
-            f"tokens: {bar} prompt:{s.prompt_tokens:,} comp:{s.completion_tokens:,}"
-            if total_tokens
-            else "tokens: 0"
-        )
+        cw = s.context_window
+        total = s.tokens
+        if total:
+            from squishy.display import fmt_tokens
+            prompt_str = fmt_tokens(s.prompt_tokens, cw)
+            comp_str = fmt_tokens(s.completion_tokens)
+            token_str = f"tokens: {fmt_tokens(total, cw)} prompt:{prompt_str} comp:{comp_str}"
+        else:
+            token_str = "tokens: 0"
         return FormattedText([
             ("", " "),
             (f"class:{color}", f"[{cfg.permission_mode}]"),
@@ -118,6 +116,7 @@ async def _amain() -> None:
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
     display = Display()
+    display.stats.context_window = cfg.max_tokens
     client = Client(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
@@ -297,6 +296,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 "  /help                     — show this help\n"
                 "  /mode <plan|edits|yolo>   — switch permission mode\n"
                 "  /status                   — show current config\n"
+                "  /plan                     — show active plan progress\n"
                 "  /exit-plan                — exit plan mode with detailed plan\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
@@ -309,7 +309,9 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         if line in ("/clear", "/new"):
             # Clear terminal screen
             os.system("clear" if os.name != "nt" else "cls")
+            cw = display.stats.context_window
             display.stats = Stats()
+            display.stats.context_window = cw
             # Rebuild agent with fresh conversation history
             current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
             # Show intro banner with discovered model name
@@ -318,6 +320,14 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             continue
         if line == "/status":
             display.status(cfg.permission_mode)
+            continue
+        if line == "/plan":
+            # Show active plan progress
+            plan = getattr(current_agent.tool_ctx, "active_plan", None)
+            if plan:
+                display.plan_panel(plan)
+            else:
+                display.info("no active plan")
             continue
         if line == "/exit-plan":
             await _show_exit_plan(cfg, display)
