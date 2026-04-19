@@ -162,10 +162,10 @@ class Display:
         for i, step in enumerate(data.get("steps", []), 1):
             desc = step if isinstance(step, str) else step.get("description", "")
             status = "" if isinstance(step, str) else step.get("status", "pending")
-            icon = {"done": "[green]✓[/]", "in-progress": "[cyan]▶[/]", "skipped": "[dim]—[/]"}.get(
+            status_icon = {"done": "[green]✓[/]", "in-progress": "[cyan]▶[/]", "skipped": "[dim]—[/]"}.get(
                 status, "[dim]○[/]"
             )
-            lines.append(f"  {icon} {i}. {desc}")
+            lines.append(f"  {status_icon} {i}. {desc}")
 
         if data.get("files_to_create"):
             lines.append("")

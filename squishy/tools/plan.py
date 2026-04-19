@@ -110,8 +110,8 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     progress_lines = []
     for i, s in enumerate(steps, 1):
-        icon = {"done": "✓", "in-progress": "▶", "skipped": "—", "pending": "○"}
-        mark = icon.get(s["status"], "?")
+        status_icons = {"done": "✓", "in-progress": "▶", "skipped": "—", "pending": "○"}
+        mark = status_icons.get(s["status"], "?")
         progress_lines.append(f"  {mark} {i}. {s['description']}")
 
     summary = (

@@ -56,10 +56,10 @@ class TestStatsContextWindow:
 
 @pytest.mark.asyncio
 class TestPlanTask:
-    async def test_plan_task_basic(self) -> None:
+    async def test_plan_task_basic(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="plan", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
         result = await _plan_task(
             {
                 "problem": "Tests are failing",
@@ -77,10 +77,10 @@ class TestPlanTask:
         # Plan should be stored on context
         assert hasattr(ctx, "active_plan")
 
-    async def test_plan_task_missing_problem(self) -> None:
+    async def test_plan_task_missing_problem(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="plan", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
         result = await _plan_task(
             {
                 "solution": "Fix it",
@@ -91,10 +91,10 @@ class TestPlanTask:
         assert not result.success
         assert "problem" in result.error
 
-    async def test_plan_task_missing_steps(self) -> None:
+    async def test_plan_task_missing_steps(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="plan", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
         result = await _plan_task(
             {
                 "problem": "broken",
@@ -106,10 +106,10 @@ class TestPlanTask:
         assert not result.success
         assert "steps" in result.error
 
-    async def test_plan_task_with_all_fields(self) -> None:
+    async def test_plan_task_with_all_fields(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="plan", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
         result = await _plan_task(
             {
                 "plan": "Fix failing tests",
@@ -129,10 +129,10 @@ class TestPlanTask:
 
 @pytest.mark.asyncio
 class TestUpdatePlan:
-    async def test_update_plan_marks_done(self) -> None:
+    async def test_update_plan_marks_done(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task, _update_plan
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="edits", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
         await _plan_task(
             {
                 "problem": "p",
@@ -146,18 +146,18 @@ class TestUpdatePlan:
         assert result.data["progress"]["done"] == 1
         assert result.data["progress"]["pending"] == 2
 
-    async def test_update_plan_no_active_plan(self) -> None:
+    async def test_update_plan_no_active_plan(self, tmp_path) -> None:
         from squishy.tools.plan import _update_plan
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="edits", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
         result = await _update_plan({"step_index": 1, "status": "done"}, ctx)
         assert not result.success
         assert "no active plan" in result.error
 
-    async def test_update_plan_out_of_range(self) -> None:
+    async def test_update_plan_out_of_range(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task, _update_plan
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="edits", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
         await _plan_task(
             {"problem": "p", "solution": "s", "steps": ["step1"]},
             ctx,
@@ -166,10 +166,10 @@ class TestUpdatePlan:
         assert not result.success
         assert "out of range" in result.error
 
-    async def test_update_plan_invalid_status(self) -> None:
+    async def test_update_plan_invalid_status(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task, _update_plan
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="edits", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
         await _plan_task(
             {"problem": "p", "solution": "s", "steps": ["step1"]},
             ctx,
@@ -177,10 +177,10 @@ class TestUpdatePlan:
         result = await _update_plan({"step_index": 1, "status": "invalid"}, ctx)
         assert not result.success
 
-    async def test_update_plan_in_progress(self) -> None:
+    async def test_update_plan_in_progress(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task, _update_plan
 
-        ctx = ToolContext(working_dir="/tmp", permission_mode="edits", use_sandbox=False)
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
         await _plan_task(
             {"problem": "p", "solution": "s", "steps": ["step1", "step2"]},
             ctx,
