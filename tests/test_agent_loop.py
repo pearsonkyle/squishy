@@ -114,36 +114,14 @@ async def test_agent_refuses_write_in_plan_mode(tmp_path):
     assert any("plan mode" in (m.get("content") or "") for m in tool_msgs)
  
  
-async def test_agent_consecutive_reads_refused_after_five(tmp_path):
-    """4+ consecutive reads get warned; 5th is refused and the model is nudged to write."""
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "yolo"
-    cfg.max_turns = 20
- 
-    # Create a file so reads succeed (otherwise the error-breaker would stop us first)
-    (tmp_path / "a.txt").write_text("x")
- 
-    script = [
-        CompletionResult(tool_calls=[_tc("read_file", {"path": "a.txt"}, call_id=f"c{i}")])
-        for i in range(10)
-    ]
-    fake = FakeClient(script=script)
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("read lots")
- 
-    # The 5th read onward should be refused via a synthetic tool_result
-    tool_msgs = [m for m in result.messages if m.get("role") == "tool"]
-    refusal_msgs = [m for m in tool_msgs if "Further reads refused" in (m.get("content") or "")]
-    assert refusal_msgs
- 
- 
+
+
 async def test_agent_runs_headless_without_display(tmp_path):
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "yolo"
     cfg.max_turns = 5
- 
+
     fake = FakeClient(
         script=[
             CompletionResult(
@@ -154,6 +132,32 @@ async def test_agent_runs_headless_without_display(tmp_path):
     )
     agent = Agent(cfg, fake, display=None)  # type: ignore[arg-type]
     result = await agent.run("write a.py")
- 
+
     assert result.success
     assert (tmp_path / "a.py").read_text() == "x"
+
+
+async def test_agent_allows_many_consecutive_reads(tmp_path):
+    """Verify that many consecutive reads are allowed (no artificial limit)."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 20
+
+    # Create multiple files so reads succeed
+    for i in range(15):
+        (tmp_path / f"file{i}.txt").write_text(f"content {i}")
+
+    script = [
+        CompletionResult(tool_calls=[_tc("read_file", {"path": f"file{i}.txt"}, call_id=f"c{i}")])
+        for i in range(15)
+    ] + [CompletionResult(text="done.", tool_calls=[])]
+    fake = FakeClient(script=script)
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    result = await agent.run("read many files")
+
+    # All 15 reads should succeed followed by final text - no artificial refusal limit
+    assert result.success
+    tool_msgs = [m for m in result.messages if m.get("role") == "tool"]
+    refusal_msgs = [m for m in tool_msgs if "refused" in (m.get("content") or "").lower()]
+    assert not refusal_msgs, f"Should allow many reads without refusal: {refusal_msgs}"

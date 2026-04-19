@@ -11,6 +11,9 @@ from rich.panel import Panel
 from rich.text import Text
 
 
+MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
+
+
 def estimate_tokens(text: str) -> int:
     """Estimate token count using ~4 chars per token heuristic."""
     if not text:
@@ -45,8 +48,10 @@ class Display:
     def __init__(self) -> None:
         self.console = Console()
         self.stats = Stats()
- 
+        self.model: str = ""
+
     def banner(self, base_url: str, model: str) -> None:
+        self.model = model
         self.console.print(
             Panel.fit(
                 f"[bold]squishy[/] — local coding agent\n"
@@ -55,7 +60,7 @@ class Display:
                 border_style="blue",
             )
         )
- 
+
     def turn_header(self, turn: int, max_turns: int, tool_name: str, brief: str) -> None:
         icon = ICONS.get(tool_name, "•")
         self.console.print(f"[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]")
@@ -136,3 +141,63 @@ class Display:
         if s.commands_run:
             lines.append(f"commands: {s.commands_run}")
         self.console.print(Panel("\n".join(lines), title="✓ done", border_style="green"))
+
+    def status(self, mode: str) -> None:
+        """Display current configuration and tool availability."""
+        from squishy.tool_restrictions import get_allowed_tools, get_denied_tools
+
+        allowed = get_allowed_tools(mode)
+        
+        self.console.rule(f"[bold]{mode.upper()} MODE[/]", style=MODE_COLORS.get(mode, "dim"))
+        
+        lines = [
+            f"mode:     {mode}",
+            f"tokens:   {self.stats.prompt_tokens + self.stats.completion_tokens:,} total",
+        ]
+        
+        if mode == "plan":
+            lines.append("tools:    read-only only")
+            lines.append(f"  allowed: {', '.join(sorted(allowed))}")
+        elif mode == "edits":
+            lines.append("tools:    read + write")
+            lines.append(f"  allowed: {', '.join(sorted(allowed))}")
+            lines.append("  denied:  run_command (requires prompt)")
+        else:  # yolo
+            lines.append("tools:    all (unrestricted)")
+        
+        self.console.print("\n".join(lines))
+
+    def progress(self, current: int, total: int, message: str = "") -> None:
+        """Display progress indicator."""
+        if total == 0:
+            percent = 100
+        else:
+            percent = (current * 100) // total
+        
+        bar_width = 40
+        filled = int(bar_width * percent / 100)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        
+        if message:
+            self.console.print(f"[dim]{message}[/] {bar} {percent}% ({current}/{total})")
+        else:
+            self.console.print(f"{bar} {percent}% ({current}/{total})")
+
+    def tool_categories(self, mode: str) -> None:
+        """Display tools organized by category for given mode."""
+        from squishy.tool_restrictions import get_allowed_tools, get_denied_tools
+        
+        allowed = get_allowed_tools(mode)
+        denied = get_denied_tools(mode)
+        
+        self.console.rule("TOOL CATEGORIES", style="blue")
+        
+        if allowed:
+            self.console.print(f"\n[bold green]ALLOWED IN {mode.upper()}[/]:")
+            for tool in sorted(allowed):
+                self.console.print(f"  ✓ {tool}")
+        
+        if denied:
+            self.console.print(f"\n[bold red]DENIED IN {mode.upper()}[/]:")
+            for tool in sorted(denied):
+                self.console.print(f"  ✗ {tool}")

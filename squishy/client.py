@@ -95,7 +95,7 @@ class Client:
  
     async def __aexit__(self, *_: Any) -> None:
         await self.aclose()
- 
+
     async def health(self) -> bool:
         try:
             await self._client.models.list()
@@ -103,7 +103,24 @@ class Client:
         except Exception as e:  # noqa: BLE001
             log.debug("health check failed: %s", e)
             return False
- 
+
+    async def discover_model_name(self) -> str:
+        """Try to discover the actual model name from the endpoint.
+        
+        Returns the configured model if discovery fails, or 'unknown-model'.
+        """
+        try:
+            # Try to list models and get the first one
+            models = await self._client.models.list()
+            if models.data:
+                # Return the first model's id
+                return models.data[0].id
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # Return configured model name if discovery fails
+        return self.model
+
     async def complete(
         self,
         messages: list[dict[str, Any]],

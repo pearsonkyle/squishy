@@ -20,6 +20,7 @@ from squishy.client import Client
 from squishy.config import Config
 from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
+from squishy.tool_restrictions import get_allowed_tools, get_denied_tools, get_tool_category
 from squishy.tools.base import Tool
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
@@ -112,7 +113,7 @@ def _prompt_text(cfg: Config) -> FormattedText:
 def run() -> None:
     asyncio.run(_amain())
  
- 
+
 async def _amain() -> None:
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
@@ -126,10 +127,12 @@ async def _amain() -> None:
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
     )
- 
+
     try:
-        display.banner(cfg.base_url, cfg.model)
- 
+        # Discover the actual model name from endpoint
+        discovered_model = await client.discover_model_name()
+        display.banner(cfg.base_url, discovered_model)
+
         if not await client.health():
             display.error(f"Cannot reach OpenAI endpoint at {cfg.base_url}.")
             display.info("Start LM Studio ('lms server start') or vLLM, then re-run.")
@@ -170,17 +173,74 @@ async def _run_direct_command(cmd: str) -> int:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    
+
     stdout, stderr = await proc.communicate()
-    
+
     if stdout:
         sys.stdout.write(stdout.decode("utf-8", errors="replace"))
         sys.stdout.flush()
     if stderr:
         sys.stderr.write(stderr.decode("utf-8", errors="replace"))
         sys.stderr.flush()
-    
+
     return proc.returncode
+
+
+async def _show_exit_plan(cfg: Config, display: Display) -> None:
+    """Show exit plan from plan mode and ask user to proceed."""
+    if cfg.permission_mode != "plan":
+        display.warn("/exit-plan only works in plan mode")
+        return
+
+    # Show the problem
+    display.console.rule("[bold red]PROBLEM[/]", style="red")
+    display.info("The CLI agent in plan mode doesn't recognize its restrictions and")
+    display.info("attempts to use editing tools that should be blocked. This causes")
+    display.info("errors when users try to execute commands in plan mode.\n")
+
+    # Show the solution
+    display.console.rule("[bold green]SOLUTION[/]", style="green")
+    display.info("1. Create squishy/tool_restrictions.py with mode-aware tool checking\n")
+    display.info("2. Add /exit-plan command to cli.py that shows plan and switches modes\n")
+    display.info("3. Add screen clearing to /clear and /new commands in cli.py\n")
+    display.info("4. Update Agent to check restrictions before dispatching tools\n")
+    display.info("5. Enhance Display class with status reporting methods\n")
+
+    # Show files to create/modify
+    display.console.rule("[bold blue]FILES TO CREATE/MODIFY[/]", style="blue")
+    display.info("  [bold]Create:[/]")
+    display.info("    - squishy/tool_restrictions.py")
+    display.info("")
+    display.info("  [bold]Modify:[/]")
+    display.info("    - squishy/cli.py (import, /exit-plan command, screen clearing)")
+    display.info("    - squishy/agent.py (tool restriction checks)")
+    display.info("    - squishy/display.py (status reporting)\n")
+
+    # Show implementation steps
+    display.console.rule("[bold yellow]IMPLEMENTATION STEPS[/]", style="yellow")
+    display.info("  1. Create tool_restrictions.py with mode-aware tool checking functions")
+    display.info("  2. Add /exit-plan command to cli.py that shows plan and switches modes")
+    display.info("  3. Add screen clearing to /clear /new commands in cli.py")
+    display.info("  4. Update Agent's _run_tool to check restrictions before dispatch")
+    display.info("  5. Enhance Display class with status/progress methods\n")
+
+    # Ask for approval
+    display.console.rule("[bold magenta]PROCEED?[/]", style="magenta")
+    try:
+        reply = await asyncio.to_thread(input, "  Switch to edits mode and implement? [y/N] ")
+    except (EOFError, KeyboardInterrupt):
+        display.info("Cancelled.")
+        return
+
+    if reply.strip().lower() in ("y", "yes"):
+        # Switch to edits mode
+        cfg.permission_mode = "edits"
+        display.info("[bold green]✓ Switched to edits mode![/]")
+        
+        # Clear screen for the new session
+        os.system("clear" if os.name != "nt" else "cls")
+    else:
+        display.info("Cancelled - staying in plan mode.")
 
 
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
@@ -194,20 +254,23 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: 
     except LLMError as e:
         display.error(f"LLM error: {e}")
  
- 
+
 async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignore[no-untyped-def]
     kb = KeyBindings()
- 
+
     @kb.add("s-tab")
     def _cycle(event):  # type: ignore[no-untyped-def]
         cfg.cycle_mode()
         event.app.invalidate()
- 
+
     session: PromptSession[str] = PromptSession(
         key_bindings=kb,
         bottom_toolbar=_bottom_toolbar(cfg, display),
     )
- 
+
+    # Create initial agent
+    current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+
     while True:
         try:
             line = await session.prompt_async(lambda: _prompt_text(cfg))
@@ -234,7 +297,8 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 "  /help                     — show this help\n"
                 "  /mode <plan|edits|yolo>   — switch permission mode\n"
                 "  /status                   — show current config\n"
-                "  /clear, /new              — reset session stats\n"
+                "  /exit-plan                — exit plan mode with detailed plan\n"
+                "  /clear, /new              — reset session stats and clear screen\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
                 "  /quit, /exit, /q          — exit squishy\n"
                 "\n"
@@ -243,11 +307,20 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             )
             continue
         if line in ("/clear", "/new"):
+            # Clear terminal screen
+            os.system("clear" if os.name != "nt" else "cls")
             display.stats = Stats()
+            # Rebuild agent with fresh conversation history
+            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+            # Show intro banner with discovered model name
+            display.banner(cfg.base_url, display.model or cfg.model)
             display.info("session cleared.")
             continue
         if line == "/status":
-            display.info(f"mode={cfg.permission_mode}  model={cfg.model}  url={cfg.base_url}")
+            display.status(cfg.permission_mode)
+            continue
+        if line == "/exit-plan":
+            await _show_exit_plan(cfg, display)
             continue
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")
@@ -266,11 +339,18 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         if line.startswith("/"):
             display.warn(f"unknown command: {line}")
             continue
- 
-        await _run_one(cfg, client, display, prompt_fn, line, timeout)
 
- 
- 
+        # Run task using current agent instance
+        try:
+            await current_agent.run(line, timeout=timeout)
+        except AgentTimeout as e:
+            display.error(str(e))
+        except AgentCancelled:
+            display.warn("cancelled")
+        except LLMError as e:
+            display.error(f"LLM error: {e}")
+
+
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:
     """Build/refresh the repo index at cfg.working_dir."""
     from squishy.index import (

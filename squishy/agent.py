@@ -1,13 +1,12 @@
 """Async agent loop. Safety patterns ported from atlas-proxy/agent.go:19-256.
- 
+
 - Conversation trim: system + first_user + last 8 (agent.go:41-50)
-- Consecutive read nudge: warn at 4, refuse at 5 (agent.go:203-241)
 - Error loop breaker: 3 consecutive tool failures -> stop (agent.go:38)
 - write_file-too-big guard: tools/fs.py:_write_file (agent.go:142-167)
 - Task-level timeout: asyncio.timeout wraps the entire run()
 - Cancellation: asyncio.CancelledError re-raised cleanly
 """
- 
+
 from __future__ import annotations
 
 import asyncio
@@ -25,10 +24,7 @@ from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.tools import PromptFn, ToolContext, dispatch, openai_schemas
 
 log = logging.getLogger("squishy.agent")
- 
-READ_ONLY_TOOLS = {"read_file", "list_directory", "search_files"}
-MAX_READS_BEFORE_WARN = 8
-MAX_READS_BEFORE_REFUSE = 10
+
 MAX_CONSECUTIVE_ERRORS = 3
  
  
@@ -129,7 +125,6 @@ class Agent:
         return total
 
     async def _run_loop(self, start: float) -> TaskResult:
-        consecutive_reads = 0
         consecutive_errors = 0
         schemas = openai_schemas()
         result = TaskResult(success=False)
@@ -164,7 +159,7 @@ class Agent:
 
             # Count tokens from messages after trimming
             msg_prompt_tokens = self._count_prompt_tokens_from_messages()
-            
+
             # Track LLM response tokens (total prompt = messages + LLM's reported usage)
             total_prompt_tokens += msg_prompt_tokens
             completion_tokens += completion.completion_tokens
@@ -188,22 +183,8 @@ class Agent:
                 return result
 
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls))
- 
-            any_mutating = False
+
             for tc in completion.tool_calls:
-                if tc.name in READ_ONLY_TOOLS:
-                    consecutive_reads += 1
-                    if consecutive_reads == MAX_READS_BEFORE_WARN and self.display:
-                        self.display.warn(f"{MAX_READS_BEFORE_WARN} consecutive reads — nudging model to write.")
-                    if consecutive_reads >= MAX_READS_BEFORE_REFUSE:
-                        msg = "You have enough context. Write or edit now. Further reads refused."
-                        if self.display:
-                            self.display.warn(msg)
-                        self._append_tool_result(tc, message=msg)
-                        continue
-                else:
-                    any_mutating = True
- 
                 outcome = await self._run_tool(turn, tc)
                 if outcome["success"]:
                     consecutive_errors = 0
@@ -215,7 +196,7 @@ class Agent:
                         commands_run += 1
                 else:
                     consecutive_errors += 1
- 
+
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     msg = f"{MAX_CONSECUTIVE_ERRORS} consecutive tool failures — stopping."
                     if self.display:
@@ -229,9 +210,6 @@ class Agent:
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
                     return result
-
-            if any_mutating:
-                consecutive_reads = 0
 
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:
