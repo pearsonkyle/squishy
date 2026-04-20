@@ -10,7 +10,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
 
 
@@ -21,6 +20,22 @@ def estimate_tokens(text: str) -> int:
     return math.ceil(len(text) / 4)
 
 
+def fmt_tokens(count: int, context_window: int = 0) -> str:
+    """Format a token count with K notation and optional window percentage.
+
+    Examples:
+        fmt_tokens(500)         -> "500"
+        fmt_tokens(1234)        -> "1.2K"
+        fmt_tokens(12345)       -> "12.3K"
+        fmt_tokens(1234, 8192)  -> "1.2K (15%)"
+    """
+    label = f"{count / 1000:.1f}K" if count >= 1000 else str(count)
+    if context_window > 0:
+        pct = count * 100 // context_window
+        return f"{label} ({pct}%)"
+    return label
+
+
 ICONS = {
     "read_file": "[cyan]📖[/]",
     "write_file": "[green]✎[/]",
@@ -28,6 +43,8 @@ ICONS = {
     "list_directory": "[cyan]📁[/]",
     "search_files": "[cyan]🔍[/]",
     "run_command": "[magenta]🔧[/]",
+    "plan_task": "[cyan]📋[/]",
+    "update_plan": "[cyan]📊[/]",
 }
 
 
@@ -38,6 +55,7 @@ class Stats:
     commands_run: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    context_window: int = 0
 
     @property
     def tokens(self) -> int:
@@ -128,11 +146,59 @@ class Display:
  
     def error(self, s: str) -> None:
         self.console.print(f"[red]✗ {s}[/]")
+
+    def plan_panel(self, data: dict) -> None:
+        """Render a structured plan in a Rich panel."""
+        lines: list[str] = []
+
+        if data.get("plan"):
+            lines.append(f"[bold]{data['plan']}[/]")
+            lines.append("")
+
+        lines.append(f"[bold red]Problem:[/]  {data.get('problem', '')}")
+        lines.append(f"[bold green]Solution:[/] {data.get('solution', '')}")
+        lines.append("")
+        lines.append("[bold yellow]Steps:[/]")
+        for i, step in enumerate(data.get("steps", []), 1):
+            desc = step if isinstance(step, str) else step.get("description", "")
+            status = "" if isinstance(step, str) else step.get("status", "pending")
+            status_icon = {"done": "[green]✓[/]", "in-progress": "[cyan]▶[/]", "skipped": "[dim]—[/]"}.get(
+                status, "[dim]○[/]"
+            )
+            lines.append(f"  {status_icon} {i}. {desc}")
+
+        if data.get("files_to_create"):
+            lines.append("")
+            lines.append("[bold blue]Create:[/]")
+            for f in data["files_to_create"]:
+                lines.append(f"  [green]+[/] {f}")
+
+        if data.get("files_to_modify"):
+            lines.append("")
+            lines.append("[bold blue]Modify:[/]")
+            for f in data["files_to_modify"]:
+                lines.append(f"  [yellow]~[/] {f}")
+
+        self.console.print(Panel("\n".join(lines), title="📋 Plan", border_style="cyan"))
+
+    def plan_progress(self, steps: list[dict]) -> None:
+        """Show a compact progress line for the active plan."""
+        total = len(steps)
+        done = sum(1 for s in steps if s.get("status") == "done")
+        in_prog = sum(1 for s in steps if s.get("status") == "in-progress")
+        bar_filled = int(20 * done / total) if total else 0
+        bar_active = int(20 * in_prog / total) if total else 0
+        bar_empty = 20 - bar_filled - bar_active
+        bar = "[green]█[/]" * bar_filled + "[cyan]▓[/]" * bar_active + "[dim]░[/]" * bar_empty
+        self.console.print(f"  plan: {bar} {done}/{total} steps done")
  
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats
+        cw = s.context_window
+        prompt_str = fmt_tokens(s.prompt_tokens, cw)
+        comp_str = fmt_tokens(s.completion_tokens)
         lines = [
-            f"turns: {turns}  |  elapsed: {elapsed_s:.1f}s  |  prompt: {s.prompt_tokens:,}  |  completion: {s.completion_tokens:,}",
+            f"turns: {turns}  |  elapsed: {elapsed_s:.1f}s  |  prompt: {prompt_str}  |  completion: {comp_str}",
         ]
         if s.files_created:
             lines.append(f"created: {', '.join(sorted(s.files_created))}")
@@ -144,15 +210,17 @@ class Display:
 
     def status(self, mode: str) -> None:
         """Display current configuration and tool availability."""
-        from squishy.tool_restrictions import get_allowed_tools, get_denied_tools
+        from squishy.tool_restrictions import get_allowed_tools
 
         allowed = get_allowed_tools(mode)
         
         self.console.rule(f"[bold]{mode.upper()} MODE[/]", style=MODE_COLORS.get(mode, "dim"))
         
+        s = self.stats
+        token_str = fmt_tokens(s.prompt_tokens + s.completion_tokens, s.context_window)
         lines = [
             f"mode:     {mode}",
-            f"tokens:   {self.stats.prompt_tokens + self.stats.completion_tokens:,} total",
+            f"tokens:   {token_str}",
         ]
         
         if mode == "plan":
@@ -169,10 +237,7 @@ class Display:
 
     def progress(self, current: int, total: int, message: str = "") -> None:
         """Display progress indicator."""
-        if total == 0:
-            percent = 100
-        else:
-            percent = (current * 100) // total
+        percent = 100 if total == 0 else (current * 100) // total
         
         bar_width = 40
         filled = int(bar_width * percent / 100)

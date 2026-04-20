@@ -21,7 +21,7 @@ from squishy.config import Config
 from squishy.context import build_system_prompt, detect_project, trim_history
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
-from squishy.tools import PromptFn, ToolContext, dispatch, openai_schemas
+from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_schemas
 
 log = logging.getLogger("squishy.agent")
 
@@ -246,7 +246,38 @@ class Agent:
         dt_ms = (time.monotonic() - t0) * 1000
 
         if self.display:
-            self.display.tool_result(outcome.success, outcome.display or outcome.error, dt_ms)
+            # Plan tool gets a rich panel instead of a plain tool_result line
+            if outcome.success and tc.name == "plan_task":
+                self.display.plan_panel(outcome.data)
+                # Ask user to approve the plan
+                approved = True
+                if self.prompt_fn is not None:
+                    try:
+                        from squishy.tools.base import Tool
+
+                        approved = await self.prompt_fn(
+                            Tool(name="plan_task", description="", parameters={},
+                                 run=lambda *_: None),  # type: ignore[arg-type]
+                            tc.args,
+                        )
+                    except (EOFError, KeyboardInterrupt):
+                        approved = False
+                if not approved:
+                    # Decline: clear the plan from context
+                    if hasattr(self.tool_ctx, "active_plan"):
+                        del self.tool_ctx.active_plan  # type: ignore[attr-defined]
+                    outcome = ToolResult(
+                        False, error="Plan declined by user. Ask for changes or a new approach."
+                    )
+            elif outcome.success and tc.name == "update_plan":
+                plan = getattr(self.tool_ctx, "active_plan", None)
+                if plan:
+                    self.display.plan_progress(plan.get("steps", []))
+            else:
+                self.display.tool_result(
+                    outcome.success, outcome.display or outcome.error, dt_ms
+                )
+
             if outcome.success and tc.name == "write_file":
                 self.display.write_preview(
                     str(tc.args.get("path", "?")), str(tc.args.get("content", ""))

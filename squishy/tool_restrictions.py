@@ -11,6 +11,8 @@ READ_ONLY_TOOLS = frozenset({
     "list_directory",
     "search_files",
     "recall",
+    "plan_task",
+    "update_plan",
 })
 
 MUTATING_TOOLS = frozenset({
@@ -63,9 +65,8 @@ def check_permission(tool_name: str, mode: str) -> tuple[bool, str]:
     if tool_name not in allowed:
         if mode == "plan":
             return False, "refused: plan mode is read-only"
-        if mode == "edits":
-            if tool_name in SHELL_TOOLS:
-                return False, "prompt"
+        if mode == "edits" and tool_name in SHELL_TOOLS:
+            return False, "prompt"
         if mode == "yolo":
             pass  # All tools allowed
     

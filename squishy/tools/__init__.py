@@ -6,16 +6,17 @@ Single source of truth for what the model can call:
 """
  
 from __future__ import annotations
- 
+
 from collections.abc import Awaitable, Callable
 
-from squishy.tools.base import Tool, ToolContext, ToolResult
 from squishy.tool_restrictions import check_permission as _check_permission
+from squishy.tools.base import Tool, ToolContext, ToolResult
 from squishy.tools.fs import FS_TOOLS
+from squishy.tools.plan import PLAN_TOOLS
 from squishy.tools.recall import RECALL_TOOLS
 from squishy.tools.shell import SHELL_TOOLS
 
-ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS]
+ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *PLAN_TOOLS]
 REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
 PromptFn = Callable[[Tool, dict[str, object]], Awaitable[bool]]
