@@ -224,8 +224,9 @@ class Display:
         ]
         
         if mode == "plan":
-            lines.append("tools:    read-only only")
+            lines.append("tools:    read-only + read-only shell allowlist")
             lines.append(f"  allowed: {', '.join(sorted(allowed))}")
+            lines.append("  run_command: ls, cat, grep, find, git log/status/diff, pytest --collect-only, ...")
         elif mode == "edits":
             lines.append("tools:    read + write")
             lines.append(f"  allowed: {', '.join(sorted(allowed))}")

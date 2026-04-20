@@ -35,8 +35,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--timeout", type=float, default=None, help="Task timeout in seconds")
     p.add_argument("--request-timeout", type=float, default=120.0)
     p.add_argument("--max-retries", type=int, default=4)
-    p.add_argument("--plan", action="store_true", help="Start in plan mode (read-only)")
-    p.add_argument("--edits", action="store_true", help="Start in edits mode (default)")
+    p.add_argument("--plan", action="store_true", help="Start in plan mode (default, read-only)")
+    p.add_argument("--edits", action="store_true", help="Start in edits mode")
     p.add_argument("--yolo", action="store_true", help="Start in yolo mode (no prompts)")
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
     p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
@@ -185,61 +185,51 @@ async def _run_direct_command(cmd: str) -> int:
     return proc.returncode
 
 
-async def _show_exit_plan(cfg: Config, display: Display) -> None:
-    """Show exit plan from plan mode and ask user to proceed."""
+async def _show_exit_plan(cfg: Config, display: Display, plan: dict | None) -> None:
+    """Show the active plan and offer to switch into edits mode."""
     if cfg.permission_mode != "plan":
         display.warn("/exit-plan only works in plan mode")
         return
+    if not plan:
+        display.info("no active plan — ask the agent to produce one first")
+        return
 
-    # Show the problem
-    display.console.rule("[bold red]PROBLEM[/]", style="red")
-    display.info("The CLI agent in plan mode doesn't recognize its restrictions and")
-    display.info("attempts to use editing tools that should be blocked. This causes")
-    display.info("errors when users try to execute commands in plan mode.\n")
-
-    # Show the solution
-    display.console.rule("[bold green]SOLUTION[/]", style="green")
-    display.info("1. Create squishy/tool_restrictions.py with mode-aware tool checking\n")
-    display.info("2. Add /exit-plan command to cli.py that shows plan and switches modes\n")
-    display.info("3. Add screen clearing to /clear and /new commands in cli.py\n")
-    display.info("4. Update Agent to check restrictions before dispatching tools\n")
-    display.info("5. Enhance Display class with status reporting methods\n")
-
-    # Show files to create/modify
-    display.console.rule("[bold blue]FILES TO CREATE/MODIFY[/]", style="blue")
-    display.info("  [bold]Create:[/]")
-    display.info("    - squishy/tool_restrictions.py")
-    display.info("")
-    display.info("  [bold]Modify:[/]")
-    display.info("    - squishy/cli.py (import, /exit-plan command, screen clearing)")
-    display.info("    - squishy/agent.py (tool restriction checks)")
-    display.info("    - squishy/display.py (status reporting)\n")
-
-    # Show implementation steps
-    display.console.rule("[bold yellow]IMPLEMENTATION STEPS[/]", style="yellow")
-    display.info("  1. Create tool_restrictions.py with mode-aware tool checking functions")
-    display.info("  2. Add /exit-plan command to cli.py that shows plan and switches modes")
-    display.info("  3. Add screen clearing to /clear /new commands in cli.py")
-    display.info("  4. Update Agent's _run_tool to check restrictions before dispatch")
-    display.info("  5. Enhance Display class with status/progress methods\n")
-
-    # Ask for approval
-    display.console.rule("[bold magenta]PROCEED?[/]", style="magenta")
+    display.plan_panel(plan)
     try:
-        reply = await asyncio.to_thread(input, "  Switch to edits mode and implement? [y/N] ")
+        reply = await asyncio.to_thread(
+            input, "  Switch to edits mode and execute the plan? [Y/n] "
+        )
     except (EOFError, KeyboardInterrupt):
         display.info("Cancelled.")
         return
 
-    if reply.strip().lower() in ("y", "yes"):
-        # Switch to edits mode
+    ans = reply.strip().lower()
+    if ans in ("", "y", "yes"):
         cfg.permission_mode = "edits"
-        display.info("[bold green]✓ Switched to edits mode![/]")
-        
-        # Clear screen for the new session
-        os.system("clear" if os.name != "nt" else "cls")
+        display.info("[bold green]✓ Switched to edits mode[/]")
     else:
-        display.info("Cancelled - staying in plan mode.")
+        display.info("Staying in plan mode.")
+
+
+async def _offer_mode_switch_after_approval(
+    cfg: Config,
+    display: Display,
+    plan: dict,
+) -> None:
+    """After plan_task approval, prompt the user to flip into edits mode."""
+    display.console.rule("[bold green]Plan approved[/]", style="green")
+    try:
+        reply = await asyncio.to_thread(
+            input, "  Switch to edits mode and execute? [Y/n] "
+        )
+    except (EOFError, KeyboardInterrupt):
+        display.info("Cancelled.")
+        return
+    if reply.strip().lower() in ("", "y", "yes"):
+        cfg.permission_mode = "edits"
+        display.info("[bold green]✓ Switched to edits mode — ready to execute[/]")
+    else:
+        display.info("Staying in plan mode.")
 
 
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
@@ -330,7 +320,8 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 display.info("no active plan")
             continue
         if line == "/exit-plan":
-            await _show_exit_plan(cfg, display)
+            plan = getattr(current_agent.tool_ctx, "active_plan", None)
+            await _show_exit_plan(cfg, display, plan)
             continue
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")
@@ -359,6 +350,16 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             display.warn("cancelled")
         except LLMError as e:
             display.error(f"LLM error: {e}")
+            continue
+
+        # If we're in plan mode and the agent just got a plan approved,
+        # offer to switch into edits mode so the same agent can execute it.
+        if cfg.permission_mode == "plan":
+            plan = getattr(current_agent.tool_ctx, "active_plan", None)
+            if isinstance(plan, dict) and plan.get("approved"):
+                # One-shot: remove the approved flag so we don't re-prompt next turn.
+                plan.pop("approved", None)
+                await _offer_mode_switch_after_approval(cfg, display, plan)
 
 
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:

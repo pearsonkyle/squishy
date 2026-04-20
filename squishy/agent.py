@@ -26,6 +26,7 @@ from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_sc
 log = logging.getLogger("squishy.agent")
 
 MAX_CONSECUTIVE_ERRORS = 3
+MAX_PLAN_NUDGES = 2
  
  
 @dataclass
@@ -60,7 +61,10 @@ class Agent:
         )
         project = detect_project(self.config.working_dir)
         system_prompt = build_system_prompt(
-            self.config.working_dir, project, self.config.thinking
+            self.config.working_dir,
+            project,
+            self.config.thinking,
+            self.config.permission_mode,
         )
         self.messages.append(
             {
@@ -126,7 +130,7 @@ class Agent:
 
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_errors = 0
-        schemas = openai_schemas()
+        plan_nudges = 0
         result = TaskResult(success=False)
         total_prompt_tokens = 0
         completion_tokens = 0
@@ -136,6 +140,8 @@ class Agent:
 
         for turn in range(1, self.config.max_turns + 1):
             self.tool_ctx.permission_mode = self.config.permission_mode
+            # Schemas are mode-scoped so plan mode never exposes write/edit tools.
+            schemas = openai_schemas(self.config.permission_mode)
             # Trim history before sending to LLM
             self.messages[:] = trim_history(self.messages)
 
@@ -165,6 +171,38 @@ class Agent:
             completion_tokens += completion.completion_tokens
 
             if not completion.tool_calls:
+                in_plan = self.config.permission_mode == "plan"
+                plan = getattr(self.tool_ctx, "active_plan", None)
+                if in_plan and plan is None:
+                    # In plan mode, prose-only completion is not acceptable —
+                    # the agent must produce a plan_task call. Nudge up to
+                    # MAX_PLAN_NUDGES times, then give up.
+                    if completion.text:
+                        self.messages.append(
+                            {"role": "assistant", "content": completion.text}
+                        )
+                    if plan_nudges >= MAX_PLAN_NUDGES:
+                        msg = "plan-mode run finished without producing a plan_task"
+                        if self.display:
+                            self.display.error(msg)
+                        result.error = msg
+                        result.turns_used = turn
+                        result.tokens_used = total_prompt_tokens + completion_tokens
+                        result.elapsed_s = time.monotonic() - start
+                        result.messages = list(self.messages)
+                        return result
+                    plan_nudges += 1
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[system] You are in plan mode. Finish by calling "
+                                "`plan_task` with problem, solution, and steps. "
+                                "Do not respond with prose until the plan is approved."
+                            ),
+                        }
+                    )
+                    continue
                 if completion.text:
                     self.messages.append({"role": "assistant", "content": completion.text})
                 if self.display:
@@ -196,6 +234,29 @@ class Agent:
                         commands_run += 1
                 else:
                     consecutive_errors += 1
+
+                # In plan mode, an approved plan is the terminal event for the run.
+                if (
+                    outcome.get("plan_approved")
+                    and self.config.permission_mode == "plan"
+                ):
+                    if self.display:
+                        self.display.stats.prompt_tokens = total_prompt_tokens
+                        self.display.stats.completion_tokens = completion_tokens
+                        self.display.summary(turn, time.monotonic() - start)
+                    plan = getattr(self.tool_ctx, "active_plan", None) or {}
+                    result.success = True
+                    result.final_text = (
+                        f"Plan approved: {plan.get('plan') or plan.get('problem', '')}"
+                    ).strip()
+                    result.turns_used = turn
+                    result.tokens_used = total_prompt_tokens + completion_tokens
+                    result.files_created = sorted(files_created)
+                    result.files_edited = sorted(files_edited)
+                    result.commands_run = commands_run
+                    result.elapsed_s = time.monotonic() - start
+                    result.messages = list(self.messages)
+                    return result
 
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     msg = f"{MAX_CONSECUTIVE_ERRORS} consecutive tool failures — stopping."
@@ -245,30 +306,44 @@ class Agent:
         outcome = await dispatch(tc.name, tc.args, self.tool_ctx, prompt_fn=self.prompt_fn)
         dt_ms = (time.monotonic() - t0) * 1000
 
-        if self.display:
-            # Plan tool gets a rich panel instead of a plain tool_result line
-            if outcome.success and tc.name == "plan_task":
+        plan_approved = False
+        if outcome.success and tc.name == "plan_task":
+            # Ask user to approve the plan (even when there's no display).
+            if self.display:
                 self.display.plan_panel(outcome.data)
-                # Ask user to approve the plan
-                approved = True
-                if self.prompt_fn is not None:
-                    try:
-                        from squishy.tools.base import Tool
+            approved = True
+            if self.prompt_fn is not None:
+                try:
+                    from squishy.tools.base import Tool
 
-                        approved = await self.prompt_fn(
-                            Tool(name="plan_task", description="", parameters={},
-                                 run=lambda *_: None),  # type: ignore[arg-type]
-                            tc.args,
-                        )
-                    except (EOFError, KeyboardInterrupt):
-                        approved = False
-                if not approved:
-                    # Decline: clear the plan from context
-                    if hasattr(self.tool_ctx, "active_plan"):
-                        del self.tool_ctx.active_plan  # type: ignore[attr-defined]
-                    outcome = ToolResult(
-                        False, error="Plan declined by user. Ask for changes or a new approach."
+                    approved = await self.prompt_fn(
+                        Tool(name="plan_task", description="", parameters={},
+                             run=lambda *_: None),  # type: ignore[arg-type]
+                        tc.args,
                     )
+                except (EOFError, KeyboardInterrupt):
+                    approved = False
+            if approved:
+                plan = getattr(self.tool_ctx, "active_plan", None)
+                if isinstance(plan, dict):
+                    plan["approved"] = True
+                plan_approved = True
+                outcome = ToolResult(
+                    True,
+                    data={**outcome.data, "approved": True},
+                    display=outcome.display,
+                )
+            else:
+                if hasattr(self.tool_ctx, "active_plan"):
+                    del self.tool_ctx.active_plan  # type: ignore[attr-defined]
+                outcome = ToolResult(
+                    False, error="Plan declined by user. Ask for changes or a new approach."
+                )
+
+        if self.display:
+            if tc.name == "plan_task":
+                # Panel already rendered above; no plain tool_result line.
+                pass
             elif outcome.success and tc.name == "update_plan":
                 plan = getattr(self.tool_ctx, "active_plan", None)
                 if plan:
@@ -293,7 +368,7 @@ class Agent:
                     self.display.stats.commands_run += 1
 
         self._append_tool_result(tc, message=outcome.to_message())
-        return {"success": outcome.success}
+        return {"success": outcome.success, "plan_approved": plan_approved}
  
     def _append_tool_result(self, tc: ToolCall, message: str) -> None:
         self.messages.append(

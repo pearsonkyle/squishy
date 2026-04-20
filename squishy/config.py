@@ -28,7 +28,7 @@ class Config:
     temperature: float = 0.3
     max_tokens: int = 8192
     max_turns: int = 30
-    permission_mode: PermissionMode = "edits"
+    permission_mode: PermissionMode = "plan"
     working_dir: str = field(default_factory=os.getcwd)
     sandbox_image: str = field(
         default_factory=lambda: os.environ.get("SQUISHY_SANDBOX_IMAGE", "python:3.11-slim")

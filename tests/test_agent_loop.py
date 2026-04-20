@@ -98,20 +98,190 @@ async def test_agent_refuses_write_in_plan_mode(tmp_path):
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "plan"
     cfg.max_turns = 5
- 
+
+    # Even if the model hallucinates a write_file call (it isn't in the plan-mode
+    # schemas), dispatch-level defence still blocks the mutation.
     fake = FakeClient(
         script=[
             CompletionResult(tool_calls=[_tc("write_file", {"path": "x.py", "content": "x"})]),
+            CompletionResult(
+                tool_calls=[
+                    _tc(
+                        "plan_task",
+                        {
+                            "problem": "user asked for x.py",
+                            "solution": "create it",
+                            "steps": ["write x.py"],
+                        },
+                        call_id="c2",
+                    )
+                ]
+            ),
             CompletionResult(text="ok stopping.", tool_calls=[]),
         ]
     )
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("write x.py")
- 
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    await agent.run("write x.py")
+
     assert not (tmp_path / "x.py").exists()
-    # Tool result message should communicate the refusal back to the model
-    tool_msgs = [m for m in result.messages if m.get("role") == "tool"]
-    assert any("plan mode" in (m.get("content") or "") for m in tool_msgs)
+
+
+async def test_agent_plan_mode_schemas_exclude_writes(tmp_path):
+    """The LLM in plan mode should not see write_file/edit_file in tool schemas."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 3
+
+    # Capture the tools list passed to complete()
+    captured_tools: list[list[dict]] = []
+
+    @dataclass
+    class CapturingClient:
+        _i: int = 0
+
+        async def health(self) -> bool:
+            return True
+
+        async def complete(
+            self,
+            messages: list[dict[str, Any]],
+            tools: list[dict[str, Any]],
+            *,
+            stream: bool = True,
+            on_text: Any = None,
+        ) -> CompletionResult:
+            captured_tools.append(list(tools))
+            self._i += 1
+            return CompletionResult(
+                tool_calls=[
+                    _tc(
+                        "plan_task",
+                        {
+                            "problem": "p",
+                            "solution": "s",
+                            "steps": ["a", "b"],
+                        },
+                    )
+                ]
+            ) if self._i == 1 else CompletionResult(text="done", tool_calls=[])
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, CapturingClient(), Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    await agent.run("plan something")
+
+    assert captured_tools, "complete() was never called"
+    names = {t["function"]["name"] for t in captured_tools[0]}
+    assert "plan_task" in names
+    assert "write_file" not in names
+    assert "edit_file" not in names
+
+
+async def test_agent_plan_mode_requires_plan_task(tmp_path):
+    """If plan mode finishes with prose and no plan_task, the agent should nudge."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 10
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(text="I think the fix is obvious.", tool_calls=[]),
+            CompletionResult(text="Still no plan.", tool_calls=[]),
+            CompletionResult(
+                tool_calls=[
+                    _tc(
+                        "plan_task",
+                        {"problem": "p", "solution": "s", "steps": ["a"]},
+                    )
+                ]
+            ),
+            CompletionResult(text="shouldn't reach", tool_calls=[]),
+        ]
+    )
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    result = await agent.run("do the thing")
+
+    assert result.success, result.error
+    # Agent must have produced a plan before finishing
+    plan = getattr(agent.tool_ctx, "active_plan", None)
+    assert isinstance(plan, dict)
+    assert plan.get("approved") is True
+    # Nudge messages should appear in the transcript
+    nudge_msgs = [
+        m
+        for m in result.messages
+        if m.get("role") == "user" and "[system]" in (m.get("content") or "")
+    ]
+    assert nudge_msgs, "expected at least one nudge injection"
+
+
+async def test_agent_plan_mode_gives_up_after_nudges(tmp_path):
+    """If the model keeps refusing to plan, the agent should eventually stop."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 10
+
+    fake = FakeClient(
+        script=[CompletionResult(text=f"prose {i}", tool_calls=[]) for i in range(6)]
+    )
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    result = await agent.run("plan please")
+
+    assert not result.success
+    assert "plan_task" in result.error
+
+
+async def test_agent_completes_when_plan_task_approved(tmp_path):
+    """A successful plan_task + user approval should terminate the run."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(
+                tool_calls=[
+                    _tc(
+                        "plan_task",
+                        {
+                            "plan": "Fix the bug",
+                            "problem": "Bug in foo",
+                            "solution": "Patch it",
+                            "steps": ["read foo", "edit foo"],
+                        },
+                    )
+                ]
+            ),
+            CompletionResult(text="extra turn that should not run", tool_calls=[]),
+        ]
+    )
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    result = await agent.run("please plan")
+
+    assert result.success
+    assert "Plan approved" in result.final_text
+    plan = getattr(agent.tool_ctx, "active_plan", None)
+    assert isinstance(plan, dict)
+    assert plan.get("approved") is True
+    # The second scripted completion should not have been consumed
+    assert fake._i == 1
  
  
 
