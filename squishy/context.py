@@ -109,6 +109,7 @@ def build_system_prompt(
     index_block = _index_header(cwd)
     instructions_block = load_agent_instructions(cwd)
     mode_block = _mode_block(mode)
+    recall_rule = _recall_rule(cwd)
 
     return f"""You are squishy, a local coding assistant that edits files and runs commands to complete the user's task.
 
@@ -120,7 +121,8 @@ def build_system_prompt(
 - Verify your work with `run_command` (run the tests or the program itself) after making changes.
 - Explore thoroughly when fixing bugs or implementing features - it's better to understand the codebase than to guess.
 - When you finish the user's task, respond with plain text summarizing what you did (no tool call).
-- To locate files or symbols, prefer `recall(query=...)` over walking with `list_directory` when an index is present.
+- Do not re-read a file you have already read in this conversation unless you need a different line range. Use what you have.
+{recall_rule}
 
 ## Planning
 - For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
@@ -173,6 +175,21 @@ def load_agent_instructions(cwd: str) -> str:
     return "".join(parts)
 
 
+def _recall_rule(cwd: str) -> str:
+    """Return the 'use recall first' rule, strengthened when an index exists."""
+    index_path = os.path.join(cwd, ".squishy", "index.json")
+    if os.path.isfile(index_path):
+        return (
+            "- An index is present at `.squishy/index.json`. Before calling "
+            "`read_file` or `list_directory`, call `recall(query=...)` at least "
+            "once per new topic to locate the right files. Do not read files blindly."
+        )
+    return (
+        "- To locate files or symbols, prefer `recall(query=...)` over walking with "
+        "`list_directory` when an index is present."
+    )
+
+
 def _mode_block(mode: str) -> str:
     if mode == "plan":
         return (
@@ -207,8 +224,11 @@ def _index_header(cwd: str) -> str:
         from squishy.index.store import load_index, load_meta
     except Exception:  # noqa: BLE001
         return ""
-    meta = load_meta(cwd)
-    idx = load_index(cwd)
+    try:
+        meta = load_meta(cwd)
+        idx = load_index(cwd)
+    except Exception:  # noqa: BLE001
+        return ""
     if meta is None or idx is None:
         return ""
  
@@ -262,22 +282,35 @@ def _top_level_files(cwd: str, limit: int = 50) -> list[str]:
  
 def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY) -> list[dict[str, Any]]:
     """Keep system + first user + last (max_messages - 2) messages.
- 
+
     Ported from atlas-proxy/agent.go:41-50. Preserves initial intent while
     bounding context size.
+
+    Pair-aware: the tail is never allowed to begin with a ``role="tool"``
+    message, because an orphan tool result whose matching assistant
+    ``tool_calls`` has been sliced off will confuse the LLM (it sees a tool
+    result it has no record of requesting, and re-requests the same read).
+    Leading tool messages are dropped until we hit an assistant or user turn.
     """
     if len(messages) <= max_messages:
         return messages
- 
+
     system = [m for m in messages if m.get("role") == "system"]
     non_system = [m for m in messages if m.get("role") != "system"]
     if not non_system:
         return system
- 
+
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
     remaining_budget = max_messages - len(system) - len(first_user)
     tail = non_system[-remaining_budget:] if remaining_budget > 0 else []
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
+
+    # Drop leading orphan tool results. Their matching assistant tool_calls
+    # message has been trimmed away, so the LLM can't associate the result
+    # with a prior action.
+    while tail and tail[0].get("role") == "tool":
+        tail = tail[1:]
+
     return system + first_user + tail
