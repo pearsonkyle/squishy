@@ -140,9 +140,10 @@ plan_task = Tool(
     name="plan_task",
     description=(
         "Present a structured plan to the user before making changes. "
-        "Use this when the task is complex and benefits from planning first. "
+        "In plan mode, call this as soon as you have enough information to propose a solid approach — do not wait for exhaustive research. "
         "The plan includes: problem statement, solution approach, implementation "
-        "steps, and files to create/modify. The user will be asked to approve."
+        "steps, and files to create/modify. The file lists are optional and may be partial or empty if some targets are still uncertain. "
+        "The user will be asked to approve."
     ),
     parameters={
         "type": "object",

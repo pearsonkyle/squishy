@@ -126,6 +126,8 @@ def build_system_prompt(
 
 ## Planning
 - For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
+- `plan_task` is valid as soon as you have enough information to propose a solid approach — do not wait for exhaustive research.
+- `files_to_modify` and `files_to_create` may be partial or empty when some file choices are still uncertain.
 - The user will be asked to approve the plan before you proceed.
 - After the plan is approved, call `update_plan(step_index=N, status="done")` as you complete each step.
 - This keeps the user informed of progress through their task.
@@ -195,7 +197,10 @@ def _mode_block(mode: str) -> str:
         return (
             "## Mode: plan (read-only)\n"
             "- You CANNOT write or edit files. `write_file` and `edit_file` are not in your toolbox.\n"
-            "- Your only goal this turn is to investigate the code and produce exactly one `plan_task` call.\n"
+            "- Your only goal this turn is to investigate just enough and produce exactly one `plan_task` call.\n"
+            "- Usually 1 recall plus 1-3 targeted reads/searches is enough. Do NOT keep reading files once you can describe the problem and fix.\n"
+            "- If the user already named likely files or symbols, skip broad exploration and inspect those directly.\n"
+            "- Call `plan_task` as soon as you can explain the problem, solution, and concrete steps. `files_to_modify`/`files_to_create` may be partial or empty if uncertain.\n"
             "- Do NOT end the turn with prose before calling `plan_task`.\n"
             "- `run_command` is limited to read-only commands: ls, cat, head, tail, wc, grep, rg, find, "
             "pwd, which, file, stat, tree, ruff check, mypy, pyright, git status/log/diff/show/branch/blame/ls-files, "

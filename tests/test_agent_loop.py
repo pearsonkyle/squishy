@@ -224,6 +224,7 @@ async def test_agent_plan_mode_requires_plan_task(tmp_path):
         if m.get("role") == "user" and "[system]" in (m.get("content") or "")
     ]
     assert nudge_msgs, "expected at least one nudge injection"
+    assert any("partial or empty if uncertain" in (m.get("content") or "") for m in nudge_msgs)
 
 
 async def test_agent_plan_mode_gives_up_after_nudges(tmp_path):
@@ -337,6 +338,7 @@ async def test_agent_plan_mode_nudges_after_tool_turns(tmp_path):
         and "read tools" in (m.get("content") or "")
     ]
     assert nudge_msgs, "expected at least one tool-turn nudge injection"
+    assert any("partial or empty if uncertain" in (m.get("content") or "") for m in nudge_msgs)
 
 
 async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
@@ -365,6 +367,9 @@ async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
 
     assert not result.success
     assert "plan_task" in result.error
+
+
+async def test_agent_runs_headless_without_display(tmp_path):
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "yolo"

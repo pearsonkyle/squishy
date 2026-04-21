@@ -200,8 +200,11 @@ class Agent:
                         {
                             "role": "user",
                             "content": (
-                                "[system] You are in plan mode. Finish by calling "
-                                "`plan_task` with problem, solution, and steps. "
+                                "[system] You are in plan mode. Stop explaining and call "
+                                "`plan_task` now with problem, solution, and steps. "
+                                "Use your best current understanding instead of waiting "
+                                "for exhaustive research. `files_to_modify` and "
+                                "`files_to_create` may be partial or empty if uncertain. "
                                 "Do not respond with prose until the plan is approved."
                             ),
                         }
@@ -300,11 +303,12 @@ class Agent:
                                 {
                                     "role": "user",
                                     "content": (
-                                        "[system] You have been investigating for many turns "
-                                        "without producing a plan. Stop calling read tools. "
-                                        "Call `plan_task` now with the problem, solution, and "
-                                        "concrete steps based on what you have found. "
-                                        "Do not read any more files before calling `plan_task`."
+                                        "[system] You have investigated enough. Stop calling "
+                                        "read tools and call `plan_task` now. Use the evidence "
+                                        "you already have instead of waiting for exhaustive "
+                                        "research. `files_to_modify` and `files_to_create` may "
+                                        "be partial or empty if uncertain. Do not read any more "
+                                        "files before calling `plan_task`."
                                     ),
                                 }
                             )
