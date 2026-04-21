@@ -1,17 +1,19 @@
 """Agent loop tests using a scripted fake Client."""
  
 from __future__ import annotations
- 
+
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
- 
+
 import pytest
- 
+
 from squishy.agent import Agent
 from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.display import Display
+from squishy.plan_state import plan_path
  
 pytestmark = pytest.mark.asyncio
  
@@ -214,9 +216,9 @@ async def test_agent_plan_mode_requires_plan_task(tmp_path):
 
     assert result.success, result.error
     # Agent must have produced a plan before finishing
-    plan = getattr(agent.tool_ctx, "active_plan", None)
-    assert isinstance(plan, dict)
-    assert plan.get("approved") is True
+    plan = agent.tool_ctx.plan
+    assert plan is not None
+    assert plan.approved is True
     # Nudge messages should appear in the transcript
     nudge_msgs = [
         m
@@ -278,9 +280,9 @@ async def test_agent_completes_when_plan_task_approved(tmp_path):
 
     assert result.success
     assert "Plan approved" in result.final_text
-    plan = getattr(agent.tool_ctx, "active_plan", None)
-    assert isinstance(plan, dict)
-    assert plan.get("approved") is True
+    plan = agent.tool_ctx.plan
+    assert plan is not None
+    assert plan.approved is True
     # The second scripted completion should not have been consumed
     assert fake._i == 1
  
@@ -327,9 +329,9 @@ async def test_agent_plan_mode_nudges_after_tool_turns(tmp_path):
     result = await agent.run("plan something")
 
     assert result.success, result.error
-    plan = getattr(agent.tool_ctx, "active_plan", None)
-    assert isinstance(plan, dict)
-    assert plan.get("approved") is True
+    plan = agent.tool_ctx.plan
+    assert plan is not None
+    assert plan.approved is True
     # A nudge message should have been injected
     nudge_msgs = [
         m
@@ -367,6 +369,97 @@ async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
 
     assert not result.success
     assert "plan_task" in result.error
+
+
+async def test_agent_restores_persisted_plan_state(tmp_path):
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(
+                tool_calls=[
+                    _tc(
+                        "plan_task",
+                        {"problem": "p", "solution": "s", "steps": ["read foo", "edit foo"]},
+                    )
+                ]
+            )
+        ]
+    )
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    await Agent(cfg, fake, Display(), prompt_fn=auto_approve).run("plan it")  # type: ignore[arg-type]
+    assert plan_path(tmp_path).is_file()
+
+    restored = Agent(cfg, FakeClient(script=[]), Display())  # type: ignore[arg-type]
+    assert restored.tool_ctx.plan is not None
+    assert restored.tool_ctx.plan.approved is True
+    assert restored.tool_ctx.plan.steps[0].description == "read foo"
+
+
+async def test_agent_blocks_success_until_plan_steps_resolved(tmp_path):
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "edits"
+    cfg.max_turns = 6
+
+    plan_json = {
+        "id": "plan-test",
+        "plan": "Fix bug",
+        "problem": "p",
+        "solution": "s",
+        "approved": True,
+        "steps": [
+            {"id": "step-1", "description": "edit file", "status": "pending"},
+        ],
+    }
+    plan_path(tmp_path).parent.mkdir(exist_ok=True)
+    plan_path(tmp_path).write_text(json.dumps(plan_json))
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(text="done", tool_calls=[]),
+            CompletionResult(tool_calls=[_tc("update_plan", {"step_index": 1, "status": "done"})]),
+            CompletionResult(text="really done", tool_calls=[]),
+        ]
+    )
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    result = await agent.run("finish the task")
+
+    assert result.success
+    assert result.final_text == "really done"
+    assert result.plan_state is not None
+    assert result.plan_state["progress"]["done"] == 1
+    assert any("unresolved steps" in (m.get("content") or "") for m in result.messages)
+
+
+async def test_agent_plan_mode_without_index_does_not_force_recall(tmp_path):
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+    (tmp_path / "foo.py").write_text("# code")
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(tool_calls=[_tc("read_file", {"path": "foo.py"})]),
+            CompletionResult(tool_calls=[_tc("plan_task", {"problem": "p", "solution": "s", "steps": ["a"]})]),
+        ]
+    )
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    result = await agent.run("plan without index")
+
+    assert result.success
+    assert not any("Too many read calls without `recall`" in (m.get("content") or "") for m in result.messages)
 
 
 async def test_agent_runs_headless_without_display(tmp_path):

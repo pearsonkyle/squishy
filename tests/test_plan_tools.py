@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from squishy.display import Display, Stats, fmt_tokens
+from squishy.plan_state import load_plan, plan_path
 from squishy.tools.base import ToolContext
 
 
@@ -74,8 +77,8 @@ class TestPlanTask:
         assert result.data["solution"] == "Fix the broken assertions"
         assert len(result.data["steps"]) == 3
         assert all(s["status"] == "pending" for s in result.data["steps"])
-        # Plan should be stored on context
-        assert hasattr(ctx, "active_plan")
+        assert ctx.plan is not None
+        assert plan_path(tmp_path).is_file()
 
     async def test_plan_task_missing_problem(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
@@ -125,6 +128,9 @@ class TestPlanTask:
         assert result.data["plan"] == "Fix failing tests"
         assert result.data["files_to_create"] == ["new_file.py"]
         assert result.data["files_to_modify"] == ["old_file.py"]
+        persisted = load_plan(tmp_path)
+        assert persisted is not None
+        assert persisted.plan == "Fix failing tests"
 
 
 @pytest.mark.asyncio
@@ -145,6 +151,7 @@ class TestUpdatePlan:
         assert result.success
         assert result.data["progress"]["done"] == 1
         assert result.data["progress"]["pending"] == 2
+        assert load_plan(tmp_path) is not None
 
     async def test_update_plan_no_active_plan(self, tmp_path) -> None:
         from squishy.tools.plan import _update_plan
@@ -188,6 +195,26 @@ class TestUpdatePlan:
         result = await _update_plan({"step_index": 1, "status": "in-progress"}, ctx)
         assert result.success
         assert result.data["progress"]["in_progress"] == 1
+
+    async def test_update_plan_attaches_evidence_and_blocked_note(self, tmp_path) -> None:
+        from squishy.tools.plan import _plan_task, _update_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["step1", "step2"]},
+            ctx,
+        )
+        ctx.pending_plan_evidence.append({"kind": "edit_file", "path": "app.py", "detail": "patched bug"})
+        result = await _update_plan(
+            {"step_index": 1, "status": "blocked", "note": "waiting on user input"},
+            ctx,
+        )
+        assert result.success
+        assert result.data["note"] == "waiting on user input"
+        assert result.data["evidence_count"] == 1
+        persisted = json.loads(plan_path(tmp_path).read_text())
+        assert persisted["steps"][0]["status"] == "blocked"
+        assert persisted["steps"][0]["evidence"][0]["path"] == "app.py"
 
 
 class TestPlanToolRestrictions:

@@ -12,11 +12,20 @@ times each task out, and streams predictions to disk. Evaluation itself
  
 from squishy.bench.runner import BenchTask, PredictionWriter, run_batch
 from squishy.bench.swebench import run_swebench_instance
-from squishy.bench.terminalbench import TerminalTask, run_terminal_task
+from squishy.bench.terminalbench import (
+    LocalTerminalBackend,
+    ShellResult,
+    TerminalBackend,
+    TerminalTask,
+    run_terminal_task,
+)
  
 __all__ = [
     "BenchTask",
+    "LocalTerminalBackend",
     "PredictionWriter",
+    "ShellResult",
+    "TerminalBackend",
     "TerminalTask",
     "run_batch",
     "run_swebench_instance",

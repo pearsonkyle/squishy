@@ -62,9 +62,18 @@ def test_build_system_prompt_plan_mode_block(tmp_path: Path) -> None:
     assert "Mode: plan" in prompt
     assert "plan_task" in prompt
     assert "write_file" in prompt  # mentioned as forbidden
-    assert "recall(query=" in prompt  # recall-first guidance
-    assert "FIRST" in prompt  # FIRST tool call instruction (uppercase)
+    assert "No repo index is present yet" in prompt
     assert "partial or empty if uncertain" in prompt
+
+
+def test_build_system_prompt_plan_mode_with_index_prefers_recall(tmp_path: Path) -> None:
+    squishy_dir = tmp_path / ".squishy"
+    squishy_dir.mkdir()
+    (squishy_dir / "index.json").write_text("{}")
+
+    prompt = build_system_prompt(str(tmp_path), ProjectInfo(), mode="plan")
+    assert "recall(query=" in prompt
+    assert "FIRST" in prompt
 
 
 def test_build_system_prompt_edits_mode_block(tmp_path: Path) -> None:

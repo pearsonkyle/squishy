@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 
@@ -30,7 +31,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--base-url", help="OpenAI-compatible endpoint (env SQUISHY_BASE_URL)")
     p.add_argument("--model", help="Model id (env SQUISHY_MODEL)")
     p.add_argument("--api-key", help="API key (env SQUISHY_API_KEY)")
-    p.add_argument("--max-turns", type=int, default=None, help="Turn cap (default 20)")
+    p.add_argument("--max-turns", type=int, default=None, help="Turn cap (default 30)")
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--timeout", type=float, default=None, help="Task timeout in seconds")
     p.add_argument("--request-timeout", type=float, default=120.0)
@@ -197,18 +198,29 @@ async def _show_exit_plan(cfg: Config, display: Display, plan: dict | None) -> N
         return
 
     display.plan_panel(plan)
+    await _prompt_switch_to_edits(
+        cfg,
+        display,
+        prompt_text="  Switch to edits mode and execute the plan? [Y/n] ",
+        success_text="[bold green]✓ Switched to edits mode[/]",
+    )
+
+
+async def _prompt_switch_to_edits(
+    cfg: Config,
+    display: Display,
+    *,
+    prompt_text: str,
+    success_text: str,
+) -> None:
     try:
-        reply = await asyncio.to_thread(
-            input, "  Switch to edits mode and execute the plan? [Y/n] "
-        )
+        reply = await asyncio.to_thread(input, prompt_text)
     except (EOFError, KeyboardInterrupt):
         display.info("Cancelled.")
         return
-
-    ans = reply.strip().lower()
-    if ans in ("", "y", "yes"):
+    if reply.strip().lower() in ("", "y", "yes"):
         cfg.permission_mode = "edits"
-        display.info("[bold green]✓ Switched to edits mode[/]")
+        display.info(success_text)
     else:
         display.info("Staying in plan mode.")
 
@@ -220,18 +232,12 @@ async def _offer_mode_switch_after_approval(
 ) -> None:
     """After plan_task approval, prompt the user to flip into edits mode."""
     display.console.rule("[bold green]Plan approved[/]", style="green")
-    try:
-        reply = await asyncio.to_thread(
-            input, "  Switch to edits mode and execute? [Y/n] "
-        )
-    except (EOFError, KeyboardInterrupt):
-        display.info("Cancelled.")
-        return
-    if reply.strip().lower() in ("", "y", "yes"):
-        cfg.permission_mode = "edits"
-        display.info("[bold green]✓ Switched to edits mode — ready to execute[/]")
-    else:
-        display.info("Staying in plan mode.")
+    await _prompt_switch_to_edits(
+        cfg,
+        display,
+        prompt_text="  Switch to edits mode and execute? [Y/n] ",
+        success_text="[bold green]✓ Switched to edits mode — ready to execute[/]",
+    )
 
 
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
@@ -315,15 +321,15 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             continue
         if line == "/plan":
             # Show active plan progress
-            plan = getattr(current_agent.tool_ctx, "active_plan", None)
+            plan = current_agent.tool_ctx.plan
             if plan:
-                display.plan_panel(plan)
+                display.plan_panel(plan.to_dict())
             else:
                 display.info("no active plan")
             continue
         if line == "/exit-plan":
-            plan = getattr(current_agent.tool_ctx, "active_plan", None)
-            await _show_exit_plan(cfg, display, plan)
+            plan = current_agent.tool_ctx.plan
+            await _show_exit_plan(cfg, display, plan.to_dict() if plan else None)
             continue
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")
@@ -357,11 +363,10 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         # If we're in plan mode and the agent just got a plan approved,
         # offer to switch into edits mode so the same agent can execute it.
         if cfg.permission_mode == "plan":
-            plan = getattr(current_agent.tool_ctx, "active_plan", None)
-            if isinstance(plan, dict) and plan.get("approved"):
-                # One-shot: remove the approved flag so we don't re-prompt next turn.
-                plan.pop("approved", None)
-                await _offer_mode_switch_after_approval(cfg, display, plan)
+            plan = current_agent.tool_ctx.plan
+            if plan is not None and plan.approved and not current_agent.tool_ctx.plan_switch_prompted:
+                current_agent.tool_ctx.plan_switch_prompted = True
+                await _offer_mode_switch_after_approval(cfg, display, plan.to_dict())
 
 
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:
@@ -431,10 +436,8 @@ async def _run_init(cfg: Config, client: Client, display: Display, *, summaries:
     save_index(cfg.working_dir, index)
 
     # Generate AGENTS.md
-    try:
+    with contextlib.suppress(Exception):
         save_agents_md(index, cfg.working_dir)
-    except Exception:  # noqa: BLE001
-        pass  # Non-critical
 
     from squishy.index.store import index_path
 

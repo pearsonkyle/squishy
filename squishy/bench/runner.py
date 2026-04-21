@@ -31,6 +31,7 @@ class BenchResult:
     task_id: str
     success: bool
     prediction: dict[str, Any] = field(default_factory=dict)
+    artifacts: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     elapsed_s: float = 0.0
  
@@ -110,6 +111,8 @@ async def run_batch(
  
             if writer is not None:
                 record = {"task_id": result.task_id, **result.prediction}
+                if result.artifacts:
+                    record["artifacts"] = result.artifacts
                 if not result.success:
                     record["error"] = result.error
                 await writer.write(record)

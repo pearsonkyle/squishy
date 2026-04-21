@@ -17,6 +17,12 @@ from __future__ import annotations
 
 from typing import Any
 
+from squishy.plan_state import (
+    STEP_STATUSES,
+    PlanEvidence,
+    PlanState,
+    save_plan,
+)
 from squishy.tools.base import Tool, ToolContext, ToolResult
 
 
@@ -34,21 +40,22 @@ async def _plan_task(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         return ToolResult(False, error="`solution` is required (string)")
     if not isinstance(steps, list) or not steps:
         return ToolResult(False, error="`steps` is required (non-empty list of strings)")
+    if not all(isinstance(step, str) and step.strip() for step in steps):
+        return ToolResult(False, error="`steps` must contain only non-empty strings")
 
-    # Build a structured plan dict that will be stored for tracking
-    plan_data: dict[str, Any] = {
-        "plan": plan or "",
-        "problem": problem,
-        "solution": solution,
-        "steps": [{"description": s, "status": "pending"} for s in steps],
-        "files_to_create": files_to_create or [],
-        "files_to_modify": files_to_modify or [],
-    }
+    plan_state = PlanState.create(
+        plan=str(plan or ""),
+        problem=problem.strip(),
+        solution=solution.strip(),
+        steps=[step.strip() for step in steps],
+        files_to_create=[str(item) for item in files_to_create or []],
+        files_to_modify=[str(item) for item in files_to_modify or []],
+    )
 
-    # Store the plan on the context for tracking across turns
-    ctx.active_plan = plan_data  # type: ignore[attr-defined]
+    ctx.plan = plan_state
+    ctx.pending_plan_evidence.clear()
+    save_plan(ctx.working_dir, plan_state)
 
-    # Build a human-readable display for the tool result
     display_lines = [
         f"Plan: {plan}" if plan else "",
         f"Problem: {problem}",
@@ -75,62 +82,85 @@ async def _plan_task(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     return ToolResult(
         True,
-        data=plan_data,
+        data=plan_state.to_dict(),
         display=display_text,
     )
 
 
 async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    """Mark a step as done, skipped, or in-progress."""
+    """Mark a step as done, skipped, in-progress, or blocked."""
     step_index = args.get("step_index")
     status = args.get("status", "done")
+    note = args.get("note", "")
 
     if not isinstance(step_index, int):
         return ToolResult(False, error="`step_index` is required (integer, 1-based)")
+    if not isinstance(note, str):
+        return ToolResult(False, error="`note` must be a string")
+    if status not in STEP_STATUSES:
+        allowed = ", ".join(repr(item) for item in STEP_STATUSES)
+        return ToolResult(False, error=f"`status` must be one of {allowed}")
+    if status == "blocked" and not note.strip():
+        return ToolResult(False, error="`note` is required when status is 'blocked'")
 
-    plan: dict[str, Any] | None = getattr(ctx, "active_plan", None)
+    plan = ctx.plan
     if plan is None:
         return ToolResult(False, error="no active plan — call plan_task first")
 
-    steps = plan.get("steps", [])
     idx = step_index - 1
-    if idx < 0 or idx >= len(steps):
-        return ToolResult(False, error=f"step_index {step_index} out of range (1-{len(steps)})")
+    if idx < 0 or idx >= len(plan.steps):
+        return ToolResult(False, error=f"step_index {step_index} out of range (1-{len(plan.steps)})")
 
-    if status not in ("done", "skipped", "in-progress"):
-        return ToolResult(False, error="`status` must be 'done', 'skipped', or 'in-progress'")
+    evidence = [
+        PlanEvidence.from_dict(item)
+        for item in ctx.pending_plan_evidence
+        if isinstance(item, dict)
+    ]
+    step = plan.update_step(
+        step_index=idx,
+        status=status,
+        note=note.strip(),
+        evidence=evidence,
+    )
+    ctx.pending_plan_evidence.clear()
+    save_plan(ctx.working_dir, plan)
 
-    steps[idx]["status"] = status
-
-    # Build a progress summary
-    total = len(steps)
-    done = sum(1 for s in steps if s["status"] == "done")
-    in_prog = sum(1 for s in steps if s["status"] == "in-progress")
-    pending = sum(1 for s in steps if s["status"] == "pending")
+    progress = plan.progress()
+    total = progress["total"]
+    done = progress["done"]
+    in_prog = progress["in_progress"]
+    pending = progress["pending"]
+    blocked = progress["blocked"]
 
     progress_lines = []
-    for i, s in enumerate(steps, 1):
-        status_icons = {"done": "✓", "in-progress": "▶", "skipped": "—", "pending": "○"}
-        mark = status_icons.get(s["status"], "?")
-        progress_lines.append(f"  {mark} {i}. {s['description']}")
+    for i, current_step in enumerate(plan.steps, 1):
+        status_icons = {
+            "done": "✓",
+            "in-progress": "▶",
+            "skipped": "—",
+            "pending": "○",
+            "blocked": "!",
+        }
+        mark = status_icons.get(current_step.status, "?")
+        progress_lines.append(f"  {mark} {i}. {current_step.description}")
 
     summary = (
         f"Step {step_index} → {status}. "
-        f"Progress: {done}/{total} done, {in_prog} in-progress, {pending} pending"
+        f"Progress: {done}/{total} done, {in_prog} in-progress, {blocked} blocked, {pending} pending"
     )
+    if step.note:
+        summary += f" Note: {step.note}"
 
     return ToolResult(
         True,
         data={
             "step_index": step_index,
             "status": status,
-            "progress": {
-                "done": done,
-                "in_progress": in_prog,
-                "pending": pending,
-                "total": total,
-            },
-            "steps": steps,
+            "progress": progress,
+            "steps": [item.to_dict() for item in plan.steps],
+            "note": step.note,
+            "evidence_count": len(step.evidence),
+            "plan": plan.to_dict(),
         },
         display=summary + "\n" + "\n".join(progress_lines),
     )
@@ -199,7 +229,8 @@ update_plan = Tool(
     description=(
         "Update the status of a step in the active plan. Call this after "
         "completing each implementation step to track progress. "
-        "Use step_index (1-based) and status ('done', 'in-progress', or 'skipped')."
+        "Use step_index (1-based), status, and an optional note. Any files edited "
+        "or commands run since the last update are attached as evidence."
     ),
     parameters={
         "type": "object",
@@ -210,8 +241,12 @@ update_plan = Tool(
             },
             "status": {
                 "type": "string",
-                "enum": ["done", "in-progress", "skipped"],
+                "enum": ["done", "in-progress", "skipped", "blocked"],
                 "description": "New status for the step",
+            },
+            "note": {
+                "type": "string",
+                "description": "Optional note or rationale for this status update",
             },
         },
         "required": ["step_index", "status"],
