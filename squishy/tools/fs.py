@@ -26,6 +26,13 @@ def _resolve(path: str, cwd: str) -> str:
     if os.path.isabs(path):
         return path
     return os.path.normpath(os.path.join(cwd, path))
+
+
+def _invalidate_read_cache(ctx: ToolContext, path: str) -> None:
+    """Drop any cached reads for `path` after a mutating write/edit."""
+    for key in [k for k in ctx.files_read_meta if k[0] == path]:
+        del ctx.files_read_meta[key]
+    ctx.files_read.pop(path, None)
  
  
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -35,19 +42,52 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     abs_path = _resolve(path, ctx.working_dir)
     if not os.path.isfile(abs_path):
         return ToolResult(False, error=f"file not found: {path}")
+
+    offset = int(args.get("offset") or 0)
+    limit = args.get("limit")
+
+    # Duplicate-read dedup. When the same path is requested with the same
+    # offset+limit window as a prior read in this conversation, return the
+    # cached content with an unmistakable marker so the LLM realizes it has
+    # already seen this file. This prevents the model from re-requesting
+    # reads after earlier turns were trimmed from history.
+    cache_key = (path, offset, limit)
+    prior = ctx.files_read_meta.get(cache_key)
+    if prior is not None:
+        return ToolResult(
+            True,
+            data={
+                "path": path,
+                "content": prior["content"],
+                "total_lines": prior["total_lines"],
+                "returned_lines": prior["returned_lines"],
+                "offset": offset,
+                "cache_hit": True,
+                "note": (
+                    "You already read this file earlier in this conversation with the same "
+                    "offset/limit. Use what you have. Only re-call read_file with a different "
+                    "offset/limit if you need a different range."
+                ),
+            },
+            display=f"cache hit ({prior['returned_lines']} lines, already read)",
+        )
+
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as f:
             text = f.read()
     except OSError as e:
         return ToolResult(False, error=str(e))
- 
+
     lines = text.splitlines()
-    offset = int(args.get("offset") or 0)
-    limit = args.get("limit")
     sliced = lines[offset : offset + int(limit)] if limit is not None else lines[offset:]
     content = "\n".join(sliced)
- 
+
     ctx.files_read[path] = content
+    ctx.files_read_meta[cache_key] = {
+        "content": content,
+        "total_lines": len(lines),
+        "returned_lines": len(sliced),
+    }
     return ToolResult(
         True,
         data={
@@ -83,7 +123,8 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(content)
- 
+
+    _invalidate_read_cache(ctx, path)
     return ToolResult(
         True,
         data={"path": path, "bytes": len(content.encode("utf-8"))},
@@ -122,7 +163,8 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     new_text = text.replace(old_str, new_str, -1 if replace_all else 1)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(new_text)
- 
+
+    _invalidate_read_cache(ctx, path)
     old_lines = len(old_str.splitlines()) or 1
     new_lines = len(new_str.splitlines()) or 1
     return ToolResult(

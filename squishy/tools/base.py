@@ -13,6 +13,7 @@ ToolRun = Callable[[dict[str, Any], "ToolContext"], Awaitable["ToolResult"]]
 class ToolContext:
     working_dir: str
     files_read: dict[str, str] = field(default_factory=dict)
+    files_read_meta: dict[tuple[str, int, Any], dict[str, Any]] = field(default_factory=dict)
     permission_mode: str = "edits"
     sandbox_image: str = "python:3.11-slim"
     use_sandbox: bool = True

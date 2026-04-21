@@ -26,6 +26,14 @@ from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_sc
 log = logging.getLogger("squishy.agent")
 
 MAX_CONSECUTIVE_ERRORS = 3
+# Maximum nudge attempts before giving up on planning
+MAX_PLAN_NUDGES = 4
+# In plan mode: after this many consecutive tool-call turns without a plan_task
+# call, inject a nudge. Reduced from 8 to encourage faster planning.
+MAX_PLAN_TOOL_TURNS = 4
+# In plan mode: after this many consecutive reads WITHOUT using recall,
+# warn the model. Set to 2 to enforce early recall usage.
+MAX_RECALL_SKIP_TURNS = 2
  
  
 @dataclass
@@ -50,7 +58,9 @@ class Agent:
     prompt_fn: PromptFn | None = None
     tool_ctx: ToolContext = field(init=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
- 
+    # Track consecutive reads without recall across turns in plan mode
+    consecutive_reads_without_recall: int = 0
+
     def __post_init__(self) -> None:
         self.tool_ctx = ToolContext(
             working_dir=self.config.working_dir,
@@ -60,7 +70,10 @@ class Agent:
         )
         project = detect_project(self.config.working_dir)
         system_prompt = build_system_prompt(
-            self.config.working_dir, project, self.config.thinking
+            self.config.working_dir,
+            project,
+            self.config.thinking,
+            self.config.permission_mode,
         )
         self.messages.append(
             {
@@ -126,7 +139,8 @@ class Agent:
 
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_errors = 0
-        schemas = openai_schemas()
+        plan_nudges = 0
+        turns_without_plan_task = 0  # plan-mode: read-only turns without plan_task call
         result = TaskResult(success=False)
         total_prompt_tokens = 0
         completion_tokens = 0
@@ -136,6 +150,8 @@ class Agent:
 
         for turn in range(1, self.config.max_turns + 1):
             self.tool_ctx.permission_mode = self.config.permission_mode
+            # Schemas are mode-scoped so plan mode never exposes write/edit tools.
+            schemas = openai_schemas(self.config.permission_mode)
             # Trim history before sending to LLM
             self.messages[:] = trim_history(self.messages)
 
@@ -165,6 +181,41 @@ class Agent:
             completion_tokens += completion.completion_tokens
 
             if not completion.tool_calls:
+                in_plan = self.config.permission_mode == "plan"
+                plan = getattr(self.tool_ctx, "active_plan", None)
+                if in_plan and plan is None:
+                    # In plan mode, prose-only completion is not acceptable —
+                    # the agent must produce a plan_task call. Nudge up to
+                    # MAX_PLAN_NUDGES times, then give up.
+                    if completion.text:
+                        self.messages.append(
+                            {"role": "assistant", "content": completion.text}
+                        )
+                    if plan_nudges >= MAX_PLAN_NUDGES:
+                        msg = "plan-mode run finished without producing a plan_task"
+                        if self.display:
+                            self.display.error(msg)
+                        result.error = msg
+                        result.turns_used = turn
+                        result.tokens_used = total_prompt_tokens + completion_tokens
+                        result.elapsed_s = time.monotonic() - start
+                        result.messages = list(self.messages)
+                        return result
+                    plan_nudges += 1
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[system] You are in plan mode. Stop explaining and call "
+                                "`plan_task` now with problem, solution, and steps. "
+                                "Use your best current understanding instead of waiting "
+                                "for exhaustive research. `files_to_modify` and "
+                                "`files_to_create` may be partial or empty if uncertain. "
+                                "Do not respond with prose until the plan is approved."
+                            ),
+                        }
+                    )
+                    continue
                 if completion.text:
                     self.messages.append({"role": "assistant", "content": completion.text})
                 if self.display:
@@ -184,10 +235,22 @@ class Agent:
 
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls))
 
+            plan_task_called_this_turn = False
+            # Track consecutive read tools without recall within this turn
+            local_read_without_recall = 0
             for tc in completion.tool_calls:
+                if tc.name == "plan_task":
+                    plan_task_called_this_turn = True
                 outcome = await self._run_tool(turn, tc)
                 if outcome["success"]:
                     consecutive_errors = 0
+                    # Track read tools (read_file, list_directory, search_files)
+                    if tc.name in ("read_file", "list_directory", "search_files"):
+                        local_read_without_recall += 1
+                    elif tc.name == "recall":
+                        # Reset the budget when recall is used
+                        local_read_without_recall = 0
+                        self.consecutive_reads_without_recall = 0  # Also reset persistent counter
                     if tc.name == "write_file":
                         files_created.add(str(tc.args.get("path", "?")))
                     elif tc.name == "edit_file":
@@ -196,6 +259,29 @@ class Agent:
                         commands_run += 1
                 else:
                     consecutive_errors += 1
+
+                # In plan mode, an approved plan is the terminal event for the run.
+                if (
+                    outcome.get("plan_approved")
+                    and self.config.permission_mode == "plan"
+                ):
+                    if self.display:
+                        self.display.stats.prompt_tokens = total_prompt_tokens
+                        self.display.stats.completion_tokens = completion_tokens
+                        self.display.summary(turn, time.monotonic() - start)
+                    plan = getattr(self.tool_ctx, "active_plan", None) or {}
+                    result.success = True
+                    result.final_text = (
+                        f"Plan approved: {plan.get('plan') or plan.get('problem', '')}"
+                    ).strip()
+                    result.turns_used = turn
+                    result.tokens_used = total_prompt_tokens + completion_tokens
+                    result.files_created = sorted(files_created)
+                    result.files_edited = sorted(files_edited)
+                    result.commands_run = commands_run
+                    result.elapsed_s = time.monotonic() - start
+                    result.messages = list(self.messages)
+                    return result
 
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                     msg = f"{MAX_CONSECUTIVE_ERRORS} consecutive tool failures — stopping."
@@ -210,6 +296,79 @@ class Agent:
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
                     return result
+
+                # Recall-first enforcement: warn after MAX_RECALL_SKIP_TURNS consecutive reads
+                # without using recall (tracked persistently across turns), refuse on the next read.
+                if self.config.permission_mode == "plan":
+                    # Update persistent counter with local reads from this turn
+                    self.consecutive_reads_without_recall += local_read_without_recall
+                    
+                    if self.consecutive_reads_without_recall >= MAX_RECALL_SKIP_TURNS:
+                        # Warn once per turn (when we first hit the threshold)
+                        if self.consecutive_reads_without_recall == MAX_RECALL_SKIP_TURNS:
+                            warning_msg = (
+                                f"You've called read tools {MAX_RECALL_SKIP_TURNS} times without using `recall`. "
+                                "In plan mode, you MUST use `recall(query=...)` first to navigate the codebase. "
+                                "The index at `.squishy/index.json` enables efficient file lookup."
+                            )
+                            if self.display:
+                                self.display.warn(warning_msg)
+                        # Refuse further reads until recall is used
+                        msg = (
+                            f"Too many read calls without `recall`. Call `recall(query=...)` now "
+                            f"to find relevant files, or call `plan_task` if you have enough information. "
+                            "Do not call read_file, list_directory, or search_files again until you use recall."
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": f"[system] {msg}",
+                            }
+                        )
+                        self.consecutive_reads_without_recall = 0  # Reset after enforcing
+                        continue
+
+            # Plan-mode enforcement: if the model keeps reading without calling
+            # plan_task, nudge it after MAX_PLAN_TOOL_TURNS consecutive tool-call
+            # turns.  The nudge budget is shared with the prose-only path above.
+            if self.config.permission_mode == "plan":
+                active_plan = getattr(self.tool_ctx, "active_plan", None)
+                if plan_task_called_this_turn:
+                    # plan_task was attempted (approved, declined, or errored).
+                    # Either way, reset the counter — the model is trying to plan.
+                    turns_without_plan_task = 0
+                elif active_plan is None:
+                    # No plan exists yet and plan_task wasn't called this turn:
+                    # the model spent the turn on read-only investigation.
+                    turns_without_plan_task += 1
+                    if turns_without_plan_task >= MAX_PLAN_TOOL_TURNS:
+                        if plan_nudges < MAX_PLAN_NUDGES:
+                            plan_nudges += 1
+                            turns_without_plan_task = 0
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[system] You have investigated enough. Stop calling "
+                                        "read tools and call `plan_task` now. Use the evidence "
+                                        "you already have instead of waiting for exhaustive "
+                                        "research. `files_to_modify` and `files_to_create` may "
+                                        "be partial or empty if uncertain. Do not read any more "
+                                        "files before calling `plan_task`."
+                                    ),
+                                }
+                            )
+                            continue
+                        else:
+                            msg = "plan-mode run finished without producing a plan_task"
+                            if self.display:
+                                self.display.error(msg)
+                            result.error = msg
+                            result.turns_used = turn
+                            result.tokens_used = total_prompt_tokens + completion_tokens
+                            result.elapsed_s = time.monotonic() - start
+                            result.messages = list(self.messages)
+                            return result
 
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:
@@ -245,30 +404,44 @@ class Agent:
         outcome = await dispatch(tc.name, tc.args, self.tool_ctx, prompt_fn=self.prompt_fn)
         dt_ms = (time.monotonic() - t0) * 1000
 
-        if self.display:
-            # Plan tool gets a rich panel instead of a plain tool_result line
-            if outcome.success and tc.name == "plan_task":
+        plan_approved = False
+        if outcome.success and tc.name == "plan_task":
+            # Ask user to approve the plan (even when there's no display).
+            if self.display:
                 self.display.plan_panel(outcome.data)
-                # Ask user to approve the plan
-                approved = True
-                if self.prompt_fn is not None:
-                    try:
-                        from squishy.tools.base import Tool
+            approved = True
+            if self.prompt_fn is not None:
+                try:
+                    from squishy.tools.base import Tool
 
-                        approved = await self.prompt_fn(
-                            Tool(name="plan_task", description="", parameters={},
-                                 run=lambda *_: None),  # type: ignore[arg-type]
-                            tc.args,
-                        )
-                    except (EOFError, KeyboardInterrupt):
-                        approved = False
-                if not approved:
-                    # Decline: clear the plan from context
-                    if hasattr(self.tool_ctx, "active_plan"):
-                        del self.tool_ctx.active_plan  # type: ignore[attr-defined]
-                    outcome = ToolResult(
-                        False, error="Plan declined by user. Ask for changes or a new approach."
+                    approved = await self.prompt_fn(
+                        Tool(name="plan_task", description="", parameters={},
+                             run=lambda *_: None),  # type: ignore[arg-type]
+                        tc.args,
                     )
+                except (EOFError, KeyboardInterrupt):
+                    approved = False
+            if approved:
+                plan = getattr(self.tool_ctx, "active_plan", None)
+                if isinstance(plan, dict):
+                    plan["approved"] = True
+                plan_approved = True
+                outcome = ToolResult(
+                    True,
+                    data={**outcome.data, "approved": True},
+                    display=outcome.display,
+                )
+            else:
+                if hasattr(self.tool_ctx, "active_plan"):
+                    del self.tool_ctx.active_plan  # type: ignore[attr-defined]
+                outcome = ToolResult(
+                    False, error="Plan declined by user. Ask for changes or a new approach."
+                )
+
+        if self.display:
+            if tc.name == "plan_task":
+                # Panel already rendered above; no plain tool_result line.
+                pass
             elif outcome.success and tc.name == "update_plan":
                 plan = getattr(self.tool_ctx, "active_plan", None)
                 if plan:
@@ -293,7 +466,7 @@ class Agent:
                     self.display.stats.commands_run += 1
 
         self._append_tool_result(tc, message=outcome.to_message())
-        return {"success": outcome.success}
+        return {"success": outcome.success, "plan_approved": plan_approved}
  
     def _append_tool_result(self, tc: ToolCall, message: str) -> None:
         self.messages.append(

@@ -92,3 +92,55 @@ async def test_read_file_offset_limit(ctx, tmp_path):
     r = await read_file.run({"path": "x.txt", "offset": 5, "limit": 3}, ctx)
     assert r.success
     assert r.data["content"] == "5\n6\n7"
+
+
+async def test_read_file_dedup_returns_cache_hit(ctx, tmp_path):
+    """Re-reading the same window returns a cache_hit marker so the LLM
+    realizes it has already seen this file and should use what it has.
+    """
+    (tmp_path / "dup.py").write_text("a\nb\nc\n")
+    r1 = await read_file.run({"path": "dup.py"}, ctx)
+    assert r1.success
+    assert not r1.data.get("cache_hit")
+
+    r2 = await read_file.run({"path": "dup.py"}, ctx)
+    assert r2.success
+    assert r2.data.get("cache_hit") is True
+    assert "already read" in r2.data.get("note", "")
+    assert r2.data["content"] == r1.data["content"]
+
+
+async def test_read_file_different_window_misses_cache(ctx, tmp_path):
+    (tmp_path / "dup.py").write_text("\n".join(str(i) for i in range(10)))
+    r1 = await read_file.run({"path": "dup.py", "offset": 0, "limit": 3}, ctx)
+    assert r1.success
+    assert not r1.data.get("cache_hit")
+
+    # Different offset/limit → fresh read, not a cache hit.
+    r2 = await read_file.run({"path": "dup.py", "offset": 5, "limit": 3}, ctx)
+    assert r2.success
+    assert not r2.data.get("cache_hit")
+    assert r2.data["content"] == "5\n6\n7"
+
+
+async def test_write_file_invalidates_read_cache(ctx):
+    await write_file.run({"path": "v.py", "content": "one\n"}, ctx)
+    r1 = await read_file.run({"path": "v.py"}, ctx)
+    assert r1.data["content"] == "one"
+
+    # Overwrite and re-read — must return fresh content, not cache hit.
+    await write_file.run({"path": "v.py", "content": "two\n"}, ctx)
+    r2 = await read_file.run({"path": "v.py"}, ctx)
+    assert not r2.data.get("cache_hit")
+    assert r2.data["content"] == "two"
+
+
+async def test_edit_file_invalidates_read_cache(ctx):
+    await write_file.run({"path": "v.py", "content": "alpha\n"}, ctx)
+    r1 = await read_file.run({"path": "v.py"}, ctx)
+    assert r1.data["content"] == "alpha"
+
+    await edit_file.run({"path": "v.py", "old_str": "alpha", "new_str": "beta"}, ctx)
+    r2 = await read_file.run({"path": "v.py"}, ctx)
+    assert not r2.data.get("cache_hit")
+    assert r2.data["content"] == "beta"
