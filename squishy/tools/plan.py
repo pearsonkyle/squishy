@@ -139,11 +139,23 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 plan_task = Tool(
     name="plan_task",
     description=(
-        "Present a structured plan to the user before making changes. "
-        "In plan mode, call this as soon as you have enough information to propose a solid approach — do not wait for exhaustive research. "
+        "**CRITICAL: For any task requiring file changes, call this FIRST before implementing.**\n\n"
+        "Present a structured plan to the user before making changes.\n"
+        "- Call this within your first 2 turns for complex tasks\n"
+        "- For simple tasks (e.g., reading one file), you may skip this\n"
         "The plan includes: problem statement, solution approach, implementation "
-        "steps, and files to create/modify. The file lists are optional and may be partial or empty if some targets are still uncertain. "
-        "The user will be asked to approve."
+        "steps, and files to create/modify. The file lists are optional and may be partial or empty if some targets are still uncertain.\n"
+        "Structure your response as:\n"
+        '```json\n'
+        '{\n'
+        '  "problem": "What needs to be fixed or implemented",\n'
+        '  "solution": "High-level approach to solve it",\n'
+        '  "steps": ["Step 1 description", "Step 2 description"],\n'
+        '  "files_to_modify": ["file1.py", "file2.py"],\n'
+        '  "files_to_create": ["new_file.py"]\n'
+        '}\n'
+        '```\n'
+        "The user will be asked to approve before you proceed with implementation."
     ),
     parameters={
         "type": "object",

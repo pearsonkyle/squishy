@@ -62,7 +62,8 @@ def test_build_system_prompt_plan_mode_block(tmp_path: Path) -> None:
     assert "Mode: plan" in prompt
     assert "plan_task" in prompt
     assert "write_file" in prompt  # mentioned as forbidden
-    assert "1-3 targeted reads" in prompt
+    assert "recall(query=" in prompt  # recall-first guidance
+    assert "FIRST" in prompt  # FIRST tool call instruction (uppercase)
     assert "partial or empty if uncertain" in prompt
 
 

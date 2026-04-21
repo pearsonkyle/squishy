@@ -196,12 +196,29 @@ def _mode_block(mode: str) -> str:
     if mode == "plan":
         return (
             "## Mode: plan (read-only)\n"
-            "- You CANNOT write or edit files. `write_file` and `edit_file` are not in your toolbox.\n"
-            "- Your only goal this turn is to investigate just enough and produce exactly one `plan_task` call.\n"
-            "- Usually 1 recall plus 1-3 targeted reads/searches is enough. Do NOT keep reading files once you can describe the problem and fix.\n"
-            "- If the user already named likely files or symbols, skip broad exploration and inspect those directly.\n"
+            "- **CRITICAL: For ANY task requiring file changes, call `plan_task` FIRST.**\n"
+            "- Do NOT attempt implementation until after the plan is approved.\n"
+            "- For simple tasks (e.g., reading one file), you may skip plan_task.\n"
+            "- **In plan mode, your FIRST tool call should ALWAYS be `recall(query=...)` to use the index.**\n"
+            "- After `recall`, make 1-2 targeted reads to understand the problem.\n"
+            "- Call `plan_task` within your first 2-3 turns. Usually: recall → targeted reads → plan.\n"
+            "- Do NOT call read_file, list_directory, or search_files without first using `recall`. The index exists for efficient navigation.\n"
+            "- If the user already named likely files, use `recall` first to verify location, then inspect directly.\n"
             "- Call `plan_task` as soon as you can explain the problem, solution, and concrete steps. `files_to_modify`/`files_to_create` may be partial or empty if uncertain.\n"
             "- Do NOT end the turn with prose before calling `plan_task`.\n"
+            "- Example workflow in plan mode:\n"
+            '  1. `recall(query="function name or file pattern")`\n'
+            '  2. `read_file(path="relevant_file.py", offset=..., limit=...)`\n'
+            '  3. `plan_task(problem="...", solution="...", steps=["..."])`\n'
+            '  ```json\n'
+            '  {\n'
+            '    "problem": "What needs to be fixed or implemented",\n'
+            '    "solution": "High-level approach to solve it",\n'
+            '    "steps": ["Step 1 description", "Step 2 description"],\n'
+            '    "files_to_modify": ["file1.py", "file2.py"],\n'
+            '    "files_to_create": ["new_file.py"]\n'
+            '  }\n'
+            '  ```\n'
             "- `run_command` is limited to read-only commands: ls, cat, head, tail, wc, grep, rg, find, "
             "pwd, which, file, stat, tree, ruff check, mypy, pyright, git status/log/diff/show/branch/blame/ls-files, "
             "pytest --collect-only, python -m pytest --collect-only. No pipes, redirects, or command chains.\n"
@@ -211,10 +228,12 @@ def _mode_block(mode: str) -> str:
         return (
             "## Mode: yolo\n"
             "- All tools available without approval prompts. Be careful.\n"
+            "- **For non-trivial tasks, call `plan_task` first to structure your approach.**\n"
         )
     return (
         "## Mode: edits\n"
         "- `run_command` requires user approval on each call.\n"
+        "- **For non-trivial tasks, call `plan_task` first to present a structured plan.**\n"
         "- If the user approved a plan, follow it: after each step call "
         "`update_plan(step_index=N, status=\"done\")`.\n"
     )

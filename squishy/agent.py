@@ -26,10 +26,14 @@ from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_sc
 log = logging.getLogger("squishy.agent")
 
 MAX_CONSECUTIVE_ERRORS = 3
-MAX_PLAN_NUDGES = 2
+# Maximum nudge attempts before giving up on planning
+MAX_PLAN_NUDGES = 4
 # In plan mode: after this many consecutive tool-call turns without a plan_task
-# call, inject a nudge.  Two nudge slots are shared with the prose-only path.
-MAX_PLAN_TOOL_TURNS = 6
+# call, inject a nudge. Reduced from 8 to encourage faster planning.
+MAX_PLAN_TOOL_TURNS = 4
+# In plan mode: after this many consecutive reads WITHOUT using recall,
+# warn the model. Set to 2 to enforce early recall usage.
+MAX_RECALL_SKIP_TURNS = 2
  
  
 @dataclass
@@ -54,7 +58,9 @@ class Agent:
     prompt_fn: PromptFn | None = None
     tool_ctx: ToolContext = field(init=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
- 
+    # Track consecutive reads without recall across turns in plan mode
+    consecutive_reads_without_recall: int = 0
+
     def __post_init__(self) -> None:
         self.tool_ctx = ToolContext(
             working_dir=self.config.working_dir,
@@ -230,12 +236,21 @@ class Agent:
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls))
 
             plan_task_called_this_turn = False
+            # Track consecutive read tools without recall within this turn
+            local_read_without_recall = 0
             for tc in completion.tool_calls:
                 if tc.name == "plan_task":
                     plan_task_called_this_turn = True
                 outcome = await self._run_tool(turn, tc)
                 if outcome["success"]:
                     consecutive_errors = 0
+                    # Track read tools (read_file, list_directory, search_files)
+                    if tc.name in ("read_file", "list_directory", "search_files"):
+                        local_read_without_recall += 1
+                    elif tc.name == "recall":
+                        # Reset the budget when recall is used
+                        local_read_without_recall = 0
+                        self.consecutive_reads_without_recall = 0  # Also reset persistent counter
                     if tc.name == "write_file":
                         files_created.add(str(tc.args.get("path", "?")))
                     elif tc.name == "edit_file":
@@ -281,6 +296,37 @@ class Agent:
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
                     return result
+
+                # Recall-first enforcement: warn after MAX_RECALL_SKIP_TURNS consecutive reads
+                # without using recall (tracked persistently across turns), refuse on the next read.
+                if self.config.permission_mode == "plan":
+                    # Update persistent counter with local reads from this turn
+                    self.consecutive_reads_without_recall += local_read_without_recall
+                    
+                    if self.consecutive_reads_without_recall >= MAX_RECALL_SKIP_TURNS:
+                        # Warn once per turn (when we first hit the threshold)
+                        if self.consecutive_reads_without_recall == MAX_RECALL_SKIP_TURNS:
+                            warning_msg = (
+                                f"You've called read tools {MAX_RECALL_SKIP_TURNS} times without using `recall`. "
+                                "In plan mode, you MUST use `recall(query=...)` first to navigate the codebase. "
+                                "The index at `.squishy/index.json` enables efficient file lookup."
+                            )
+                            if self.display:
+                                self.display.warn(warning_msg)
+                        # Refuse further reads until recall is used
+                        msg = (
+                            f"Too many read calls without `recall`. Call `recall(query=...)` now "
+                            f"to find relevant files, or call `plan_task` if you have enough information. "
+                            "Do not call read_file, list_directory, or search_files again until you use recall."
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": f"[system] {msg}",
+                            }
+                        )
+                        self.consecutive_reads_without_recall = 0  # Reset after enforcing
+                        continue
 
             # Plan-mode enforcement: if the model keeps reading without calling
             # plan_task, nudge it after MAX_PLAN_TOOL_TURNS consecutive tool-call
