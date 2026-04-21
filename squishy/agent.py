@@ -27,6 +27,9 @@ log = logging.getLogger("squishy.agent")
 
 MAX_CONSECUTIVE_ERRORS = 3
 MAX_PLAN_NUDGES = 2
+# In plan mode: after this many consecutive tool-call turns without a plan_task
+# call, inject a nudge.  Two nudge slots are shared with the prose-only path.
+MAX_PLAN_TOOL_TURNS = 6
  
  
 @dataclass
@@ -131,6 +134,7 @@ class Agent:
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_errors = 0
         plan_nudges = 0
+        turns_without_plan_task = 0  # plan-mode: read-only turns without plan_task call
         result = TaskResult(success=False)
         total_prompt_tokens = 0
         completion_tokens = 0
@@ -222,7 +226,10 @@ class Agent:
 
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls))
 
+            plan_task_called_this_turn = False
             for tc in completion.tool_calls:
+                if tc.name == "plan_task":
+                    plan_task_called_this_turn = True
                 outcome = await self._run_tool(turn, tc)
                 if outcome["success"]:
                     consecutive_errors = 0
@@ -271,6 +278,43 @@ class Agent:
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
                     return result
+
+            # Plan-mode enforcement: if the model keeps reading without calling
+            # plan_task, nudge it after MAX_PLAN_TOOL_TURNS consecutive tool-call
+            # turns.  The nudge budget is shared with the prose-only path above.
+            if self.config.permission_mode == "plan":
+                active_plan = getattr(self.tool_ctx, "active_plan", None)
+                if plan_task_called_this_turn:
+                    turns_without_plan_task = 0
+                elif active_plan is None:
+                    turns_without_plan_task += 1
+                    if turns_without_plan_task >= MAX_PLAN_TOOL_TURNS:
+                        if plan_nudges < MAX_PLAN_NUDGES:
+                            plan_nudges += 1
+                            turns_without_plan_task = 0
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "[system] You have been investigating for many turns "
+                                        "without producing a plan. Stop calling read tools. "
+                                        "Call `plan_task` now with the problem, solution, and "
+                                        "concrete steps based on what you have found. "
+                                        "Do not read any more files before calling `plan_task`."
+                                    ),
+                                }
+                            )
+                            continue
+                        else:
+                            msg = "plan-mode run finished without producing a plan_task"
+                            if self.display:
+                                self.display.error(msg)
+                            result.error = msg
+                            result.turns_used = turn
+                            result.tokens_used = total_prompt_tokens + completion_tokens
+                            result.elapsed_s = time.monotonic() - start
+                            result.messages = list(self.messages)
+                            return result
 
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:

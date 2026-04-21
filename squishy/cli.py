@@ -116,7 +116,6 @@ async def _amain() -> None:
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
     display = Display()
-    display.stats.context_window = cfg.max_tokens
     client = Client(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
@@ -128,9 +127,12 @@ async def _amain() -> None:
     )
 
     try:
-        # Discover the actual model name from endpoint
+        # Discover the actual model name from endpoint (also discovers context_window)
         discovered_model = await client.discover_model_name()
         display.banner(cfg.base_url, discovered_model)
+        # Use the discovered context window so the % usage display is meaningful.
+        # Falls back to 0 (no % shown) for endpoints that don't expose it.
+        display.stats.context_window = client.context_window
 
         if not await client.health():
             display.error(f"Cannot reach OpenAI endpoint at {cfg.base_url}.")

@@ -286,7 +286,85 @@ async def test_agent_completes_when_plan_task_approved(tmp_path):
  
 
 
-async def test_agent_runs_headless_without_display(tmp_path):
+async def test_agent_plan_mode_nudges_after_tool_turns(tmp_path):
+    """In plan mode, reading files for MAX_PLAN_TOOL_TURNS turns without calling
+    plan_task should inject a nudge, then eventually produce the plan."""
+    from squishy.agent import MAX_PLAN_TOOL_TURNS
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 30
+
+    # Create a file so read_file succeeds
+    (tmp_path / "foo.py").write_text("# code")
+
+    # MAX_PLAN_TOOL_TURNS turns of read-only tool calls, then plan_task
+    script = [
+        CompletionResult(
+            tool_calls=[_tc("read_file", {"path": "foo.py"}, call_id=f"c{i}")]
+        )
+        for i in range(MAX_PLAN_TOOL_TURNS)
+    ] + [
+        CompletionResult(
+            tool_calls=[
+                _tc(
+                    "plan_task",
+                    {"problem": "p", "solution": "s", "steps": ["a"]},
+                    call_id="plan1",
+                )
+            ]
+        ),
+        CompletionResult(text="should not reach", tool_calls=[]),
+    ]
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    fake = FakeClient(script=script)
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    result = await agent.run("plan something")
+
+    assert result.success, result.error
+    plan = getattr(agent.tool_ctx, "active_plan", None)
+    assert isinstance(plan, dict)
+    assert plan.get("approved") is True
+    # A nudge message should have been injected
+    nudge_msgs = [
+        m
+        for m in result.messages
+        if m.get("role") == "user" and "[system]" in (m.get("content") or "")
+        and "read tools" in (m.get("content") or "")
+    ]
+    assert nudge_msgs, "expected at least one tool-turn nudge injection"
+
+
+async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
+    """If the model keeps calling read tools without ever calling plan_task, the
+    agent should give up after exhausting nudge budget (tool-call path)."""
+    from squishy.agent import MAX_PLAN_NUDGES, MAX_PLAN_TOOL_TURNS
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 30
+
+    (tmp_path / "foo.py").write_text("# code")
+
+    # Enough turns to exhaust all nudges: (MAX_PLAN_NUDGES + 1) * MAX_PLAN_TOOL_TURNS
+    n_turns = (MAX_PLAN_NUDGES + 1) * MAX_PLAN_TOOL_TURNS + 1
+    script = [
+        CompletionResult(
+            tool_calls=[_tc("read_file", {"path": "foo.py"}, call_id=f"c{i}")]
+        )
+        for i in range(n_turns)
+    ]
+    fake = FakeClient(script=script)
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    result = await agent.run("plan please")
+
+    assert not result.success
+    assert "plan_task" in result.error
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "yolo"

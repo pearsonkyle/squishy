@@ -75,6 +75,7 @@ class Client:
     max_tokens: int = 8192
     request_timeout: float = 120.0
     max_retries: int = 4
+    context_window: int = 0  # discovered from endpoint; 0 = unknown (no % display)
     """Our own retry count. The underlying SDK retries are disabled to avoid double-counting."""
  
     _client: AsyncOpenAI = field(init=False, repr=False)
@@ -106,18 +107,25 @@ class Client:
 
     async def discover_model_name(self) -> str:
         """Try to discover the actual model name from the endpoint.
-        
+
+        As a side-effect, sets ``self.context_window`` when the endpoint
+        exposes it (LM Studio returns ``context_length`` on model objects).
+
         Returns the configured model if discovery fails, or 'unknown-model'.
         """
         try:
             # Try to list models and get the first one
             models = await self._client.models.list()
             if models.data:
-                # Return the first model's id
-                return models.data[0].id
+                model = models.data[0]
+                # LM Studio (and some vLLM builds) expose context_length.
+                ctx = getattr(model, "context_length", None)
+                if isinstance(ctx, int) and ctx > 0:
+                    self.context_window = ctx
+                return model.id
         except Exception:  # noqa: BLE001
             pass
-        
+
         # Return configured model name if discovery fails
         return self.model
 
