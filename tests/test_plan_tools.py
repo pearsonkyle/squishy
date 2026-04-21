@@ -131,6 +131,9 @@ class TestPlanTask:
         persisted = load_plan(tmp_path)
         assert persisted is not None
         assert persisted.plan == "Fix failing tests"
+        assert persisted.problem == "Tests are failing"
+        assert persisted.solution == "Fix the broken assertions"
+        assert [step.description for step in persisted.steps] == ["Read file", "Fix it"]
 
 
 @pytest.mark.asyncio

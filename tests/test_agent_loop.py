@@ -435,6 +435,8 @@ async def test_agent_blocks_success_until_plan_steps_resolved(tmp_path):
     assert result.final_text == "really done"
     assert result.plan_state is not None
     assert result.plan_state["progress"]["done"] == 1
+    persisted = json.loads(plan_path(tmp_path).read_text())
+    assert persisted["steps"][0]["status"] == "done"
     assert any("unresolved steps" in (m.get("content") or "") for m in result.messages)
 
 
