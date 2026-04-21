@@ -23,8 +23,12 @@ def index_path(cwd: str | os.PathLike[str]) -> Path:
  
 def meta_path(cwd: str | os.PathLike[str]) -> Path:
     return index_dir(cwd) / META_FILE
- 
- 
+
+
+def has_index(cwd: str | os.PathLike[str]) -> bool:
+    return index_path(cwd).is_file()
+
+
 def save_index(cwd: str | os.PathLike[str], index: Index) -> Path:
     d = index_dir(cwd)
     d.mkdir(parents=True, exist_ok=True)
@@ -62,6 +66,7 @@ __all__ = [
     "INDEX_FILE",
     "META_FILE",
     "index_dir",
+    "has_index",
     "index_path",
     "meta_path",
     "save_index",

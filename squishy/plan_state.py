@@ -12,7 +12,7 @@ from typing import Any
 
 PLAN_DIR = ".squishy"
 PLAN_FILE = "active_plan.json"
-STEP_STATUSES = ("pending", "in-progress", "done", "skipped", "blocked")
+STEP_STATUSES = frozenset({"pending", "in-progress", "done", "skipped", "blocked"})
 RESOLVED_STEP_STATUSES = frozenset({"done", "skipped"})
 
 

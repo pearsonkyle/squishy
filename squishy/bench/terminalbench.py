@@ -107,7 +107,7 @@ class LocalTerminalBackend:
     async def run_setup(self, task: TerminalTask, workspace: Path) -> list[ShellResult]:
         results: list[ShellResult] = []
         for cmd in task.setup:
-            result = await _run_shell(cmd, cwd=workspace)
+            result = await _run_shell(cmd, cwd=workspace, timeout=task.timeout)
             results.append(result)
             if result.exit_code != 0:
                 break
@@ -116,7 +116,7 @@ class LocalTerminalBackend:
     async def verify(self, task: TerminalTask, workspace: Path) -> ShellResult | None:
         if not task.verify:
             return None
-        return await _run_shell(task.verify, cwd=workspace)
+        return await _run_shell(task.verify, cwd=workspace, timeout=task.timeout)
 
 
 async def run_terminal_task(

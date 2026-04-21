@@ -27,11 +27,17 @@ MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
  
  
 def _parse_args(argv: list[str]) -> argparse.Namespace:
+    default_turns = Config().max_turns
     p = argparse.ArgumentParser(prog="squishy", description="Minimal local-LLM coding agent.")
     p.add_argument("--base-url", help="OpenAI-compatible endpoint (env SQUISHY_BASE_URL)")
     p.add_argument("--model", help="Model id (env SQUISHY_MODEL)")
     p.add_argument("--api-key", help="API key (env SQUISHY_API_KEY)")
-    p.add_argument("--max-turns", type=int, default=None, help="Turn cap (uses config default: 30)")
+    p.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help=f"Turn cap (uses config default: {default_turns})",
+    )
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--timeout", type=float, default=None, help="Task timeout in seconds")
     p.add_argument("--request-timeout", type=float, default=120.0)

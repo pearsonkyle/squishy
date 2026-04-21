@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -22,6 +21,7 @@ from squishy.config import Config
 from squishy.context import build_system_prompt, detect_project, trim_history
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
+from squishy.index.store import has_index
 from squishy.plan_state import clear_plan, load_plan, save_plan
 from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_schemas
 
@@ -73,7 +73,7 @@ class Agent:
             use_sandbox=self.config.use_sandbox,
             plan=load_plan(self.config.working_dir),
         )
-        self.has_index = os.path.isfile(os.path.join(self.config.working_dir, ".squishy", "index.json"))
+        self.has_index = has_index(self.config.working_dir)
         project = detect_project(self.config.working_dir)
         system_prompt = build_system_prompt(
             self.config.working_dir,

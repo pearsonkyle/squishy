@@ -9,7 +9,9 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any
- 
+
+from squishy.index.store import has_index
+
 MAX_HISTORY = 10  # system + first user + last 8 = 10
  
  
@@ -193,7 +195,7 @@ def _recall_rule(cwd: str) -> str:
 
 
 def _mode_block(mode: str, cwd: str) -> str:
-    has_index = os.path.isfile(os.path.join(cwd, ".squishy", "index.json"))
+    index_available = has_index(cwd)
     if mode == "plan":
         index_guidance = (
             "- **In plan mode, your FIRST tool call should ALWAYS be `recall(query=...)` to use the index.**\n"
@@ -205,7 +207,7 @@ def _mode_block(mode: str, cwd: str) -> str:
             '  1. `recall(query="function name or file pattern")`\n'
             '  2. `read_file(path="relevant_file.py", offset=..., limit=...)`\n'
             '  3. `plan_task(problem="...", solution="...", steps=["..."])`\n'
-        ) if has_index else (
+        ) if index_available else (
             "- No repo index is present yet, so you may use targeted `read_file`, `list_directory`, or `search_files` calls to investigate.\n"
             "- Prefer 1-3 focused reads, then call `plan_task`; do not wait for exhaustive research.\n"
             "- If navigation is difficult, ask the user to run `/init` or use it yourself once you are allowed to leave plan mode.\n"
