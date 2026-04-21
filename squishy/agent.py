@@ -285,8 +285,12 @@ class Agent:
             if self.config.permission_mode == "plan":
                 active_plan = getattr(self.tool_ctx, "active_plan", None)
                 if plan_task_called_this_turn:
+                    # plan_task was attempted (approved, declined, or errored).
+                    # Either way, reset the counter — the model is trying to plan.
                     turns_without_plan_task = 0
                 elif active_plan is None:
+                    # No plan exists yet and plan_task wasn't called this turn:
+                    # the model spent the turn on read-only investigation.
                     turns_without_plan_task += 1
                     if turns_without_plan_task >= MAX_PLAN_TOOL_TURNS:
                         if plan_nudges < MAX_PLAN_NUDGES:
