@@ -16,8 +16,21 @@ async def test_run_command_success(ctx):
  
 async def test_run_command_nonzero_exit(ctx):
     r = await run_command.run({"command": "sh -c 'exit 7'"}, ctx)
-    assert r.success  # success means we executed; exit_code reports shell status
+    # Non-zero exit now reports as tool failure so a 7B model can't mistake a
+    # crashing command for success, but exit_code and outputs stay in `data`.
+    assert not r.success
     assert r.data["exit_code"] == 7
+    assert "exited 7" in r.error
+
+
+async def test_run_command_truncation_is_signalled(ctx):
+    # Produce ~20KB of stdout to trip the OUTPUT_CAP_STDOUT limit.
+    r = await run_command.run(
+        {"command": "python -c \"print('x' * 20000)\""}, ctx
+    )
+    assert r.success
+    assert r.data["truncated"] is True
+    assert "truncated" in r.data["stdout"]
  
  
 async def test_run_command_timeout(ctx):

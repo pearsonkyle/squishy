@@ -7,7 +7,15 @@ import json
 import pytest
 
 from squishy.display import Display, Stats, fmt_tokens
-from squishy.plan_state import load_plan, plan_path
+from squishy.plan_state import (
+    PLAN_STATUS_CLOSE_TAG,
+    PLAN_STATUS_OPEN_TAG,
+    PlanState,
+    is_plan_status_message,
+    load_plan,
+    plan_path,
+    render_plan_status,
+)
 from squishy.tools.base import ToolContext
 
 
@@ -235,6 +243,138 @@ class TestPlanToolRestrictions:
             allowed = get_allowed_tools(mode)
             assert "plan_task" in allowed
             assert "update_plan" in allowed
+            assert "get_plan" in allowed
+            assert "log_blocker" in allowed
+
+
+@pytest.mark.asyncio
+class TestGetPlanTool:
+    async def test_get_plan_no_active_plan(self, tmp_path) -> None:
+        from squishy.tools.plan import _get_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
+        result = await _get_plan({}, ctx)
+        assert result.success
+        assert result.data == {"plan": None}
+
+    async def test_get_plan_returns_active_plan(self, tmp_path) -> None:
+        from squishy.tools.plan import _get_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
+        await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["one", "two"]}, ctx
+        )
+        result = await _get_plan({}, ctx)
+        assert result.success
+        assert result.data["plan"]["problem"] == "p"
+        assert len(result.data["plan"]["steps"]) == 2
+
+
+@pytest.mark.asyncio
+class TestLogBlockerTool:
+    async def test_log_blocker_requires_plan(self, tmp_path) -> None:
+        from squishy.tools.plan import _log_blocker
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        result = await _log_blocker({"step_index": 1, "detail": "x"}, ctx)
+        assert not result.success
+        assert "no active plan" in result.error
+
+    async def test_log_blocker_requires_detail(self, tmp_path) -> None:
+        from squishy.tools.plan import _log_blocker, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        result = await _log_blocker({"step_index": 1, "detail": "  "}, ctx)
+        assert not result.success
+        assert "detail" in result.error
+
+    async def test_log_blocker_appends_evidence_without_status_change(self, tmp_path) -> None:
+        from squishy.tools.plan import _log_blocker, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a", "b"]}, ctx)
+        result = await _log_blocker({"step_index": 2, "detail": "docker missing"}, ctx)
+        assert result.success
+        assert ctx.plan.steps[1].status == "pending"
+        assert ctx.plan.steps[1].evidence[-1].kind == "blocker"
+        assert ctx.plan.steps[1].evidence[-1].detail == "docker missing"
+
+
+@pytest.mark.asyncio
+class TestUpdatePlanAddSteps:
+    async def test_add_steps_appends(self, tmp_path) -> None:
+        from squishy.tools.plan import _plan_task, _update_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        result = await _update_plan(
+            {"step_index": 1, "status": "done", "add_steps": ["b", "c"]}, ctx
+        )
+        assert result.success
+        assert [s.description for s in ctx.plan.steps] == ["a", "b", "c"]
+        assert ctx.plan.steps[1].status == "pending"
+
+    async def test_add_steps_rejects_bad_shape(self, tmp_path) -> None:
+        from squishy.tools.plan import _plan_task, _update_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        result = await _update_plan(
+            {"step_index": 1, "status": "done", "add_steps": ["ok", ""]}, ctx
+        )
+        assert not result.success
+        assert "add_steps" in result.error
+
+
+class TestRenderPlanStatus:
+    def _plan(self, steps=None) -> PlanState:
+        return PlanState.create(
+            plan="Fix import",
+            problem="foo module missing",
+            solution="add guarded import",
+            steps=steps or ["Read src/foo.py", "Add guard", "Run pytest"],
+            files_to_modify=["src/foo.py"],
+        )
+
+    def test_render_includes_tags_and_steps(self) -> None:
+        plan = self._plan()
+        text = render_plan_status(plan)
+        assert text.startswith(PLAN_STATUS_OPEN_TAG)
+        assert text.endswith(PLAN_STATUS_CLOSE_TAG)
+        assert "plan: Fix import" in text
+        assert "solution: add guarded import" in text
+        assert "1. Read src/foo.py" in text
+        assert "2. Add guard" in text
+        assert "progress: 0/3 done" in text
+
+    def test_render_reflects_status_changes(self) -> None:
+        plan = self._plan()
+        plan.mark_approved()
+        plan.update_step(step_index=0, status="done")
+        plan.update_step(step_index=1, status="in-progress", note="editing")
+        plan.update_step(step_index=2, status="blocked", note="infra down")
+        text = render_plan_status(plan)
+        assert "[approved]" in text
+        assert "[✓] 1." in text
+        assert "[▶] 2." in text
+        assert "[!] 3." in text
+        assert "blocked: infra down" in text
+        assert "progress: 1/3 done" in text
+
+    def test_render_truncates_long_step_descriptions(self) -> None:
+        plan = self._plan(steps=["x" * 500])
+        text = render_plan_status(plan, step_desc_chars=40)
+        step_line = [ln for ln in text.splitlines() if ln.strip().startswith("[")][0]
+        assert "…" in step_line
+        assert len(step_line) < 80
+
+    def test_is_plan_status_message(self) -> None:
+        plan = self._plan()
+        msg = {"role": "system", "content": render_plan_status(plan)}
+        assert is_plan_status_message(msg)
+        assert not is_plan_status_message({"role": "system", "content": "something else"})
+        assert not is_plan_status_message({"role": "user", "content": render_plan_status(plan)})
 
 
 class TestDisplayPlanPanel:

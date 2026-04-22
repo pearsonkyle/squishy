@@ -260,9 +260,18 @@ def _parse_tool_call(call_id: str, name: str, arguments: str) -> ToolCall:
     try:
         args = json.loads(arguments)
         if not isinstance(args, dict):
-            args = {"_raw": arguments}
-    except json.JSONDecodeError:
-        args = {"_raw": arguments}
+            args = {
+                "_tool_arg_error": f"expected JSON object, got {type(args).__name__}",
+                "_raw": arguments[:800],
+            }
+    except json.JSONDecodeError as e:
+        # Surface a clear, actionable error so the tool dispatcher returns a
+        # message the model can correct, instead of a silent "_raw" payload
+        # that looks like a missing-required-field error downstream.
+        args = {
+            "_tool_arg_error": f"invalid JSON in tool arguments: {e}",
+            "_raw": arguments[:800],
+        }
     return ToolCall(id=call_id, name=name, args=args)
  
  

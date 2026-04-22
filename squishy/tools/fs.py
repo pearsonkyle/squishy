@@ -33,6 +33,29 @@ def _invalidate_read_cache(ctx: ToolContext, path: str) -> None:
     for key in [k for k in ctx.files_read_meta if k[0] == path]:
         del ctx.files_read_meta[key]
     ctx.files_read.pop(path, None)
+
+
+def _collect_match_context(
+    text: str, needle: str, *, max_matches: int = 3, context_lines: int = 2
+) -> str:
+    """Return a short string showing up to ``max_matches`` match sites with
+    ``context_lines`` lines of surrounding context. Used by edit_file to help
+    the model disambiguate without re-reading the entire file."""
+    lines = text.splitlines()
+    needle_first_line = needle.splitlines()[0] if needle else needle
+    out: list[str] = []
+    found = 0
+    for i, line in enumerate(lines):
+        if needle_first_line not in line:
+            continue
+        start = max(0, i - context_lines)
+        end = min(len(lines), i + context_lines + 1)
+        chunk = [f"  L{n + 1}: {lines[n]}" for n in range(start, end)]
+        out.append(f"--- match {found + 1} at line {i + 1} ---\n" + "\n".join(chunk))
+        found += 1
+        if found >= max_matches:
+            break
+    return "\n".join(out) if out else "(no match context available)"
  
  
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -109,14 +132,22 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     abs_path = _resolve(path, ctx.working_dir)
  
     if os.path.isfile(abs_path):
-        with open(abs_path, encoding="utf-8", errors="replace") as _f:
-            existing_lines = sum(1 for _ in _f)
+        try:
+            with open(abs_path, encoding="utf-8", errors="replace") as _f:
+                existing = _f.readlines()
+        except OSError as e:
+            return ToolResult(False, error=f"could not read {path}: {e}")
+        existing_lines = len(existing)
         if existing_lines > WRITE_LIMIT_LINES:
+            preview_first = existing[0].rstrip() if existing else ""
+            preview_last = existing[-1].rstrip() if existing else ""
             return ToolResult(
                 False,
                 error=(
-                    f"refusing write_file: {path} exists with {existing_lines} lines (>{WRITE_LIMIT_LINES}). "
-                    "Use edit_file with old_str/new_str for targeted changes."
+                    f"refusing write_file: {path} exists with {existing_lines} lines "
+                    f"(>{WRITE_LIMIT_LINES}). Use edit_file with old_str/new_str for targeted "
+                    f"changes. File starts with: {preview_first[:80]!r}; ends with: "
+                    f"{preview_last[:80]!r}."
                 ),
             )
  
@@ -152,11 +183,13 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if count == 0:
         return ToolResult(False, error="old_str not found in file")
     if count > 1 and not replace_all:
+        context_snippets = _collect_match_context(text, old_str, max_matches=3, context_lines=2)
         return ToolResult(
             False,
             error=(
                 f"old_str matches {count} times; pass replace_all=true or expand old_str "
-                "with more surrounding context to make it unique."
+                "with more surrounding context to make it unique. Match sites:\n"
+                + context_snippets
             ),
         )
  
@@ -304,7 +337,6 @@ read_file = Tool(
         "required": ["path"],
     },
     run=_read_file,
-    mutates=False,
 )
  
 write_file = Tool(
@@ -320,7 +352,6 @@ write_file = Tool(
         "required": ["path", "content"],
     },
     run=_write_file,
-    mutates=True,
 )
  
 edit_file = Tool(
@@ -338,7 +369,6 @@ edit_file = Tool(
         "required": ["path", "old_str", "new_str"],
     },
     run=_edit_file,
-    mutates=True,
 )
  
 list_directory = Tool(
@@ -349,7 +379,6 @@ list_directory = Tool(
         "properties": {"path": {"type": "string", "default": "."}},
     },
     run=_list_directory,
-    mutates=False,
 )
  
 search_files = Tool(
@@ -365,7 +394,6 @@ search_files = Tool(
         "required": ["pattern"],
     },
     run=_search_files,
-    mutates=False,
 )
  
 FS_TOOLS: list[Tool] = [read_file, write_file, edit_file, list_directory, search_files]

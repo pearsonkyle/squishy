@@ -364,7 +364,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         # auto-switch to edits mode and trigger plan execution.
         if cfg.permission_mode == "plan":
             plan = current_agent.tool_ctx.plan
-            if plan is not None and plan.approved_by_user and not current_agent.tool_ctx.plan_switch_prompted:
+            if plan is not None and plan.approved and not current_agent.tool_ctx.plan_switch_prompted:
                 current_agent.tool_ctx.plan_switch_prompted = True
                 # Auto-switch to edits mode (user already consented by approving the plan)
                 cfg.permission_mode = "edits"

@@ -22,20 +22,16 @@ from squishy.context import build_system_prompt, detect_project, trim_history
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.index.store import has_index
-from squishy.plan_state import clear_plan, load_plan, save_plan
+from squishy.plan_state import (
+    clear_plan,
+    is_plan_status_message,
+    load_plan,
+    render_plan_status,
+    save_plan,
+)
 from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_schemas
 
 log = logging.getLogger("squishy.agent")
-
-MAX_CONSECUTIVE_ERRORS = 3
-# Maximum nudge attempts before giving up on planning
-MAX_PLAN_NUDGES = 4
-# In plan mode: after this many consecutive tool-call turns without a plan_task
-# call, inject a nudge. Reduced from 8 to encourage faster planning.
-MAX_PLAN_TOOL_TURNS = 4
-# In plan mode: after this many consecutive reads WITHOUT using recall,
-# warn the model. Set to 2 to enforce early recall usage.
-MAX_RECALL_SKIP_TURNS = 2
  
  
 @dataclass
@@ -145,6 +141,20 @@ class Agent:
     def _plan_snapshot(self) -> dict[str, Any] | None:
         return self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else None
 
+    def _refresh_plan_status_message(self) -> None:
+        """Drop any prior plan-status system message; append a fresh one.
+
+        Called each turn so the model always sees the current plan state even
+        after the conversation has been trimmed. No-op when there is no plan.
+        """
+        self.messages[:] = [m for m in self.messages if not is_plan_status_message(m)]
+        plan = self.tool_ctx.plan
+        if plan is None:
+            return
+        self.messages.append(
+            {"role": "system", "content": render_plan_status(plan)}
+        )
+
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_errors = 0
         plan_nudges = 0
@@ -160,8 +170,14 @@ class Agent:
             self.tool_ctx.permission_mode = self.config.permission_mode
             # Schemas are mode-scoped so plan mode never exposes write/edit tools.
             schemas = openai_schemas(self.config.permission_mode)
+            # Re-inject a fresh plan-status system message so the model always
+            # sees its current plan (even after tool chains or history trim
+            # evict the original plan_task result from context).
+            self._refresh_plan_status_message()
             # Trim history before sending to LLM
-            self.messages[:] = trim_history(self.messages)
+            self.messages[:] = trim_history(
+                self.messages, max_messages=self.config.max_history_messages
+            )
 
             try:
                 completion = await self.client.complete(
@@ -195,12 +211,12 @@ class Agent:
                 if in_plan and plan is None:
                     # In plan mode, prose-only completion is not acceptable —
                     # the agent must produce a plan_task call. Nudge up to
-                    # MAX_PLAN_NUDGES times, then give up.
+                    # max_plan_nudges times, then give up.
                     if completion.text:
                         self.messages.append(
                             {"role": "assistant", "content": completion.text}
                         )
-                    if plan_nudges >= MAX_PLAN_NUDGES:
+                    if plan_nudges >= self.config.max_plan_nudges:
                         msg = "plan-mode run finished without producing a plan_task"
                         if self.display:
                             self.display.error(msg)
@@ -291,6 +307,13 @@ class Agent:
                         files_edited.add(str(tc.args.get("path", "?")))
                     elif tc.name == "run_command":
                         commands_run += 1
+                elif tc.name == "run_command":
+                    # Non-zero exits are "soft" failures — the tool ran, the
+                    # command just returned non-zero (e.g. failing tests).
+                    # Count it as a command but don't trip the error-loop
+                    # breaker; the model legitimately needs to iterate.
+                    commands_run += 1
+                    consecutive_errors = 0
                 else:
                     consecutive_errors += 1
 
@@ -318,8 +341,8 @@ class Agent:
                     result.plan_state = self._plan_snapshot()
                     return result
 
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    msg = f"{MAX_CONSECUTIVE_ERRORS} consecutive tool failures — stopping."
+                if consecutive_errors >= self.config.max_consecutive_errors:
+                    msg = f"{self.config.max_consecutive_errors} consecutive tool failures — stopping."
                     if self.display:
                         self.display.error(msg)
                     result.error = msg
@@ -333,17 +356,18 @@ class Agent:
                     result.plan_state = self._plan_snapshot()
                     return result
 
-                # Recall-first enforcement: warn after MAX_RECALL_SKIP_TURNS consecutive reads
+                # Recall-first enforcement: warn after max_recall_skip_turns consecutive reads
                 # without using recall (tracked persistently across turns), refuse on the next read.
                 if self.config.permission_mode == "plan":
+                    recall_skip_budget = self.config.max_recall_skip_turns
                     # Update persistent counter with local reads from this turn
                     self.consecutive_reads_without_recall += local_read_without_recall
-                     
-                    if self.has_index and self.consecutive_reads_without_recall >= MAX_RECALL_SKIP_TURNS:
+
+                    if self.has_index and self.consecutive_reads_without_recall >= recall_skip_budget:
                         # Warn once per turn (when we first hit the threshold)
-                        if self.consecutive_reads_without_recall == MAX_RECALL_SKIP_TURNS:
+                        if self.consecutive_reads_without_recall == recall_skip_budget:
                             warning_msg = (
-                                f"You've called read tools {MAX_RECALL_SKIP_TURNS} times without using `recall`. "
+                                f"You've called read tools {recall_skip_budget} times without using `recall`. "
                                 "In plan mode, you MUST use `recall(query=...)` first to navigate the codebase. "
                                 "The index at `.squishy/index.json` enables efficient file lookup."
                             )
@@ -365,8 +389,8 @@ class Agent:
                         continue
 
             # Plan-mode enforcement: if the model keeps reading without calling
-            # plan_task, nudge it after MAX_PLAN_TOOL_TURNS consecutive tool-call
-            # turns.  The nudge budget is shared with the prose-only path above.
+            # plan_task, nudge it after max_plan_investigation_turns consecutive
+            # tool-call turns. The nudge budget is shared with the prose-only path above.
             if self.config.permission_mode == "plan":
                 active_plan = self.tool_ctx.plan
                 if plan_task_called_this_turn:
@@ -377,8 +401,8 @@ class Agent:
                     # No plan exists yet and plan_task wasn't called this turn:
                     # the model spent the turn on read-only investigation.
                     turns_without_plan_task += 1
-                    if turns_without_plan_task >= MAX_PLAN_TOOL_TURNS:
-                        if plan_nudges < MAX_PLAN_NUDGES:
+                    if turns_without_plan_task >= self.config.max_plan_investigation_turns:
+                        if plan_nudges < self.config.max_plan_nudges:
                             plan_nudges += 1
                             turns_without_plan_task = 0
                             self.messages.append(
@@ -462,7 +486,6 @@ class Agent:
             if approved:
                 if self.tool_ctx.plan is not None:
                     self.tool_ctx.plan.mark_approved()
-                    self.tool_ctx.plan.approved_by_user = True
                     self.tool_ctx.plan_switch_prompted = False
                     save_plan(self.tool_ctx.working_dir, self.tool_ctx.plan)
                 plan_approved = True
@@ -484,7 +507,13 @@ class Agent:
                     False, error="Plan declined by user. Ask for changes or a new approach."
                 )
 
-        if outcome.success and self.tool_ctx.plan is not None and self.tool_ctx.plan.approved:
+        # Accumulate evidence even when run_command returns success=False because
+        # of a non-zero exit — failing commands are useful plan evidence too.
+        ran_command = tc.name == "run_command" and outcome.data.get("exit_code") is not None
+        should_record = (outcome.success or ran_command) and (
+            self.tool_ctx.plan is not None and self.tool_ctx.plan.approved
+        )
+        if should_record:
             if tc.name == "write_file":
                 self.tool_ctx.pending_plan_evidence.append(
                     {
@@ -529,7 +558,7 @@ class Agent:
                 self.display.write_preview(
                     str(tc.args.get("path", "?")), str(tc.args.get("content", ""))
                 )
-            if outcome.success and tc.name == "run_command":
+            if tc.name == "run_command" and outcome.data.get("exit_code") is not None:
                 self.display.command_output(outcome.data)
             if outcome.success:
                 if tc.name == "write_file":

@@ -334,18 +334,31 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
     ``tool_calls`` has been sliced off will confuse the LLM (it sees a tool
     result it has no record of requesting, and re-requests the same read).
     Leading tool messages are dropped until we hit an assistant or user turn.
-    """
-    if len(messages) <= max_messages:
-        return messages
 
-    system = [m for m in messages if m.get("role") == "system"]
-    non_system = [m for m in messages if m.get("role") != "system"]
+    Plan-status system messages (wrapped in ``<plan-status>…</plan-status>``)
+    are preserved alongside the primary system prompt so the model keeps its
+    current plan snapshot regardless of how many tool turns have passed.
+    """
+    from squishy.plan_state import is_plan_status_message
+
+    system = [m for m in messages if m.get("role") == "system" and not is_plan_status_message(m)]
+    plan_status_msgs = [m for m in messages if is_plan_status_message(m)]
+    non_system = [
+        m for m in messages
+        if m.get("role") != "system" and not is_plan_status_message(m)
+    ]
+
+    if len(messages) <= max_messages:
+        # Still ensure plan-status system messages are ordered after the
+        # primary system prompt (they may have been appended later).
+        return system + plan_status_msgs + non_system
+
     if not non_system:
-        return system
+        return system + plan_status_msgs
 
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
-    remaining_budget = max_messages - len(system) - len(first_user)
+    remaining_budget = max_messages - len(system) - len(plan_status_msgs) - len(first_user)
     tail = non_system[-remaining_budget:] if remaining_budget > 0 else []
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
@@ -356,4 +369,4 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
     while tail and tail[0].get("role") == "tool":
         tail = tail[1:]
 
-    return system + first_user + tail
+    return system + plan_status_msgs + first_user + tail

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -50,6 +51,16 @@ class PredictionWriter:
         async with self._lock:
             self._fh.write(line + "\n")
             self._fh.flush()
+            # fsync after flush so long bench runs survive a kernel panic or
+            # SIGKILL. Python flush() only pushes user-space buffers; the OS
+            # page cache can still drop data.
+            try:
+                os.fsync(self._fh.fileno())
+            except OSError:
+                # Some file systems (tmpfs, overlays in certain containers)
+                # reject fsync. Log and keep going — durability becomes
+                # best-effort rather than a crash.
+                log.debug("fsync unavailable on %s", self.path)
  
     def close(self) -> None:
         self._fh.close()

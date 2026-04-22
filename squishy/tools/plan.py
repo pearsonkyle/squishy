@@ -18,9 +18,11 @@ from __future__ import annotations
 from typing import Any
 
 from squishy.plan_state import (
+    STATUS_ICONS,
     STEP_STATUSES,
     PlanEvidence,
     PlanState,
+    PlanStep,
     save_plan,
 )
 from squishy.tools.base import Tool, ToolContext, ToolResult
@@ -88,10 +90,15 @@ async def _plan_task(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    """Mark a step as done, skipped, in-progress, or blocked."""
+    """Mark a step as done, skipped, in-progress, or blocked.
+
+    Optionally append new steps via ``add_steps: list[str]``. Appended steps
+    always land at the end of the plan with status=``pending``.
+    """
     step_index = args.get("step_index")
     status = args.get("status", "done")
     note = args.get("note", "")
+    add_steps = args.get("add_steps")
 
     if not isinstance(step_index, int):
         return ToolResult(False, error="`step_index` is required (integer, 1-based)")
@@ -102,6 +109,11 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         return ToolResult(False, error=f"`status` must be one of {allowed}")
     if status == "blocked" and not note.strip():
         return ToolResult(False, error="`note` is required when status is 'blocked'")
+    if add_steps is not None and (
+        not isinstance(add_steps, list)
+        or not all(isinstance(s, str) and s.strip() for s in add_steps)
+    ):
+        return ToolResult(False, error="`add_steps` must be a list of non-empty strings")
 
     plan = ctx.plan
     if plan is None:
@@ -123,6 +135,13 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         evidence=evidence,
     )
     ctx.pending_plan_evidence.clear()
+
+    if add_steps:
+        offset = len(plan.steps)
+        for i, desc in enumerate(add_steps):
+            plan.steps.append(
+                PlanStep(id=f"step-{offset + i + 1}", description=desc.strip())
+            )
     save_plan(ctx.working_dir, plan)
 
     progress = plan.progress()
@@ -134,14 +153,7 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     progress_lines = []
     for i, current_step in enumerate(plan.steps, 1):
-        status_icons = {
-            "done": "✓",
-            "in-progress": "▶",
-            "skipped": "—",
-            "pending": "○",
-            "blocked": "!",
-        }
-        mark = status_icons.get(current_step.status, "?")
+        mark = STATUS_ICONS.get(current_step.status, "?")
         progress_lines.append(f"  {mark} {i}. {current_step.description}")
 
     summary = (
@@ -221,7 +233,6 @@ plan_task = Tool(
         "required": ["problem", "solution", "steps"],
     },
     run=_plan_task,
-    mutates=False,
 )
 
 update_plan = Tool(
@@ -230,7 +241,9 @@ update_plan = Tool(
         "Update the status of a step in the active plan. Call this after "
         "completing each implementation step to track progress. "
         "Use step_index (1-based), status, and an optional note. Any files edited "
-        "or commands run since the last update are attached as evidence."
+        "or commands run since the last update are attached as evidence. "
+        "Pass `add_steps=[...]` to append newly-discovered steps to the end of "
+        "the plan when the work is larger than originally scoped."
     ),
     parameters={
         "type": "object",
@@ -248,13 +261,105 @@ update_plan = Tool(
                 "type": "string",
                 "description": "Optional note or rationale for this status update",
             },
+            "add_steps": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Optional list of new step descriptions to append to the plan. "
+                    "Use when you discover the work is larger than you originally scoped."
+                ),
+            },
         },
         "required": ["step_index", "status"],
     },
     run=_update_plan,
-    mutates=False,
 )
 
-PLAN_TOOLS: list[Tool] = [plan_task, update_plan]
 
-__all__ = ["plan_task", "update_plan", "PLAN_TOOLS"]
+async def _get_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Return the current plan as a structured dict, or {'plan': None}."""
+    plan = ctx.plan
+    if plan is None:
+        return ToolResult(True, data={"plan": None}, display="No active plan.")
+    data = plan.to_dict()
+    lines = [f"Plan {plan.id} ({'approved' if plan.approved else 'proposed'}):"]
+    for i, step in enumerate(plan.steps, 1):
+        mark = STATUS_ICONS.get(step.status, "?")
+        lines.append(f"  {mark} {i}. {step.description}")
+    return ToolResult(True, data={"plan": data}, display="\n".join(lines))
+
+
+get_plan = Tool(
+    name="get_plan",
+    description=(
+        "Return the active plan's current state (problem, solution, steps with "
+        "status, files, progress). Use this when you have lost track of where "
+        "you are in a long task. Returns {'plan': null} if no plan exists."
+    ),
+    parameters={"type": "object", "properties": {}},
+    run=_get_plan,
+)
+
+
+async def _log_blocker(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Attach a blocker note to a step without changing its status.
+
+    Useful for recording environment issues, missing tools, or unclear
+    requirements that the model wants surfaced without mutating the step's
+    progress state.
+    """
+    step_index = args.get("step_index")
+    detail = args.get("detail", "")
+
+    if not isinstance(step_index, int):
+        return ToolResult(False, error="`step_index` is required (integer, 1-based)")
+    if not isinstance(detail, str) or not detail.strip():
+        return ToolResult(False, error="`detail` is required (non-empty string)")
+
+    plan = ctx.plan
+    if plan is None:
+        return ToolResult(False, error="no active plan — call plan_task first")
+
+    idx = step_index - 1
+    if idx < 0 or idx >= len(plan.steps):
+        return ToolResult(False, error=f"step_index {step_index} out of range (1-{len(plan.steps)})")
+
+    step = plan.steps[idx]
+    step.evidence.append(PlanEvidence(kind="blocker", detail=detail.strip()))
+    save_plan(ctx.working_dir, plan)
+    return ToolResult(
+        True,
+        data={"step_index": step_index, "evidence_count": len(step.evidence)},
+        display=f"Logged blocker on step {step_index}: {detail.strip()[:120]}",
+    )
+
+
+log_blocker = Tool(
+    name="log_blocker",
+    description=(
+        "Record a blocker or concern against a plan step without changing its "
+        "status. Use when environment issues, missing tools, or unclear "
+        "requirements surface mid-execution — a separate tool from `update_plan` "
+        "so you can log noise without marking the step blocked."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "step_index": {
+                "type": "integer",
+                "description": "1-based index of the step the blocker relates to",
+            },
+            "detail": {
+                "type": "string",
+                "description": "Short description of the blocker or concern",
+            },
+        },
+        "required": ["step_index", "detail"],
+    },
+    run=_log_blocker,
+)
+
+
+PLAN_TOOLS: list[Tool] = [plan_task, update_plan, get_plan, log_blocker]
+
+__all__ = ["plan_task", "update_plan", "get_plan", "log_blocker", "PLAN_TOOLS"]

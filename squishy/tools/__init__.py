@@ -46,6 +46,13 @@ async def dispatch(
     if tool is None:
         return ToolResult(False, error=f"unknown tool: {name}")
 
+    # Surface JSON-argument parse errors from the client before we hand the
+    # (possibly malformed) args to the tool. The tool would otherwise return
+    # a misleading "missing required field" error.
+    tool_arg_error = args.get("_tool_arg_error")
+    if isinstance(tool_arg_error, str):
+        return ToolResult(False, error=tool_arg_error)
+
     allowed, reason = check_permission(tool, ctx.permission_mode, args)
     if not allowed:
         if reason == "prompt":

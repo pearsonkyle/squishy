@@ -58,6 +58,16 @@ def _parse() -> argparse.Namespace:
         sp.add_argument("--request-timeout", type=float, default=120.0)
         sp.add_argument("--max-retries", type=int, default=4)
         sp.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
+        sp.add_argument("--max-history-messages", type=int, default=10,
+                        help="Number of conversation messages to retain per turn (default 10)")
+        sp.add_argument("--max-consecutive-errors", type=int, default=3,
+                        help="Consecutive tool failures before aborting (default 3)")
+        sp.add_argument("--max-plan-nudges", type=int, default=4,
+                        help="Max plan-mode nudges before giving up (default 4)")
+        sp.add_argument("--max-plan-investigation-turns", type=int, default=4,
+                        help="Plan-mode read-only turns allowed before nudging toward plan_task")
+        sp.add_argument("--max-recall-skip-turns", type=int, default=2,
+                        help="Plan-mode consecutive reads allowed without calling recall")
  
     return p.parse_args()
  
@@ -73,6 +83,11 @@ async def _amain(args: argparse.Namespace) -> int:
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
         use_sandbox=args.sandbox,
+        max_consecutive_errors=args.max_consecutive_errors,
+        max_plan_nudges=args.max_plan_nudges,
+        max_plan_investigation_turns=args.max_plan_investigation_turns,
+        max_recall_skip_turns=args.max_recall_skip_turns,
+        max_history_messages=args.max_history_messages,
     ) as squishy:
         if not await squishy.health():
             print(f"! cannot reach {args.base_url}", file=sys.stderr)

@@ -146,3 +146,34 @@ def test_system_prompt_softer_recall_rule_when_no_index(tmp_path):
     prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)))
     assert "prefer `recall" in prompt
     assert "Do not read files blindly" not in prompt
+
+
+def test_trim_history_preserves_plan_status_system_message():
+    """A <plan-status> system message must survive trimming alongside the
+    primary system prompt, regardless of where it appears in the list."""
+    msgs: list[dict] = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first user"},
+    ]
+    for i in range(15):
+        msgs.append({"role": "assistant", "content": f"a{i}"})
+    msgs.append({"role": "system", "content": "<plan-status>\nplan: foo\n</plan-status>"})
+    for i in range(15, 20):
+        msgs.append({"role": "assistant", "content": f"a{i}"})
+
+    trimmed = trim_history(msgs, max_messages=10)
+    kinds = [(m["role"], m.get("content", "")[:13]) for m in trimmed]
+    assert ("system", "sys") in kinds
+    assert any(role == "system" and content.startswith("<plan-status>") for role, content in kinds)
+    assert trimmed[-1]["content"] == "a19"
+
+
+def test_trim_history_noop_orders_plan_status_after_primary_system():
+    msgs = [
+        {"role": "system", "content": "<plan-status>\nx\n</plan-status>"},
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+    ]
+    trimmed = trim_history(msgs)
+    assert trimmed[0]["content"] == "sys"
+    assert trimmed[1]["content"].startswith("<plan-status>")
