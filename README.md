@@ -88,8 +88,8 @@ Three modes, cycle with **Shift+Tab** during a session:
 
 | Mode | Reads | Writes / Edits | Shell |
 |------|-------|----------------|-------|
-| `plan` | auto | refused | refused |
-| `edits` *(default)* | auto | auto | prompt |
+| `plan` *(default)* | auto | refused | refused |
+| `edits` | auto | auto | prompt |
 | `yolo` | auto | auto | auto |
 
 Set the starting mode with `--plan`, `--edits`, or `--yolo`.
@@ -121,7 +121,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`TaskResult` fields: `success`, `final_text`, `turns_used`, `tokens_used`, `files_created`, `files_edited`, `commands_run`, `elapsed_s`, `error`, `messages`.
+`TaskResult` fields: `success`, `final_text`, `turns_used`, `tokens_used`, `files_created`, `files_edited`, `commands_run`, `elapsed_s`, `error`, `messages`, `plan_state`.
 
 ### Error model
 
@@ -179,7 +179,7 @@ squishy-bench term \
   --concurrency 4
 ```
 
-Each task runs in a fresh temp workspace, the verify shell is scored pass/fail by exit code.
+Each task runs in a fresh temp workspace, the verify shell is scored pass/fail by exit code, and terminal-bench results now include artifacts such as the transcript, plan state, setup/verify command output, and a workspace snapshot.
 
 ### Custom harness
 

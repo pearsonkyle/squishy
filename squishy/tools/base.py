@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
- 
+
+from squishy.plan_state import PlanState
+
 ToolRun = Callable[[dict[str, Any], "ToolContext"], Awaitable["ToolResult"]]
  
  
@@ -17,6 +19,9 @@ class ToolContext:
     permission_mode: str = "edits"
     sandbox_image: str = "python:3.11-slim"
     use_sandbox: bool = True
+    plan: PlanState | None = None
+    pending_plan_evidence: list[dict[str, Any]] = field(default_factory=list)
+    plan_switch_prompted: bool = False
  
  
 @dataclass

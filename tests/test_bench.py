@@ -115,6 +115,8 @@ class _FakeSquishy:
             final_text=self._final_text,
             turns_used=1,
             elapsed_s=0.01,
+            messages=[{"role": "assistant", "content": self._final_text}],
+            plan_state={"id": "plan-1", "progress": {"done": 1, "total": 1}},
         )
  
  
@@ -130,6 +132,9 @@ async def test_run_terminal_task_verifies_via_shell(tmp_path):
     assert result.success
     assert result.prediction["verify_exit_code"] == 0
     assert "marker" in result.prediction["task_id"] or result.task_id == "probe"
+    assert result.prediction["plan_state"]["id"] == "plan-1"
+    assert result.artifacts["transcript"][0]["content"] == "done"
+    assert result.artifacts["verify_result"]["exit_code"] == 0
  
  
 async def test_run_terminal_task_verify_failure(tmp_path):
@@ -143,6 +148,7 @@ async def test_run_terminal_task_verify_failure(tmp_path):
     assert not result.success
     assert result.prediction["verify_exit_code"] == 1
     assert "verify failed" in result.error
+    assert result.artifacts["workspace_snapshot"] == []
  
  
 async def test_prediction_writer_records_errors(tmp_path):

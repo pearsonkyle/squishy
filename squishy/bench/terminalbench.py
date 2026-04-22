@@ -18,18 +18,18 @@ to spawn that contract by changing how ``setup`` / ``verify`` execute.
 """
  
 from __future__ import annotations
- 
+
 import asyncio
 import json
 import logging
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
- 
+from typing import Any, Protocol
+
 from squishy.api import Squishy
 from squishy.bench.runner import BenchResult
- 
+
 log = logging.getLogger("squishy.bench.terminalbench")
  
  
@@ -52,35 +52,97 @@ class TerminalTask:
             files=dict(d.get("files", {}) or {}),
             timeout=float(d.get("timeout", 300.0)),
         )
- 
- 
+
+
+@dataclass
+class ShellResult:
+    command: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+            "timed_out": self.timed_out,
+        }
+
+
+class TerminalBackend(Protocol):
+    async def prepare_workspace(
+        self,
+        task: TerminalTask,
+        *,
+        workspace_root: str | Path | None = None,
+    ) -> Path: ...
+
+    async def run_setup(self, task: TerminalTask, workspace: Path) -> list[ShellResult]: ...
+
+    async def verify(self, task: TerminalTask, workspace: Path) -> ShellResult | None: ...
+
+
+class LocalTerminalBackend:
+    async def prepare_workspace(
+        self,
+        task: TerminalTask,
+        *,
+        workspace_root: str | Path | None = None,
+    ) -> Path:
+        if workspace_root is None:
+            workspace = Path(tempfile.mkdtemp(prefix=f"squishy-term-{task.id}-"))
+        else:
+            workspace = Path(workspace_root) / task.id
+            workspace.mkdir(parents=True, exist_ok=True)
+
+        for relpath, content in task.files.items():
+            full = workspace / relpath
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(content, encoding="utf-8")
+        return workspace
+
+    async def run_setup(self, task: TerminalTask, workspace: Path) -> list[ShellResult]:
+        results: list[ShellResult] = []
+        for cmd in task.setup:
+            result = await _run_shell(cmd, cwd=workspace, timeout=task.timeout)
+            results.append(result)
+            if result.exit_code != 0:
+                break
+        return results
+
+    async def verify(self, task: TerminalTask, workspace: Path) -> ShellResult | None:
+        if not task.verify:
+            return None
+        return await _run_shell(task.verify, cwd=workspace, timeout=task.timeout)
+
+
 async def run_terminal_task(
     task: TerminalTask,
     *,
     squishy: Squishy,
     workspace_root: str | Path | None = None,
+    backend: TerminalBackend | None = None,
 ) -> BenchResult:
     """Run one Terminal-bench task. Returns pass/fail based on ``verify`` exit code."""
-    if workspace_root is None:
-        workspace = Path(tempfile.mkdtemp(prefix=f"squishy-term-{task.id}-"))
-    else:
-        workspace = Path(workspace_root) / task.id
-        workspace.mkdir(parents=True, exist_ok=True)
- 
-    for relpath, content in task.files.items():
-        full = workspace / relpath
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(content, encoding="utf-8")
- 
-    for cmd in task.setup:
-        rc, out, err = await _run_shell(cmd, cwd=workspace)
-        if rc != 0:
+    runner = backend or LocalTerminalBackend()
+    workspace = await runner.prepare_workspace(task, workspace_root=workspace_root)
+
+    setup_results = await runner.run_setup(task, workspace)
+    for result in setup_results:
+        if result.exit_code != 0:
             return BenchResult(
                 task_id=task.id,
                 success=False,
-                error=f"setup '{cmd}' exited {rc}: {err[:200]}",
+                error=f"setup '{result.command}' exited {result.exit_code}: {result.stderr[:200]}",
+                artifacts={
+                    "workspace": str(workspace),
+                    "setup_results": [item.to_dict() for item in setup_results],
+                },
             )
- 
+
     try:
         task_result = await squishy.run(
             task.description, working_dir=str(workspace), timeout=task.timeout
@@ -97,23 +159,32 @@ async def run_terminal_task(
         "files_created": task_result.files_created,
         "files_edited": task_result.files_edited,
         "commands_run": task_result.commands_run,
+        "plan_state": task_result.plan_state,
     }
- 
+    artifacts: dict[str, Any] = {
+        "workspace": str(workspace),
+        "transcript": task_result.messages,
+        "setup_results": [item.to_dict() for item in setup_results],
+        "workspace_snapshot": _snapshot_workspace(workspace),
+    }
+
     verified = True
+    verify_result = await runner.verify(task, workspace)
     verify_output = ""
-    if task.verify:
-        rc, out, err = await _run_shell(task.verify, cwd=workspace)
-        verified = rc == 0
-        verify_output = (out + err)[-800:]
-        prediction["verify_exit_code"] = rc
+    if verify_result is not None:
+        verified = verify_result.exit_code == 0
+        verify_output = (verify_result.stdout + verify_result.stderr)[-800:]
+        prediction["verify_exit_code"] = verify_result.exit_code
         prediction["verify_output"] = verify_output
- 
+        artifacts["verify_result"] = verify_result.to_dict()
+
     return BenchResult(
         task_id=task.id,
         success=task_result.success and verified,
         prediction=prediction,
         error="" if verified else f"verify failed: {verify_output[:200]}",
         elapsed_s=task_result.elapsed_s,
+        artifacts=artifacts,
     )
  
  
@@ -133,7 +204,18 @@ def load_tasks(path: str | Path) -> list[TerminalTask]:
     return [TerminalTask.from_dict(t) for t in tasks]
  
  
-async def _run_shell(cmd: str, *, cwd: Path, timeout: float = 120.0) -> tuple[int, str, str]:
+def _snapshot_workspace(workspace: Path) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": str(path.relative_to(workspace)),
+            "size": path.stat().st_size,
+        }
+        for path in sorted(workspace.rglob("*"))
+        if path.is_file()
+    ]
+
+
+async def _run_shell(cmd: str, *, cwd: Path, timeout: float = 120.0) -> ShellResult:
     proc = await asyncio.create_subprocess_shell(
         cmd,
         cwd=str(cwd),
@@ -145,9 +227,16 @@ async def _run_shell(cmd: str, *, cwd: Path, timeout: float = 120.0) -> tuple[in
     except TimeoutError:
         proc.kill()
         await proc.wait()
-        return 124, "", f"shell timeout after {timeout}s"
-    return (
-        proc.returncode or 0,
-        stdout_b.decode("utf-8", errors="replace"),
-        stderr_b.decode("utf-8", errors="replace"),
+        return ShellResult(
+            command=cmd,
+            exit_code=124,
+            stdout="",
+            stderr=f"shell timeout after {timeout}s",
+            timed_out=True,
+        )
+    return ShellResult(
+        command=cmd,
+        exit_code=proc.returncode or 0,
+        stdout=stdout_b.decode("utf-8", errors="replace"),
+        stderr=stderr_b.decode("utf-8", errors="replace"),
     )

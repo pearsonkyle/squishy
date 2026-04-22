@@ -9,7 +9,9 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any
- 
+
+from squishy.index.store import has_index
+
 MAX_HISTORY = 10  # system + first user + last 8 = 10
  
  
@@ -108,7 +110,7 @@ def build_system_prompt(
 
     index_block = _index_header(cwd)
     instructions_block = load_agent_instructions(cwd)
-    mode_block = _mode_block(mode)
+    mode_block = _mode_block(mode, cwd)
     recall_rule = _recall_rule(cwd)
 
     return f"""You are squishy, a local coding assistant that edits files and runs commands to complete the user's task.
@@ -123,6 +125,11 @@ def build_system_prompt(
 - When you finish the user's task, respond with plain text summarizing what you did (no tool call).
 - Do not re-read a file you have already read in this conversation unless you need a different line range. Use what you have.
 {recall_rule}
+
+## File References
+- Users can reference files in their input using `@filename` syntax.
+- When a user includes `@some/path.py`, the full file contents are automatically injected into the conversation wrapped in `<file>` tags.
+- File content is labeled with path and line count so you know exactly what file it is.
 
 ## Planning
 - For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
@@ -192,24 +199,36 @@ def _recall_rule(cwd: str) -> str:
     )
 
 
-def _mode_block(mode: str) -> str:
+def _mode_block(mode: str, cwd: str) -> str:
+    index_available = has_index(cwd)
     if mode == "plan":
-        return (
-            "## Mode: plan (read-only)\n"
-            "- **CRITICAL: For ANY task requiring file changes, call `plan_task` FIRST.**\n"
-            "- Do NOT attempt implementation until after the plan is approved.\n"
-            "- For simple tasks (e.g., reading one file), you may skip plan_task.\n"
+        index_guidance = (
             "- **In plan mode, your FIRST tool call should ALWAYS be `recall(query=...)` to use the index.**\n"
             "- After `recall`, make 1-2 targeted reads to understand the problem.\n"
             "- Call `plan_task` within your first 2-3 turns. Usually: recall → targeted reads → plan.\n"
             "- Do NOT call read_file, list_directory, or search_files without first using `recall`. The index exists for efficient navigation.\n"
             "- If the user already named likely files, use `recall` first to verify location, then inspect directly.\n"
-            "- Call `plan_task` as soon as you can explain the problem, solution, and concrete steps. `files_to_modify`/`files_to_create` may be partial or empty if uncertain.\n"
-            "- Do NOT end the turn with prose before calling `plan_task`.\n"
             "- Example workflow in plan mode:\n"
             '  1. `recall(query="function name or file pattern")`\n'
             '  2. `read_file(path="relevant_file.py", offset=..., limit=...)`\n'
             '  3. `plan_task(problem="...", solution="...", steps=["..."])`\n'
+        ) if index_available else (
+            "- No repo index is present yet, so you may use targeted `read_file`, `list_directory`, or `search_files` calls to investigate.\n"
+            "- Prefer 1-3 focused reads, then call `plan_task`; do not wait for exhaustive research.\n"
+            "- If navigation is difficult, ask the user to run `/init` or use it yourself once you are allowed to leave plan mode.\n"
+            "- Example workflow in plan mode without an index:\n"
+            '  1. `list_directory(path=".")`\n'
+            '  2. `read_file(path="relevant_file.py", offset=..., limit=...)`\n'
+            '  3. `plan_task(problem="...", solution="...", steps=["..."])`\n'
+        )
+        return (
+            "## Mode: plan (read-only)\n"
+            "- **CRITICAL: For ANY task requiring file changes, call `plan_task` FIRST.**\n"
+            "- Do NOT attempt implementation until after the plan is approved.\n"
+            "- For simple tasks (e.g., reading one file), you may skip plan_task.\n"
+            f"{index_guidance}"
+            "- Call `plan_task` as soon as you can explain the problem, solution, and concrete steps. `files_to_modify`/`files_to_create` may be partial or empty if uncertain.\n"
+            "- Do NOT end the turn with prose before calling `plan_task`.\n"
             '  ```json\n'
             '  {\n'
             '    "problem": "What needs to be fixed or implemented",\n'

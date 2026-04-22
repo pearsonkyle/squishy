@@ -21,6 +21,8 @@ from squishy.config import Config
 from squishy.context import build_system_prompt, detect_project, trim_history
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
+from squishy.index.store import has_index
+from squishy.plan_state import clear_plan, load_plan, save_plan
 from squishy.tools import PromptFn, ToolContext, ToolResult, dispatch, openai_schemas
 
 log = logging.getLogger("squishy.agent")
@@ -48,6 +50,7 @@ class TaskResult:
     elapsed_s: float = 0.0
     error: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
+    plan_state: dict[str, Any] | None = None
  
  
 @dataclass
@@ -60,6 +63,7 @@ class Agent:
     messages: list[dict[str, Any]] = field(default_factory=list)
     # Track consecutive reads without recall across turns in plan mode
     consecutive_reads_without_recall: int = 0
+    has_index: bool = field(init=False, default=False)
 
     def __post_init__(self) -> None:
         self.tool_ctx = ToolContext(
@@ -67,7 +71,9 @@ class Agent:
             permission_mode=self.config.permission_mode,
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
+            plan=load_plan(self.config.working_dir),
         )
+        self.has_index = has_index(self.config.working_dir)
         project = detect_project(self.config.working_dir)
         system_prompt = build_system_prompt(
             self.config.working_dir,
@@ -87,6 +93,10 @@ class Agent:
             self.display.stats.prompt_tokens += estimate_tokens(system_prompt)
         
         self._check_index_staleness()
+        if self.display is not None and self.tool_ctx.plan is not None:
+            self.display.info(f"[plan] restored {self.tool_ctx.plan.id}")
+        if self.display is not None and self.config.permission_mode == "plan" and not self.has_index:
+            self.display.info("[plan] no index found; direct file exploration fallback is enabled")
  
     def _check_index_staleness(self) -> None:
         if self.display is None:
@@ -124,11 +134,6 @@ class Agent:
         except asyncio.CancelledError:
             raise AgentCancelled("task cancelled by caller") from None
 
-    def _add_tool_result_messages(self) -> None:
-        """Add token estimation for any pending tool result messages in history."""
-        if self.display is None:
-            return
-
     def _count_prompt_tokens_from_messages(self) -> int:
         """Estimate prompt tokens from current messages (after trim_history)."""
         total = 0
@@ -136,6 +141,9 @@ class Agent:
             if msg.get("content"):
                 total += estimate_tokens(msg["content"])
         return total
+
+    def _plan_snapshot(self) -> dict[str, Any] | None:
+        return self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else None
 
     async def _run_loop(self, start: float) -> TaskResult:
         consecutive_errors = 0
@@ -168,6 +176,7 @@ class Agent:
                 result.error = str(e)
                 result.turns_used = turn - 1
                 result.elapsed_s = time.monotonic() - start
+                result.plan_state = self._plan_snapshot()
                 return result
 
             if completion.text and self.display:
@@ -182,7 +191,7 @@ class Agent:
 
             if not completion.tool_calls:
                 in_plan = self.config.permission_mode == "plan"
-                plan = getattr(self.tool_ctx, "active_plan", None)
+                plan = self.tool_ctx.plan
                 if in_plan and plan is None:
                     # In plan mode, prose-only completion is not acceptable —
                     # the agent must produce a plan_task call. Nudge up to
@@ -200,6 +209,7 @@ class Agent:
                         result.tokens_used = total_prompt_tokens + completion_tokens
                         result.elapsed_s = time.monotonic() - start
                         result.messages = list(self.messages)
+                        result.plan_state = self._plan_snapshot()
                         return result
                     plan_nudges += 1
                     self.messages.append(
@@ -212,6 +222,29 @@ class Agent:
                                 "for exhaustive research. `files_to_modify` and "
                                 "`files_to_create` may be partial or empty if uncertain. "
                                 "Do not respond with prose until the plan is approved."
+                            ),
+                        }
+                    )
+                    continue
+                if (
+                    plan is not None
+                    and plan.approved
+                    and self.config.permission_mode != "plan"
+                    and plan.unresolved_steps()
+                ):
+                    if completion.text:
+                        self.messages.append({"role": "assistant", "content": completion.text})
+                    remaining = "; ".join(
+                        f"{i + 1}. {step.description}"
+                        for i, step in enumerate(plan.unresolved_steps()[:4])
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "[system] You have an approved plan with unresolved steps. "
+                                "Continue working, then call `update_plan` before finishing. "
+                                f"Remaining steps: {remaining}"
                             ),
                         }
                     )
@@ -231,6 +264,7 @@ class Agent:
                 result.commands_run = commands_run
                 result.elapsed_s = time.monotonic() - start
                 result.messages = list(self.messages)
+                result.plan_state = self._plan_snapshot()
                 return result
 
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls))
@@ -269,7 +303,7 @@ class Agent:
                         self.display.stats.prompt_tokens = total_prompt_tokens
                         self.display.stats.completion_tokens = completion_tokens
                         self.display.summary(turn, time.monotonic() - start)
-                    plan = getattr(self.tool_ctx, "active_plan", None) or {}
+                    plan = self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else {}
                     result.success = True
                     result.final_text = (
                         f"Plan approved: {plan.get('plan') or plan.get('problem', '')}"
@@ -281,6 +315,7 @@ class Agent:
                     result.commands_run = commands_run
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
+                    result.plan_state = self._plan_snapshot()
                     return result
 
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -295,6 +330,7 @@ class Agent:
                     result.commands_run = commands_run
                     result.elapsed_s = time.monotonic() - start
                     result.messages = list(self.messages)
+                    result.plan_state = self._plan_snapshot()
                     return result
 
                 # Recall-first enforcement: warn after MAX_RECALL_SKIP_TURNS consecutive reads
@@ -302,8 +338,8 @@ class Agent:
                 if self.config.permission_mode == "plan":
                     # Update persistent counter with local reads from this turn
                     self.consecutive_reads_without_recall += local_read_without_recall
-                    
-                    if self.consecutive_reads_without_recall >= MAX_RECALL_SKIP_TURNS:
+                     
+                    if self.has_index and self.consecutive_reads_without_recall >= MAX_RECALL_SKIP_TURNS:
                         # Warn once per turn (when we first hit the threshold)
                         if self.consecutive_reads_without_recall == MAX_RECALL_SKIP_TURNS:
                             warning_msg = (
@@ -315,8 +351,8 @@ class Agent:
                                 self.display.warn(warning_msg)
                         # Refuse further reads until recall is used
                         msg = (
-                            f"Too many read calls without `recall`. Call `recall(query=...)` now "
-                            f"to find relevant files, or call `plan_task` if you have enough information. "
+                            "Too many read calls without `recall`. Call `recall(query=...)` now "
+                            "to find relevant files, or call `plan_task` if you have enough information. "
                             "Do not call read_file, list_directory, or search_files again until you use recall."
                         )
                         self.messages.append(
@@ -332,7 +368,7 @@ class Agent:
             # plan_task, nudge it after MAX_PLAN_TOOL_TURNS consecutive tool-call
             # turns.  The nudge budget is shared with the prose-only path above.
             if self.config.permission_mode == "plan":
-                active_plan = getattr(self.tool_ctx, "active_plan", None)
+                active_plan = self.tool_ctx.plan
                 if plan_task_called_this_turn:
                     # plan_task was attempted (approved, declined, or errored).
                     # Either way, reset the counter — the model is trying to plan.
@@ -368,6 +404,7 @@ class Agent:
                             result.tokens_used = total_prompt_tokens + completion_tokens
                             result.elapsed_s = time.monotonic() - start
                             result.messages = list(self.messages)
+                            result.plan_state = self._plan_snapshot()
                             return result
 
         msg = f"max turns ({self.config.max_turns}) reached"
@@ -384,6 +421,7 @@ class Agent:
         result.commands_run = commands_run
         result.elapsed_s = time.monotonic() - start
         result.messages = list(self.messages)
+        result.plan_state = self._plan_snapshot()
         return result
  
     async def _run_tool(self, turn: int, tc: ToolCall) -> dict[str, Any]:
@@ -422,20 +460,56 @@ class Agent:
                 except (EOFError, KeyboardInterrupt):
                     approved = False
             if approved:
-                plan = getattr(self.tool_ctx, "active_plan", None)
-                if isinstance(plan, dict):
-                    plan["approved"] = True
+                if self.tool_ctx.plan is not None:
+                    self.tool_ctx.plan.mark_approved()
+                    self.tool_ctx.plan.approved_by_user = True
+                    self.tool_ctx.plan_switch_prompted = False
+                    save_plan(self.tool_ctx.working_dir, self.tool_ctx.plan)
                 plan_approved = True
                 outcome = ToolResult(
                     True,
-                    data={**outcome.data, "approved": True},
+                    data={
+                        **outcome.data,
+                        "approved": True,
+                        "plan": self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else {},
+                    },
                     display=outcome.display,
                 )
             else:
-                if hasattr(self.tool_ctx, "active_plan"):
-                    del self.tool_ctx.active_plan  # type: ignore[attr-defined]
+                self.tool_ctx.plan = None
+                self.tool_ctx.pending_plan_evidence.clear()
+                self.tool_ctx.plan_switch_prompted = False
+                clear_plan(self.tool_ctx.working_dir)
                 outcome = ToolResult(
                     False, error="Plan declined by user. Ask for changes or a new approach."
+                )
+
+        if outcome.success and self.tool_ctx.plan is not None and self.tool_ctx.plan.approved:
+            if tc.name == "write_file":
+                self.tool_ctx.pending_plan_evidence.append(
+                    {
+                        "kind": "write_file",
+                        "path": str(tc.args.get("path", "")),
+                        "detail": "created or rewrote file",
+                    }
+                )
+            elif tc.name == "edit_file":
+                self.tool_ctx.pending_plan_evidence.append(
+                    {
+                        "kind": "edit_file",
+                        "path": str(tc.args.get("path", "")),
+                        "detail": "edited existing file",
+                    }
+                )
+            elif tc.name == "run_command":
+                data = outcome.data
+                self.tool_ctx.pending_plan_evidence.append(
+                    {
+                        "kind": "run_command",
+                        "command": str(tc.args.get("command", "")),
+                        "exit_code": int(data.get("exit_code", 0)) if isinstance(data.get("exit_code"), int) else None,
+                        "detail": str(data.get("stderr") or data.get("stdout") or "").strip()[:300],
+                    }
                 )
 
         if self.display:
@@ -443,9 +517,9 @@ class Agent:
                 # Panel already rendered above; no plain tool_result line.
                 pass
             elif outcome.success and tc.name == "update_plan":
-                plan = getattr(self.tool_ctx, "active_plan", None)
+                plan = self.tool_ctx.plan
                 if plan:
-                    self.display.plan_progress(plan.get("steps", []))
+                    self.display.plan_progress([step.to_dict() for step in plan.steps])
             else:
                 self.display.tool_result(
                     outcome.success, outcome.display or outcome.error, dt_ms
