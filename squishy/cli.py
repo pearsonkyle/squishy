@@ -22,9 +22,11 @@ from squishy.config import Config
 from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
+from squishy.plan_state import PlanState
 from squishy.tools.base import Tool
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
+EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
  
  
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -392,7 +394,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 # Trigger the agent to execute the approved plan
                 try:
                     await current_agent.run(
-                        "Execute the approved plan.",
+                        EXECUTE_APPROVED_PLAN_PROMPT,
                         timeout=timeout,
                     )
                 except AgentTimeout as e:
