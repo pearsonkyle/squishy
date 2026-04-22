@@ -22,9 +22,11 @@ from squishy.config import Config
 from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
+from squishy.plan_state import PlanState
 from squishy.tools.base import Tool
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
+EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
  
  
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -240,16 +242,20 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: 
         if references:
             display.info(format_reference_list(references))
         await agent.run(message_with_files, timeout=timeout)
-        if cfg.permission_mode == "plan":
-            plan = agent.tool_ctx.plan
-            if plan is not None and plan.approved and not agent.tool_ctx.plan_switch_prompted:
-                agent.tool_ctx.plan_switch_prompted = True
-                cfg.permission_mode = "edits"
-                display.info("[bold green]✓ Switched to edits mode[/]")
-                await agent.run(
-                    "Execute the approved plan.",
-                    timeout=timeout,
-                )
+        plan = agent.tool_ctx.plan
+        if (
+            cfg.permission_mode == "plan"
+            and isinstance(plan, PlanState)
+            and plan.approved
+            and not agent.tool_ctx.plan_switch_prompted
+        ):
+            agent.tool_ctx.plan_switch_prompted = True
+            cfg.permission_mode = "edits"
+            display.info("[bold green]✓ Switched to edits mode[/]")
+            await agent.run(
+                EXECUTE_APPROVED_PLAN_PROMPT,
+                timeout=timeout,
+            )
     except AgentTimeout as e:
         display.error(str(e))
     except AgentCancelled:
@@ -382,7 +388,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 # Trigger the agent to execute the approved plan
                 try:
                     await current_agent.run(
-                        "Execute the approved plan.",
+                        EXECUTE_APPROVED_PLAN_PROMPT,
                         timeout=timeout,
                     )
                 except AgentTimeout as e:

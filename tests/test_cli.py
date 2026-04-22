@@ -6,6 +6,7 @@ import pytest
 
 import squishy.cli as cli
 from squishy.config import Config
+from squishy.plan_state import PlanState
 
 pytestmark = pytest.mark.asyncio
 
@@ -13,6 +14,9 @@ pytestmark = pytest.mark.asyncio
 async def test_run_one_continues_after_plan_approval(monkeypatch):
     cfg = Config()
     cfg.permission_mode = "plan"
+
+    class FakeClient:
+        pass
 
     class FakeDisplay:
         def __init__(self) -> None:
@@ -27,26 +31,38 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
         def error(self, _message: str) -> None:
             pass
 
-    class FakeAgent:
-        last: FakeAgent | None = None
+    seen_agents: list[FakeAgent] = []
 
-        def __init__(self, *_args, **_kwargs) -> None:
+    class FakeAgent:
+
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
             self.tool_ctx = SimpleNamespace(plan=None, plan_switch_prompted=False)
             self.calls: list[str] = []
-            FakeAgent.last = self
+            seen_agents.append(self)
 
-        async def run(self, message: str, *, timeout=None):  # type: ignore[no-untyped-def]
+        async def run(self, message: str, *, timeout: float | None = None):
             self.calls.append(message)
             if len(self.calls) == 1:
-                self.tool_ctx.plan = SimpleNamespace(approved=True)
+                plan = PlanState.create(problem="p", solution="s", steps=["a"])
+                plan.mark_approved()
+                self.tool_ctx.plan = plan
             return None
 
     monkeypatch.setattr(cli, "Agent", FakeAgent)
     display = FakeDisplay()
 
-    await cli._run_one(cfg, client=object(), display=display, prompt_fn=None, message="do task", timeout=None)
+    await cli._run_one(
+        cfg,
+        client=FakeClient(),
+        display=display,
+        prompt_fn=None,
+        message="do task",
+        timeout=None,
+    )
 
-    assert FakeAgent.last is not None
-    assert FakeAgent.last.calls == ["do task", "Execute the approved plan."]
+    assert seen_agents
+    assert seen_agents[0].calls == ["do task", "Execute the approved plan."]
+    assert seen_agents[0].tool_ctx.plan_switch_prompted is True
     assert cfg.permission_mode == "edits"
     assert "[bold green]✓ Switched to edits mode[/]" in display.info_calls
