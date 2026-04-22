@@ -21,6 +21,7 @@ from squishy.client import Client
 from squishy.config import Config
 from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
+from squishy.file_browser import format_reference_list, inject_references
 from squishy.tools.base import Tool
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
@@ -231,25 +232,14 @@ async def _prompt_switch_to_edits(
         display.info("Staying in plan mode.")
 
 
-async def _offer_mode_switch_after_approval(
-    cfg: Config,
-    display: Display,
-    plan: dict,
-) -> None:
-    """After plan_task approval, prompt the user to flip into edits mode."""
-    display.console.rule("[bold green]Plan approved[/]", style="green")
-    await _prompt_switch_to_edits(
-        cfg,
-        display,
-        prompt_text="  Switch to edits mode and execute? [Y/n] ",
-        success_text="[bold green]✓ Switched to edits mode — ready to execute[/]",
-    )
-
-
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
     try:
-        await agent.run(message, timeout=timeout)
+        # Inject file references before running
+        message_with_files, references = inject_references(message, cfg.working_dir)
+        if references:
+            display.info(format_reference_list(references))
+        await agent.run(message_with_files, timeout=timeout)
     except AgentTimeout as e:
         display.error(str(e))
     except AgentCancelled:
@@ -357,7 +347,11 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
 
         # Run task using current agent instance
         try:
-            await current_agent.run(line, timeout=timeout)
+            # Inject file references before running
+            message_with_files, references = inject_references(line, cfg.working_dir)
+            if references:
+                display.info(format_reference_list(references))
+            await current_agent.run(message_with_files, timeout=timeout)
         except AgentTimeout as e:
             display.error(str(e))
         except AgentCancelled:
@@ -366,13 +360,27 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             display.error(f"LLM error: {e}")
             continue
 
-        # If we're in plan mode and the agent just got a plan approved,
-        # offer to switch into edits mode so the same agent can execute it.
+        # If we're in plan mode and the agent just got a plan approved by the user,
+        # auto-switch to edits mode and trigger plan execution.
         if cfg.permission_mode == "plan":
             plan = current_agent.tool_ctx.plan
-            if plan is not None and plan.approved and not current_agent.tool_ctx.plan_switch_prompted:
+            if plan is not None and plan.approved_by_user and not current_agent.tool_ctx.plan_switch_prompted:
                 current_agent.tool_ctx.plan_switch_prompted = True
-                await _offer_mode_switch_after_approval(cfg, display, plan.to_dict())
+                # Auto-switch to edits mode (user already consented by approving the plan)
+                cfg.permission_mode = "edits"
+                display.info("[bold green]✓ Switched to edits mode[/]")
+                # Trigger the agent to execute the approved plan
+                try:
+                    await current_agent.run(
+                        "Execute the approved plan.",
+                        timeout=timeout,
+                    )
+                except AgentTimeout as e:
+                    display.error(str(e))
+                except AgentCancelled:
+                    display.warn("cancelled")
+                except LLMError as e:
+                    display.error(f"LLM error: {e}")
 
 
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:

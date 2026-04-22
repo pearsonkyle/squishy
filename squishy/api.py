@@ -116,21 +116,31 @@ class _CallbackDisplay:
     class _Console:
         def print(self, *_: Any, **__: Any) -> None:
             pass
- 
+
         def out(self, *_: Any, **__: Any) -> None:
             pass
- 
+
+        def info(self, *_: Any, **__: Any) -> None:
+            pass
+
+        def error(self, *_: Any, **__: Any) -> None:
+            pass
+
+        def warn(self, *_: Any, **__: Any) -> None:
+            pass
+
     console = _Console()
- 
+
     def streaming_text_chunk(self, chunk: str) -> None:
         with contextlib.suppress(Exception):
             self._on_text(chunk)
- 
+
     def turn_header(self, *_: Any, **__: Any) -> None: ...
     def tool_result(self, *_: Any, **__: Any) -> None: ...
     def edit_diff(self, *_: Any, **__: Any) -> None: ...
     def write_preview(self, *_: Any, **__: Any) -> None: ...
     def command_output(self, *_: Any, **__: Any) -> None: ...
+    def command_line(self, *_: Any, **__: Any) -> None: ...
     def text(self, *_: Any, **__: Any) -> None: ...
     def info(self, *_: Any, **__: Any) -> None: ...
     def warn(self, *_: Any, **__: Any) -> None: ...

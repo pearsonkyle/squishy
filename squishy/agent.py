@@ -462,6 +462,7 @@ class Agent:
             if approved:
                 if self.tool_ctx.plan is not None:
                     self.tool_ctx.plan.mark_approved()
+                    self.tool_ctx.plan.approved_by_user = True
                     self.tool_ctx.plan_switch_prompted = False
                     save_plan(self.tool_ctx.working_dir, self.tool_ctx.plan)
                 plan_approved = True

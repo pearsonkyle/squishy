@@ -123,6 +123,7 @@ class PlanState:
     updated_at: str = field(default_factory=utc_now)
     approved: bool = False
     approved_at: str | None = None
+    approved_by_user: bool = False
 
     @classmethod
     def create(
@@ -185,6 +186,7 @@ class PlanState:
             updated_at=str(data.get("updated_at") or utc_now()),
             approved=bool(data.get("approved", False)),
             approved_at=str(data.get("approved_at")) if data.get("approved_at") else None,
+            approved_by_user=bool(data.get("approved_by_user", False)),
         )
 
     def progress(self) -> dict[str, int]:

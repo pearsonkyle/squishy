@@ -126,6 +126,11 @@ def build_system_prompt(
 - Do not re-read a file you have already read in this conversation unless you need a different line range. Use what you have.
 {recall_rule}
 
+## File References
+- Users can reference files in their input using `@filename` syntax.
+- When a user includes `@some/path.py`, the full file contents are automatically injected into the conversation wrapped in `<file>` tags.
+- File content is labeled with path and line count so you know exactly what file it is.
+
 ## Planning
 - For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
 - `plan_task` is valid as soon as you have enough information to propose a solid approach — do not wait for exhaustive research.
