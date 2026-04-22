@@ -135,7 +135,6 @@ recall = Tool(
         "required": ["query"],
     },
     run=_recall,
-    mutates=False,
 )
  
 RECALL_TOOLS: list[Tool] = [recall]

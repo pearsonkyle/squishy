@@ -12,6 +12,25 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 DEFAULT_TIMEOUT = 60
 OUTPUT_CAP_STDOUT = 8000
 OUTPUT_CAP_STDERR = 4000
+# Host env vars that are safe to forward into the sandbox. Everything else
+# (API keys, tokens, local paths) is dropped so a stray `env` call can't
+# exfiltrate the agent's credentials.
+SANDBOX_ALLOWED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "TERM")
+
+
+def _cap_output(raw: bytes, cap: int) -> tuple[str, bool]:
+    """Return (decoded-and-capped, truncated?).
+
+    Keeps the tail — usually the most diagnostic part of long outputs
+    (tracebacks, test failures). Prepends an explicit marker when truncation
+    happens so the model knows it didn't see everything.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    if len(text) <= cap:
+        return text, False
+    dropped = len(text) - cap
+    marker = f"…<truncated {dropped} bytes of head>\n"
+    return marker + text[-cap:], True
  
  
 def _docker_available() -> bool:
@@ -37,7 +56,7 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             "sh", "-c", command,
         ]
         exec_cwd = ctx.working_dir
-        exec_env = os.environ.copy()
+        exec_env = {k: v for k, v in os.environ.items() if k in SANDBOX_ALLOWED_ENV}
     else:
         exec_args = ["sh", "-c", command]
         exec_cwd = cwd
@@ -68,20 +87,34 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             "try --no-sandbox or install the tool in the sandbox image)"
         )
 
-    stderr_cap = OUTPUT_CAP_STDERR - len(hint)
-    stderr_text = stderr_b.decode("utf-8", errors="replace")[-stderr_cap:] + hint
+    stdout_text, stdout_truncated = _cap_output(stdout_b, OUTPUT_CAP_STDOUT)
+    stderr_text, stderr_truncated = _cap_output(stderr_b, OUTPUT_CAP_STDERR - len(hint))
+    stderr_text = stderr_text + hint
 
+    exit_code = proc.returncode or 0
+    success = exit_code == 0
+    data: dict[str, Any] = {
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "sandboxed": sandboxed,
+        "truncated": stdout_truncated or stderr_truncated,
+    }
+    # Escape brackets so Rich does not swallow the sandbox tag
+    display = f"exit={exit_code}" + (" \\[sandbox]" if sandboxed else "")
+    if success:
+        return ToolResult(True, data=data, display=display)
+    # Non-zero exit: report failure so the model can't mistake a crashing
+    # command for success. stdout/stderr remain in `data` so it can diagnose.
+    err_tail = (stderr_text.strip() or stdout_text.strip())[-400:]
     return ToolResult(
-        True,
-        data={
-            "command": command,
-            "exit_code": proc.returncode,
-            "stdout": stdout_b.decode("utf-8", errors="replace")[-OUTPUT_CAP_STDOUT:],
-            "stderr": stderr_text,
-            "sandboxed": sandboxed,
-        },
-        # Escape brackets so Rich does not swallow the sandbox tag
-        display=f"exit={proc.returncode}" + (" \\[sandbox]" if sandboxed else ""),
+        False,
+        data=data,
+        error=(
+            f"command exited {exit_code}: {err_tail}" if err_tail else f"command exited {exit_code}"
+        ),
+        display=display,
     )
  
  
@@ -99,7 +132,6 @@ run_command = Tool(
         "required": ["command"],
     },
     run=_run_command,
-    mutates=True,
 )
  
 SHELL_TOOLS: list[Tool] = [run_command]

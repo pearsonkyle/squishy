@@ -43,8 +43,7 @@ class Tool:
     description: str
     parameters: dict[str, Any]
     run: ToolRun
-    mutates: bool = False
- 
+
     def openai_schema(self) -> dict[str, Any]:
         return {
             "type": "function",

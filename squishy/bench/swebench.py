@@ -72,6 +72,15 @@ def build_prompt(instance: dict[str, Any]) -> str:
         "of the repository at the relevant commit. Read the relevant files, make the smallest",
         "change that fixes the problem, and verify by running tests.",
         "",
+        "## CRITICAL INSTRUCTIONS FOR PLAN EXECUTION",
+        "You are running in yolo mode with full tool access. After creating any plan:",
+        "  1. The plan is auto-approved - DO NOT wait for user approval",
+        "  2. IMMEDIATELY start executing step 1 by calling update_plan(step_index=1, status=\"in-progress\")",
+        "  3. Read files with read_file, make edits with edit_file or write_file",
+        "  4. Run tests with run_command to verify your changes",
+        "  5. Call update_plan(step_index=N, status=\"done\") when each step is complete",
+        "  6. Continue until all steps are done, then respond with plain text summary",
+        "",
         "## Problem",
         instance.get("problem_statement", "").strip(),
     ]
@@ -99,6 +108,7 @@ async def run_swebench_instance(
     workspace_root: str | Path,
     model_name: str,
     task_timeout: float = 900.0,
+    auto_init: bool = False,
 ) -> BenchResult:
     """Run one SWE-bench instance end-to-end, returning a prediction record."""
     instance_id = instance["instance_id"]
@@ -106,7 +116,37 @@ async def run_swebench_instance(
         workspace = await prepare_workspace(instance, workspace_root)
     except BenchError as e:
         return BenchResult(task_id=instance_id, success=False, error=f"workspace: {e}")
- 
+
+    # Build index if auto_init is enabled
+    if auto_init:
+        try:
+            from squishy.index import _build_index_async, save_agents_md, build_index
+            from squishy.display import Display
+
+            # Create a minimal display for progress output
+            class _QuietDisplay(Display):
+                def info(self, msg: str) -> None:
+                    print(f"[index] {msg}")
+
+            display = _QuietDisplay()
+            
+            # Build the index
+            prior = None  # No prior for fresh workspace
+            idx = await _build_index_async(
+                str(workspace),
+                prior=prior,
+                concurrency=squishy.config.index_concurrency if hasattr(squishy, "config") else 4,
+            )
+            
+            # Save index files
+            from squishy.index.store import save_index
+            save_index(str(workspace), idx)
+            
+            # Save agents_md (requires index and cwd)
+            save_agents_md(idx, str(workspace))
+        except Exception as e:  # noqa: BLE001
+            print(f"[index] Warning: index build failed: {e}")
+
     prompt = build_prompt(instance)
     try:
         task_result = await squishy.run(

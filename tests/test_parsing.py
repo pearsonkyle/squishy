@@ -31,14 +31,14 @@ async def test_plan_mode_blocks_mutations():
 async def test_edits_mode_prompts_run_command():
     # In edits mode, run_command is gated on a prompt; dispatch refuses when
     # no prompt_fn is provided (no TTY / library usage).
-    ctx = ToolContext(working_dir=".", permission_mode="edits")
+    ctx = ToolContext(working_dir=".", permission_mode="edits", use_sandbox=False)
     r = await dispatch("run_command", {"command": "echo x"}, ctx)
     assert not r.success
     assert "approval" in r.error
  
  
 async def test_edits_mode_prompt_fn_approves():
-    ctx = ToolContext(working_dir=".", permission_mode="edits")
+    ctx = ToolContext(working_dir=".", permission_mode="edits", use_sandbox=False)
  
     async def approve(_tool, _args):
         return True
@@ -48,7 +48,7 @@ async def test_edits_mode_prompt_fn_approves():
  
  
 async def test_edits_mode_prompt_fn_declines():
-    ctx = ToolContext(working_dir=".", permission_mode="edits")
+    ctx = ToolContext(working_dir=".", permission_mode="edits", use_sandbox=False)
  
     async def decline(_tool, _args):
         return False

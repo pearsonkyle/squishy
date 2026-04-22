@@ -16,6 +16,8 @@ READ_ONLY_TOOLS = frozenset({
     "recall",
     "plan_task",
     "update_plan",
+    "get_plan",
+    "log_blocker",
 })
 
 MUTATING_TOOLS = frozenset({

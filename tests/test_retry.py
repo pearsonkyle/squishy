@@ -112,7 +112,27 @@ async def test_parse_tool_call_tolerates_malformed_json():
  
     tc = _parse_tool_call("c1", "read_file", "{not json")
     assert tc.name == "read_file"
-    assert tc.args == {"_raw": "{not json"}
+    assert tc.args["_raw"] == "{not json"
+    assert "invalid JSON" in tc.args["_tool_arg_error"]
  
     tc = _parse_tool_call("c2", "read_file", '"a string"')
-    assert tc.args == {"_raw": '"a string"'}
+    assert tc.args["_raw"] == '"a string"'
+    assert "expected JSON object" in tc.args["_tool_arg_error"]
+
+
+async def test_dispatch_surfaces_tool_arg_error():
+    """Dispatcher turns ``_tool_arg_error`` into an actionable error message."""
+    import tempfile
+
+    from squishy.tools import dispatch
+    from squishy.tools.base import ToolContext
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ctx = ToolContext(working_dir=tmp, permission_mode="yolo", use_sandbox=False)
+        result = await dispatch(
+            "read_file",
+            {"_tool_arg_error": "invalid JSON: bad bracket", "_raw": "{bad"},
+            ctx,
+        )
+    assert not result.success
+    assert "invalid JSON" in result.error

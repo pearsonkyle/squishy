@@ -39,6 +39,13 @@ class Config:
     max_tokens_per_index: int = 100_000
     auto_init: bool = False
     index_summaries: bool = True
+    # Agent-loop safety thresholds. Tunable so bench runs can trade off
+    # reliability vs. autonomy without code changes.
+    max_consecutive_errors: int = 3
+    max_plan_nudges: int = 4
+    max_plan_investigation_turns: int = 4
+    max_recall_skip_turns: int = 2
+    max_history_messages: int = 10
  
     def cycle_mode(self) -> PermissionMode:
         i = (MODES.index(self.permission_mode) + 1) % len(MODES)

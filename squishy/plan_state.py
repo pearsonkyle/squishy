@@ -15,6 +15,17 @@ PLAN_FILE = "active_plan.json"
 STEP_STATUSES = frozenset({"pending", "in-progress", "done", "skipped", "blocked"})
 RESOLVED_STEP_STATUSES = frozenset({"done", "skipped"})
 
+STATUS_ICONS: dict[str, str] = {
+    "done": "✓",
+    "in-progress": "▶",
+    "skipped": "—",
+    "pending": "○",
+    "blocked": "!",
+}
+
+PLAN_STATUS_OPEN_TAG = "<plan-status>"
+PLAN_STATUS_CLOSE_TAG = "</plan-status>"
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
@@ -123,7 +134,6 @@ class PlanState:
     updated_at: str = field(default_factory=utc_now)
     approved: bool = False
     approved_at: str | None = None
-    approved_by_user: bool = False
 
     @classmethod
     def create(
@@ -186,7 +196,6 @@ class PlanState:
             updated_at=str(data.get("updated_at") or utc_now()),
             approved=bool(data.get("approved", False)),
             approved_at=str(data.get("approved_at")) if data.get("approved_at") else None,
-            approved_by_user=bool(data.get("approved_by_user", False)),
         )
 
     def progress(self) -> dict[str, int]:
@@ -220,6 +229,59 @@ class PlanState:
         step.apply(status=status, note=note, evidence=evidence)
         self.updated_at = utc_now()
         return step
+
+
+def render_plan_status(plan: PlanState, *, step_desc_chars: int = 160) -> str:
+    """Render the plan as a compact, re-injectable status block.
+
+    The block is wrapped in ``<plan-status>``/``</plan-status>`` so the agent
+    loop can strip any prior copy before injecting the fresh one each turn.
+    Kept small (~200-400 tokens for typical plans) so re-injection is cheap.
+    """
+    lines: list[str] = [PLAN_STATUS_OPEN_TAG]
+    title = plan.plan or plan.problem
+    approved_marker = " [approved]" if plan.approved else " [proposed]"
+    lines.append(f"plan: {title} ({plan.id}){approved_marker}")
+    if plan.problem and plan.problem != title:
+        lines.append(f"problem: {plan.problem}")
+    if plan.solution:
+        lines.append(f"solution: {plan.solution}")
+    if plan.files_to_modify:
+        lines.append(f"files_to_modify: {', '.join(plan.files_to_modify)}")
+    if plan.files_to_create:
+        lines.append(f"files_to_create: {', '.join(plan.files_to_create)}")
+    lines.append("steps:")
+    for i, step in enumerate(plan.steps, 1):
+        icon = STATUS_ICONS.get(step.status, "?")
+        desc = step.description or ""
+        if len(desc) > step_desc_chars:
+            desc = desc[: step_desc_chars - 1] + "…"
+        suffix = ""
+        if step.status == "blocked" and step.note:
+            suffix = f" (blocked: {step.note[:80]})"
+        elif step.note and step.status == "in-progress":
+            suffix = f" (note: {step.note[:80]})"
+        lines.append(f"  [{icon}] {i}. {desc}{suffix}")
+    progress = plan.progress()
+    lines.append(
+        f"progress: {progress['done']}/{progress['total']} done, "
+        f"{progress['in_progress']} in-progress, "
+        f"{progress['blocked']} blocked, "
+        f"{progress['pending']} pending, "
+        f"{progress['skipped']} skipped"
+    )
+    lines.append(PLAN_STATUS_CLOSE_TAG)
+    return "\n".join(lines)
+
+
+def is_plan_status_message(message: dict[str, Any]) -> bool:
+    """Return True if ``message`` is a previously-injected plan-status block."""
+    if message.get("role") != "system":
+        return False
+    content = message.get("content")
+    if not isinstance(content, str):
+        return False
+    return content.startswith(PLAN_STATUS_OPEN_TAG)
 
 
 def plan_dir(cwd: str | os.PathLike[str]) -> Path:
@@ -265,13 +327,18 @@ def clear_plan(cwd: str | os.PathLike[str]) -> None:
 __all__ = [
     "PLAN_DIR",
     "PLAN_FILE",
+    "PLAN_STATUS_CLOSE_TAG",
+    "PLAN_STATUS_OPEN_TAG",
     "PlanEvidence",
     "PlanState",
     "PlanStep",
+    "STATUS_ICONS",
     "STEP_STATUSES",
     "clear_plan",
     "has_plan_file",
+    "is_plan_status_message",
     "load_plan",
     "plan_path",
+    "render_plan_status",
     "save_plan",
 ]

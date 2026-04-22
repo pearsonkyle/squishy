@@ -290,24 +290,23 @@ async def test_agent_completes_when_plan_task_approved(tmp_path):
 
 
 async def test_agent_plan_mode_nudges_after_tool_turns(tmp_path):
-    """In plan mode, reading files for MAX_PLAN_TOOL_TURNS turns without calling
-    plan_task should inject a nudge, then eventually produce the plan."""
-    from squishy.agent import MAX_PLAN_TOOL_TURNS
-
+    """In plan mode, reading files for max_plan_investigation_turns turns without
+    calling plan_task should inject a nudge, then eventually produce the plan."""
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "plan"
     cfg.max_turns = 30
+    max_tool_turns = cfg.max_plan_investigation_turns
 
     # Create a file so read_file succeeds
     (tmp_path / "foo.py").write_text("# code")
 
-    # MAX_PLAN_TOOL_TURNS turns of read-only tool calls, then plan_task
+    # max_plan_investigation_turns turns of read-only tool calls, then plan_task
     script = [
         CompletionResult(
             tool_calls=[_tc("read_file", {"path": "foo.py"}, call_id=f"c{i}")]
         )
-        for i in range(MAX_PLAN_TOOL_TURNS)
+        for i in range(max_tool_turns)
     ] + [
         CompletionResult(
             tool_calls=[
@@ -346,8 +345,6 @@ async def test_agent_plan_mode_nudges_after_tool_turns(tmp_path):
 async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
     """If the model keeps calling read tools without ever calling plan_task, the
     agent should give up after exhausting nudge budget (tool-call path)."""
-    from squishy.agent import MAX_PLAN_NUDGES, MAX_PLAN_TOOL_TURNS
-
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "plan"
@@ -355,8 +352,8 @@ async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
 
     (tmp_path / "foo.py").write_text("# code")
 
-    # Enough turns to exhaust all nudges: (MAX_PLAN_NUDGES + 1) * MAX_PLAN_TOOL_TURNS
-    n_turns = (MAX_PLAN_NUDGES + 1) * MAX_PLAN_TOOL_TURNS + 1
+    # Enough turns to exhaust all nudges: (max_plan_nudges + 1) * max_plan_investigation_turns
+    n_turns = (cfg.max_plan_nudges + 1) * cfg.max_plan_investigation_turns + 1
     script = [
         CompletionResult(
             tool_calls=[_tc("read_file", {"path": "foo.py"}, call_id=f"c{i}")]

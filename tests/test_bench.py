@@ -167,3 +167,68 @@ def test_path_types(tmp_path: Path) -> None:
     p1.close()
     p2 = PredictionWriter(tmp_path / "y.jsonl")
     p2.close()
+
+
+def test_plan_adherence_no_plan():
+    from squishy.bench.terminalbench import _plan_adherence
+
+    assert _plan_adherence(None) == {"had_plan": False}
+    assert _plan_adherence({}) == {"had_plan": False}
+
+
+def test_plan_adherence_computes_completion_ratio():
+    from squishy.bench.terminalbench import _plan_adherence
+
+    plan_state = {
+        "approved": True,
+        "progress": {"done": 3, "total": 4, "blocked": 0, "skipped": 0, "pending": 1, "in_progress": 0},
+    }
+    result = _plan_adherence(plan_state)
+    assert result["had_plan"] is True
+    assert result["approved"] is True
+    assert result["total_steps"] == 4
+    assert result["done"] == 3
+    assert result["completion_ratio"] == 0.75
+
+
+def test_tool_counts_parses_transcript():
+    from squishy.bench.terminalbench import _tool_counts
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "..."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c3", "type": "function", "function": {"name": "plan_task", "arguments": "{}"}},
+            ],
+        },
+    ]
+    assert _tool_counts(messages) == {"read_file": 2, "plan_task": 1}
+    assert _tool_counts(None) == {}
+
+
+def test_classify_error_maps_common_cases():
+    from squishy.bench.terminalbench import _classify_error
+
+    ok = TaskResult(success=True)
+    assert _classify_error(ok, verified=True) == "ok"
+    assert _classify_error(ok, verified=False) == "verify_failed"
+
+    tr = TaskResult(success=False, error="max turns (30) reached")
+    assert _classify_error(tr, verified=True) == "max_turns"
+
+    tr = TaskResult(success=False, error="3 consecutive tool failures — stopping.")
+    assert _classify_error(tr, verified=True) == "tool_error_loop"
+
+    tr = TaskResult(success=False, error="plan-mode run finished without producing a plan_task")
+    assert _classify_error(tr, verified=True) == "plan_mode_no_plan"
