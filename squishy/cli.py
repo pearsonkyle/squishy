@@ -240,6 +240,16 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: 
         if references:
             display.info(format_reference_list(references))
         await agent.run(message_with_files, timeout=timeout)
+        if cfg.permission_mode == "plan":
+            plan = agent.tool_ctx.plan
+            if plan is not None and plan.approved and not agent.tool_ctx.plan_switch_prompted:
+                agent.tool_ctx.plan_switch_prompted = True
+                cfg.permission_mode = "edits"
+                display.info("[bold green]✓ Switched to edits mode[/]")
+                await agent.run(
+                    "Execute the approved plan.",
+                    timeout=timeout,
+                )
     except AgentTimeout as e:
         display.error(str(e))
     except AgentCancelled:
