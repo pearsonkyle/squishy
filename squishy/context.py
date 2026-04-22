@@ -248,6 +248,15 @@ def _mode_block(mode: str, cwd: str) -> str:
             "## Mode: yolo\n"
             "- All tools available without approval prompts. Be careful.\n"
             "- **For non-trivial tasks, call `plan_task` first to structure your approach.**\n"
+            "- **CRITICAL: After creating a plan, you must EXECUTE it.**\n"
+            "  1. Call `update_plan(step_index=1, status=\"in-progress\")` to start step 1\n"
+            "  2. Read necessary files with `read_file`\n"
+            "  3. Make changes with `edit_file` or `write_file`\n"
+            "  4. Run tests/verify with `run_command`\n"
+            "  5. Call `update_plan(step_index=1, status=\"done\")` when complete\n"
+            "  6. Repeat for remaining steps\n"
+            "- Use `get_plan()` if you lose track of where you are in the plan.\n"
+            "- For bug fixes, ALWAYS run tests after making changes to verify the fix works.\n"
         )
     return (
         "## Mode: edits\n"

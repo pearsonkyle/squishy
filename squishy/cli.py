@@ -239,13 +239,33 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: 
         message_with_files, references = inject_references(message, cfg.working_dir)
         if references:
             display.info(format_reference_list(references))
-        await agent.run(message_with_files, timeout=timeout)
+        result = await agent.run(message_with_files, timeout=timeout)
     except AgentTimeout as e:
         display.error(str(e))
+        return
     except AgentCancelled:
         display.warn("cancelled")
+        return
     except LLMError as e:
         display.error(f"LLM error: {e}")
+        return
+
+    # In plan mode, if a plan was approved, auto-switch to edits mode and execute.
+    if (
+        cfg.permission_mode == "plan"
+        and result.plan_state
+        and result.plan_state.get("approved")
+    ):
+        cfg.permission_mode = "edits"
+        display.info("[bold green]✓ Switched to edits mode[/]")
+        try:
+            await agent.run("Execute the approved plan.", timeout=timeout)
+        except AgentTimeout as e:
+            display.error(str(e))
+        except AgentCancelled:
+            display.warn("cancelled")
+        except LLMError as e:
+            display.error(f"LLM error: {e}")
  
 
 async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignore[no-untyped-def]

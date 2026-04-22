@@ -42,7 +42,8 @@ class Squishy:
     max_plan_investigation_turns: int = 4
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
- 
+    auto_init: bool = False
+
     _client: Client = field(init=False, repr=False)
  
     def __post_init__(self) -> None:
@@ -108,6 +109,7 @@ class Squishy:
             max_plan_investigation_turns=self.max_plan_investigation_turns,
             max_recall_skip_turns=self.max_recall_skip_turns,
             max_history_messages=self.max_history_messages,
+            auto_init=self.auto_init,
         )
  
  

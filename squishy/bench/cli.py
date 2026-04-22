@@ -27,12 +27,12 @@ def _load_instances(path: str) -> list[dict[str, Any]]:
         return [json.loads(line) for line in text.splitlines() if line.strip()]
     data = json.loads(text)
     return data if isinstance(data, list) else [data]
- 
- 
+
+
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="squishy-bench", description="Run benchmarks with squishy.")
     sub = p.add_subparsers(dest="cmd", required=True)
- 
+
     swe = sub.add_parser("swe", help="SWE-bench instances -> predictions.jsonl")
     swe.add_argument("--instances", required=True, help="Path to SWE-bench instances JSONL")
     swe.add_argument("--output", default="predictions.jsonl")
@@ -41,19 +41,24 @@ def _parse() -> argparse.Namespace:
     swe.add_argument("--concurrency", type=int, default=2)
     swe.add_argument("--task-timeout", type=float, default=900.0)
     swe.add_argument("--limit", type=int, default=None)
- 
+
     term = sub.add_parser("term", help="Terminal-bench tasks -> results.jsonl")
     term.add_argument("--tasks", required=True, help="Path to tasks JSONL or JSON")
     term.add_argument("--output", default="results.jsonl")
     term.add_argument("--workspace-root", default=None, help="If omitted, uses temp dirs")
     term.add_argument("--concurrency", type=int, default=4)
     term.add_argument("--limit", type=int, default=None)
- 
+
+    # SWE-bench tasks need more turns for planning + execution
+    swe.add_argument("--max-turns", type=int, default=200,
+                     help="Max turns per task (default 200 for SWE-bench)")
+    term.add_argument("--max-turns", type=int, default=40,
+                      help="Max turns per task (default 40 for Terminal-bench)")
+
     for sp in (swe, term):
         sp.add_argument("--base-url", default="http://localhost:1234/v1")
         sp.add_argument("--api-key", default="local")
         sp.add_argument("--model", required=True)
-        sp.add_argument("--max-turns", type=int, default=40)
         sp.add_argument("--temperature", type=float, default=0.3)
         sp.add_argument("--request-timeout", type=float, default=120.0)
         sp.add_argument("--max-retries", type=int, default=4)
@@ -68,10 +73,14 @@ def _parse() -> argparse.Namespace:
                         help="Plan-mode read-only turns allowed before nudging toward plan_task")
         sp.add_argument("--max-recall-skip-turns", type=int, default=2,
                         help="Plan-mode consecutive reads allowed without calling recall")
- 
+
+    # SWE-bench specific: auto-init for repo indexing
+    swe.add_argument("--auto-init", action="store_true",
+                     help="Automatically build repo index before running tasks")
+
     return p.parse_args()
- 
- 
+
+
 async def _amain(args: argparse.Namespace) -> int:
     async with Squishy(
         base_url=args.base_url,
@@ -88,6 +97,7 @@ async def _amain(args: argparse.Namespace) -> int:
         max_plan_investigation_turns=args.max_plan_investigation_turns,
         max_recall_skip_turns=args.max_recall_skip_turns,
         max_history_messages=args.max_history_messages,
+        auto_init=args.auto_init if args.cmd == "swe" else False,
     ) as squishy:
         if not await squishy.health():
             print(f"! cannot reach {args.base_url}", file=sys.stderr)
@@ -107,6 +117,7 @@ async def _amain(args: argparse.Namespace) -> int:
                         workspace_root=args.workspace_root,
                         model_name=args.model_name,
                         task_timeout=args.task_timeout,
+                        auto_init=args.auto_init,
                     )
  
                 results = await run_batch(
