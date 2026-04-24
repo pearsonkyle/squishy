@@ -169,6 +169,9 @@ after 3 turns with no file mutations.
 
 ### Terminal-bench
 
+Tasks adapted from [Terminal-Bench 2.0](https://github.com/harbor-framework/terminal-bench)
+(file ops, data processing, regex, algorithmic puzzles, etc.).
+
 Task schema (JSONL or JSON array):
 
 ```json
@@ -182,15 +185,22 @@ Task schema (JSONL or JSON array):
 }
 ```
 
+A curated mini set (`terminal_bench_mini.jsonl`, 8 tasks) is included for quick
+validation:
+
 ```bash
 squishy-bench term \
-  --tasks tasks.jsonl \
-  --model local-model \
+  --tasks terminal_bench_mini.jsonl \
+  --model qwen-3-coder \
+  --base-url http://vadc-dla17:10200/v1 \
+  --api-key sk-no-key-required \
   --output results.jsonl \
-  --concurrency 4
+  --concurrency 1
 ```
 
-Each task runs in a fresh temp workspace, the verify shell is scored pass/fail by exit code, and terminal-bench results now include artifacts such as the transcript, plan state, setup/verify command output, and a workspace snapshot.
+Each task runs in a fresh temp workspace, the verify shell is scored pass/fail
+by exit code, and results include the transcript, plan state, setup/verify
+command output, and a workspace snapshot.
 
 ### Custom harness
 
