@@ -1,14 +1,14 @@
 """Single source of truth for environment variables, constants, runtime settings."""
- 
+
 from __future__ import annotations
- 
+
 import os
 from dataclasses import dataclass, field
- 
-PermissionMode = str  # "plan" | "edits" | "yolo"
-MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo")
- 
- 
+
+PermissionMode = str  # "plan" | "edits" | "yolo" | "bench"
+MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo", "bench")
+
+
 @dataclass
 class Config:
     base_url: str = field(
@@ -41,12 +41,28 @@ class Config:
     index_summaries: bool = True
     # Agent-loop safety thresholds. Tunable so bench runs can trade off
     # reliability vs. autonomy without code changes.
-    max_consecutive_errors: int = 3
+    max_consecutive_errors: int = 8
     max_plan_nudges: int = 4
     max_plan_investigation_turns: int = 4
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
- 
+    max_tool_output_chars: int = 32_000
+    max_quality_retries: int = 2
+    compaction_threshold: float = 0.7
+    max_stuck_turns: int = 3
+    # Phase-budget thresholds (bench/yolo modes only).
+    max_explore_turns: int = 8
+    max_fix_verify_cycles: int = 6
+    max_post_edit_read_turns: int = 4
+    # Session persistence.
+    session_dir: str = field(
+        default_factory=lambda: os.environ.get(
+            "SQUISHY_SESSION_DIR",
+            os.path.expanduser("~/.squishy/sessions"),
+        )
+    )
+    save_sessions: bool = True
+
     def cycle_mode(self) -> PermissionMode:
         i = (MODES.index(self.permission_mode) + 1) % len(MODES)
         self.permission_mode = MODES[i]

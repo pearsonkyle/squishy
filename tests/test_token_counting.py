@@ -71,7 +71,7 @@ class TestAgentTokenCounting:
 
         assert display.stats.prompt_tokens > 0  # System prompt was counted
 
-    async def test_agent_counts_user_message_tokens(self, tmp_path) -> None:
+    async def test_agent_uses_api_prompt_tokens(self, tmp_path) -> None:
         from squishy.agent import Agent
         from squishy.client import CompletionResult
         from squishy.config import Config
@@ -92,7 +92,7 @@ class TestAgentTokenCounting:
                 return CompletionResult(
                     text="done",
                     tool_calls=[],
-                    usage={"prompt_tokens": 10, "completion_tokens": 5},
+                    usage={"prompt_tokens": 100, "completion_tokens": 5},
                 )
 
         cfg = Config()
@@ -103,16 +103,15 @@ class TestAgentTokenCounting:
         display = Display()
         agent = Agent(cfg, FakeClient(), display)  # type: ignore[arg-type]
 
-        initial_tokens = display.stats.prompt_tokens
-        await agent.run("hello world")
+        result = await agent.run("hello world")
 
-        # After run, prompt tokens should include system + user message
-        assert display.stats.prompt_tokens > initial_tokens
+        # After run, prompt tokens come from the API response (100 per call).
+        assert display.stats.prompt_tokens == 100
+        assert result.tokens_used == 105  # 100 prompt + 5 completion
 
-        # Run again to verify user messages are counted each time
-        initial_tokens = display.stats.prompt_tokens
-        await agent.run("second message")
-        assert display.stats.prompt_tokens > initial_tokens
+        # Run again: tokens accumulate across runs via _LoopState per-run.
+        result2 = await agent.run("second message")
+        assert result2.tokens_used == 105  # fresh _LoopState per run
 
     async def test_completion_result_has_token_properties(self) -> None:
         from squishy.client import CompletionResult

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -40,16 +40,6 @@ class PlanEvidence:
     exit_code: int | None = None
     detail: str = ""
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind,
-            "timestamp": self.timestamp,
-            "path": self.path,
-            "command": self.command,
-            "exit_code": self.exit_code,
-            "detail": self.detail,
-        }
-
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PlanEvidence:
         return cls(
@@ -74,16 +64,7 @@ class PlanStep:
     evidence: list[PlanEvidence] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "description": self.description,
-            "status": self.status,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "completed_at": self.completed_at,
-            "note": self.note,
-            "evidence": [item.to_dict() for item in self.evidence],
-        }
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PlanStep:
@@ -163,20 +144,9 @@ class PlanState:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "plan": self.plan,
-            "problem": self.problem,
-            "solution": self.solution,
-            "steps": [step.to_dict() for step in self.steps],
-            "files_to_create": self.files_to_create,
-            "files_to_modify": self.files_to_modify,
-            "created_at": self.created_at,
-            "updated_at": self.updated_at,
-            "approved": self.approved,
-            "approved_at": self.approved_at,
-            "progress": self.progress(),
-        }
+        d = asdict(self)
+        d["progress"] = self.progress()
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PlanState:

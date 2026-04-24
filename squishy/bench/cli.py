@@ -63,8 +63,8 @@ def _parse() -> argparse.Namespace:
         sp.add_argument("--request-timeout", type=float, default=120.0)
         sp.add_argument("--max-retries", type=int, default=4)
         sp.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
-        sp.add_argument("--max-history-messages", type=int, default=10,
-                        help="Number of conversation messages to retain per turn (default 10)")
+        sp.add_argument("--max-history-messages", type=int, default=30,
+                        help="Number of conversation messages to retain per turn (default 30)")
         sp.add_argument("--max-consecutive-errors", type=int, default=3,
                         help="Consecutive tool failures before aborting (default 3)")
         sp.add_argument("--max-plan-nudges", type=int, default=4,
@@ -88,7 +88,7 @@ async def _amain(args: argparse.Namespace) -> int:
         model=args.model,
         temperature=args.temperature,
         max_turns=args.max_turns,
-        permission_mode="yolo",
+        permission_mode="bench",
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
         use_sandbox=args.sandbox,

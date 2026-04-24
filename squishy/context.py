@@ -118,7 +118,7 @@ def build_system_prompt(
 {thinking_line}
 ## Rules
 - Read files before editing them.
-- For existing files longer than 100 lines, always use `edit_file` (not `write_file`).
+- `write_file` is for creating NEW files only. It will be refused on any existing file. Always use `edit_file` for existing files.
 - Use relative paths. Working directory is already set.
 - Verify your work with `run_command` (run the tests or the program itself) after making changes.
 - Explore thoroughly when fixing bugs or implementing features - it's better to understand the codebase than to guess.
@@ -243,6 +243,24 @@ def _mode_block(mode: str, cwd: str) -> str:
             "pytest --collect-only, python -m pytest --collect-only. No pipes, redirects, or command chains.\n"
             "- After the user approves the plan, they will switch you into edits mode to execute it.\n"
         )
+    if mode == "bench":
+        recall_line = (
+            "- An index is available. Call `recall(query=...)` to locate files before "
+            "using `search_files` or `list_directory`.\n"
+        ) if index_available else ""
+        return (
+            "## Mode: bench\n"
+            "- All tools available. No approval prompts.\n"
+            "- Focus on fixing the bug directly. Do NOT call plan_task or update_plan.\n"
+            "- Follow the workflow: understand → locate → fix → verify → finish.\n"
+            f"{recall_line}"
+            "- Use `save_note` to persist key findings (bug location, test command,\n"
+            "  root cause) so you remember them across long conversations.\n"
+            "- Do NOT re-read files you have already read. Use `save_note` to store important\n"
+            "  content rather than reading the same file multiple times.\n"
+            "- Use `show_diff` before finishing to verify all your changes look correct.\n"
+            "- For bug fixes, ALWAYS run the specific test after making changes.\n"
+        )
     if mode == "yolo":
         return (
             "## Mode: yolo\n"
@@ -251,11 +269,11 @@ def _mode_block(mode: str, cwd: str) -> str:
             "- **CRITICAL: After creating a plan, you must EXECUTE it.**\n"
             "  1. Call `update_plan(step_index=1, status=\"in-progress\")` to start step 1\n"
             "  2. Read necessary files with `read_file`\n"
-            "  3. Make changes with `edit_file` or `write_file`\n"
+            "  3. Make changes with `edit_file` (use `write_file` only for new files)\n"
             "  4. Run tests/verify with `run_command`\n"
             "  5. Call `update_plan(step_index=1, status=\"done\")` when complete\n"
             "  6. Repeat for remaining steps\n"
-            "- Use `get_plan()` if you lose track of where you are in the plan.\n"
+            "- Call `get_plan` if you lose track of where you are in the plan.\n"
             "- For bug fixes, ALWAYS run tests after making changes to verify the fix works.\n"
         )
     return (
@@ -332,11 +350,41 @@ def _top_level_files(cwd: str, limit: int = 50) -> list[str]:
     return out
  
  
+def snip_old_tool_results(
+    messages: list[dict[str, Any]],
+    max_chars: int = 2000,
+    preserve_last_n: int = 6,
+) -> list[dict[str, Any]]:
+    """Truncate old tool-role messages that exceed *max_chars*.
+
+    For tool messages older than *preserve_last_n* from the end, keep the
+    first half and last quarter of their content, inserting a snip marker.
+    Mutates in place and returns the same list.
+    """
+    cutoff = max(0, len(messages) - preserve_last_n)
+    for i in range(cutoff):
+        m = messages[i]
+        if m.get("role") != "tool":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, str) or len(content) <= max_chars:
+            continue
+        first_half = content[: max_chars // 2]
+        last_quarter = content[-(max_chars // 4) :]
+        snipped = len(content) - len(first_half) - len(last_quarter)
+        m["content"] = f"{first_half}\n[... {snipped} chars snipped ...]\n{last_quarter}"
+    return messages
+
+
 def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY) -> list[dict[str, Any]]:
     """Keep system + first user + last (max_messages - 2) messages.
 
     Ported from atlas-proxy/agent.go:41-50. Preserves initial intent while
     bounding context size.
+
+    Before trimming, applies ``snip_old_tool_results`` to compress large
+    tool outputs in older messages — this is free (no LLM call) and
+    preserves more useful context per turn.
 
     Pair-aware: the tail is never allowed to begin with a ``role="tool"``
     message, because an orphan tool result whose matching assistant
@@ -348,26 +396,33 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
     are preserved alongside the primary system prompt so the model keeps its
     current plan snapshot regardless of how many tool turns have passed.
     """
-    from squishy.plan_state import is_plan_status_message
+    # Layer 1: snip old tool results before trimming
+    snip_old_tool_results(messages)
 
-    system = [m for m in messages if m.get("role") == "system" and not is_plan_status_message(m)]
-    plan_status_msgs = [m for m in messages if is_plan_status_message(m)]
+    from squishy.plan_state import is_plan_status_message
+    from squishy.tools.scratchpad import is_notes_message
+
+    def _is_injected_system(m: dict[str, Any]) -> bool:
+        return is_plan_status_message(m) or is_notes_message(m)
+
+    system = [m for m in messages if m.get("role") == "system" and not _is_injected_system(m)]
+    injected_msgs = [m for m in messages if _is_injected_system(m)]
     non_system = [
         m for m in messages
-        if m.get("role") != "system" and not is_plan_status_message(m)
+        if m.get("role") != "system" and not _is_injected_system(m)
     ]
 
     if len(messages) <= max_messages:
-        # Still ensure plan-status system messages are ordered after the
+        # Still ensure injected system messages are ordered after the
         # primary system prompt (they may have been appended later).
-        return system + plan_status_msgs + non_system
+        return system + injected_msgs + non_system
 
     if not non_system:
-        return system + plan_status_msgs
+        return system + injected_msgs
 
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
-    remaining_budget = max_messages - len(system) - len(plan_status_msgs) - len(first_user)
+    remaining_budget = max_messages - len(system) - len(injected_msgs) - len(first_user)
     tail = non_system[-remaining_budget:] if remaining_budget > 0 else []
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
@@ -378,4 +433,144 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
     while tail and tail[0].get("role") == "tool":
         tail = tail[1:]
 
-    return system + plan_status_msgs + first_user + tail
+    # Semantic anchoring: pull up to 3 anchored messages from the dropped
+    # middle section into the retained set.
+    if remaining_budget > 0:
+        dropped_start = first_user_idx + 1
+        dropped_end = len(non_system) - (len(tail) if tail else 0)
+        dropped = non_system[dropped_start:dropped_end]
+        anchored = [m for m in dropped if m.get("_squishy_anchor")]
+        for m in anchored[:3]:
+            tail.insert(0, m)
+
+    return system + injected_msgs + first_user + tail
+
+
+# ── Layer 2: LLM-based context compaction ────────────────────────────────
+
+
+def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    """Estimate token count from message contents (chars / 4)."""
+    total = 0
+    for m in messages:
+        content = m.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+        for tc in m.get("tool_calls", []):
+            if isinstance(tc, dict):
+                func = tc.get("function", {})
+                total += len(func.get("name", "")) + len(func.get("arguments", ""))
+    return total // 4
+
+
+def find_compaction_split(
+    messages: list[dict[str, Any]], keep_ratio: float = 0.3
+) -> int:
+    """Find the index that splits messages so ~keep_ratio of tokens are kept.
+
+    Walks backwards from end, accumulating token estimates, and returns
+    the index where the recent portion reaches keep_ratio of total tokens.
+    """
+    total = _estimate_message_tokens(messages)
+    target = int(total * keep_ratio)
+    running = 0
+    for i in range(len(messages) - 1, -1, -1):
+        running += _estimate_message_tokens([messages[i]])
+        if running >= target:
+            return i
+    return 0
+
+
+async def compact_messages(
+    messages: list[dict[str, Any]],
+    client: Any,  # squishy.client.Client
+    context_limit: int,
+    threshold: float = 0.7,
+) -> list[dict[str, Any]]:
+    """Compress old messages into a summary via LLM call (Layer 2).
+
+    Only fires when estimated token usage exceeds ``context_limit * threshold``.
+    Splits messages at a 30% keep ratio, summarizes the old portion, and
+    returns ``[system_msgs, summary_msg, ack_msg, *recent]``.
+
+    Anchored messages (``_squishy_anchor``) in the old portion are pulled
+    into the recent section to preserve high-value context.
+    """
+    from squishy.plan_state import is_plan_status_message
+    from squishy.tools.scratchpad import is_notes_message
+
+    est = _estimate_message_tokens(messages)
+    if est <= int(context_limit * threshold):
+        return messages
+
+    # Separate system messages (always preserved as-is)
+    def _is_system(m: dict[str, Any]) -> bool:
+        return m.get("role") == "system"
+
+    system = [m for m in messages if _is_system(m)]
+    non_system = [m for m in messages if not _is_system(m)]
+
+    if len(non_system) < 4:
+        return messages
+
+    split = find_compaction_split(non_system)
+    if split <= 0:
+        return messages
+
+    old = non_system[:split]
+    recent = non_system[split:]
+
+    # Pull anchored messages from old section into recent
+    anchored = [m for m in old if m.get("_squishy_anchor")]
+    for m in anchored[:3]:
+        recent.insert(0, m)
+
+    # Build summary text from old messages
+    summary_parts: list[str] = []
+    for m in old:
+        if m in anchored:
+            continue  # already pulled into recent
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if isinstance(content, str) and content.strip():
+            summary_parts.append(f"[{role}]: {content[:500]}")
+        elif m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                func = tc.get("function", {})
+                summary_parts.append(f"[{role}]: called {func.get('name', '?')}")
+
+    old_text = "\n".join(summary_parts)
+
+    # Summarize via LLM
+    try:
+        from squishy.errors import LLMError
+        summary_prompt = (
+            "Summarize this conversation history concisely. Preserve: "
+            "file paths, function/class names, error messages, test commands, "
+            "line numbers, root cause findings, and what was tried. "
+            "Be specific about file locations and code details.\n\n"
+            + old_text
+        )
+        result = await client.complete(
+            [
+                {"role": "system", "content": "You are a concise summarizer."},
+                {"role": "user", "content": summary_prompt},
+            ],
+            tools=[],
+            stream=False,
+        )
+        summary_text = result.text or "(no summary)"
+    except Exception:  # noqa: BLE001
+        # If summarization fails, fall back to a simple truncation
+        summary_text = old_text[:2000] + "\n...(truncated)"
+
+    summary_msg = {
+        "role": "user",
+        "content": f"[Previous conversation summary]\n{summary_text}",
+    }
+    ack_msg = {
+        "role": "assistant",
+        "content": "Understood. I have the context from earlier. Continuing.",
+    }
+
+    return system + [summary_msg, ack_msg] + recent

@@ -13,7 +13,6 @@ from squishy.file_browser import (
     format_reference_list,
     inject_references,
     parse_references,
-    wrap_file_content,
 )
 
 
@@ -96,26 +95,6 @@ def test_inject_preserves_surrounding_text():
         result, _ = inject_references(text, tmpdir)
         assert "Please" in result
         assert "and fix it" in result
-
-
-def test_wrap_file_content():
-    """Test wrapping file content with metadata."""
-    content = "line1\nline2\nline3"
-    wrapped = wrap_file_content(content)
-    
-    assert '<file path="" total_lines="3">' in wrapped
-    assert "line1" in wrapped
-    assert "line2" in wrapped
-    assert "line3" in wrapped
-
-
-def test_wrap_file_content_truncation():
-    """Test file content truncation."""
-    content = "\n".join(f"line{i}" for i in range(150))
-    wrapped = wrap_file_content(content, max_lines=100)
-    
-    assert "line99" in wrapped
-    assert "[Note: 50 lines truncated]" in wrapped
 
 
 def test_format_reference_list():

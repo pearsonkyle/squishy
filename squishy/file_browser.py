@@ -7,9 +7,10 @@ wraps them in a delimiter that the LLM recognizes as file content.
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
+
+from squishy.tools.fs import _resolve
 
 FILE_PATTERN = re.compile(r"@(\S+)")
 """Regex pattern to match @filename references."""
@@ -30,15 +31,7 @@ class FileReference:
 
 
 def parse_references(text: str, working_dir: str) -> list[FileReference]:
-    """Find all @filename references in text and return their contents.
-
-    Args:
-        text: User input potentially containing @filename patterns
-        working_dir: Working directory for resolving relative paths
-
-    Returns:
-        List of FileReference objects for all valid references found
-    """
+    """Find all @filename references in text and return their contents."""
     references = []
     matches = FILE_PATTERN.findall(text)
 
@@ -55,13 +48,6 @@ def parse_references(text: str, working_dir: str) -> list[FileReference]:
     return references
 
 
-def _resolve(path: str, cwd: str) -> str:
-    """Resolve a path relative to working_dir."""
-    if os.path.isabs(path):
-        return os.path.normpath(path)
-    return os.path.normpath(os.path.join(cwd, path))
-
-
 def _read_file(abs_path: str) -> str | None:
     """Read a file and return its contents, or None if not readable."""
     try:
@@ -69,31 +55,6 @@ def _read_file(abs_path: str) -> str | None:
             return f.read()
     except (OSError, UnicodeDecodeError):
         return None
-
-
-def wrap_file_content(content: str, max_lines: int | None = 100) -> str:
-    """Wrap file content for LLM consumption.
-
-    Args:
-        content: Raw file contents
-        max_lines: Maximum lines to include (None for unlimited)
-
-    Returns:
-        Content wrapped in <file> tags with metadata
-    """
-    lines = content.splitlines()
-
-    if max_lines is not None and len(lines) > max_lines:
-        truncated = lines[:max_lines]
-        content = "\n".join(truncated)
-        note = f"\n\n[Note: {len(lines) - max_lines} lines truncated]"
-        content += note
-
-    return FILE_WRAPPER.format(
-        path="",
-        total_lines=len(lines),
-        content=content,
-    )
 
 
 def inject_references(text: str, working_dir: str) -> tuple[str, list[FileReference]]:

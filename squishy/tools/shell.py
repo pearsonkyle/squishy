@@ -12,6 +12,8 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 DEFAULT_TIMEOUT = 60
 OUTPUT_CAP_STDOUT = 8000
 OUTPUT_CAP_STDERR = 4000
+# Max lines to keep per individual failure block in pytest output.
+_PYTEST_FAILURE_BLOCK_CAP = 40
 # Host env vars that are safe to forward into the sandbox. Everything else
 # (API keys, tokens, local paths) is dropped so a stray `env` call can't
 # exfiltrate the agent's credentials.
@@ -33,6 +35,106 @@ def _cap_output(raw: bytes, cap: int) -> tuple[str, bool]:
     return marker + text[-cap:], True
  
  
+def _looks_like_pytest(text: str) -> bool:
+    """Heuristic: does this look like pytest output?"""
+    markers = ("= FAILURES =", "short test summary info", "FAILED ", "passed", "failed")
+    count = sum(1 for m in markers if m in text)
+    return count >= 2
+
+
+def _smart_cap_pytest(raw: bytes, cap: int) -> tuple[str, bool]:
+    """Truncate pytest output while preserving failure details.
+
+    Keeps: failure blocks (FAILURES section), short test summary, final
+    summary line. Trims: passing test dots/lines and verbose pass output.
+    Falls back to generic _cap_output if the result is still too large.
+    """
+    text = raw.decode("utf-8", errors="replace")
+    if len(text) <= cap:
+        return text, False
+
+    lines = text.splitlines()
+    kept: list[str] = []
+    in_failures_section = False
+    in_failure_block = False
+    failure_block_lines = 0
+    in_summary = False
+
+    for line in lines:
+        # Detect the FAILURES section header
+        if "= FAILURES =" in line or "= ERRORS =" in line:
+            in_failures_section = True
+            in_failure_block = False
+            kept.append(line)
+            continue
+
+        # Detect individual failure block headers (underlined test names)
+        if in_failures_section and line.startswith("_") and line.endswith("_"):
+            in_failure_block = True
+            failure_block_lines = 0
+            kept.append(line)
+            continue
+
+        # End of FAILURES section (next separator line)
+        if in_failures_section and line.startswith("=") and ("passed" in line or "failed" in line or "error" in line):
+            in_failures_section = False
+            in_failure_block = False
+            kept.append(line)
+            continue
+
+        # Keep failure block lines (capped per block)
+        if in_failure_block:
+            failure_block_lines += 1
+            if failure_block_lines <= _PYTEST_FAILURE_BLOCK_CAP:
+                kept.append(line)
+            elif failure_block_lines == _PYTEST_FAILURE_BLOCK_CAP + 1:
+                kept.append(f"    ... (failure block truncated)")
+            continue
+
+        # Keep non-block lines in failures section (e.g., between blocks)
+        if in_failures_section:
+            kept.append(line)
+            continue
+
+        # Detect short test summary section
+        if "short test summary info" in line:
+            in_summary = True
+            kept.append(line)
+            continue
+
+        if in_summary:
+            kept.append(line)
+            continue
+
+        # Keep lines with FAILED, ERROR, or warnings
+        if "FAILED " in line or "ERROR " in line or "ERRORS " in line:
+            kept.append(line)
+            continue
+
+        # Keep the final summary line (e.g., "5 failed, 120 passed in 45s")
+        if line.startswith("=") and ("passed" in line or "failed" in line or "error" in line):
+            kept.append(line)
+            continue
+
+        # Keep collection/setup errors
+        if "CollectionError" in line or "ImportError" in line:
+            kept.append(line)
+            continue
+
+    result = "\n".join(kept)
+    if len(result) > cap:
+        # Still too large — fall back to generic tail truncation
+        return _cap_output(raw, cap)
+
+    # Prepend a marker if we dropped content
+    dropped = len(text) - len(result)
+    if dropped > 0:
+        marker = f"…<{dropped} chars of passing output trimmed>\n"
+        result = marker + result
+
+    return result, True
+
+
 def _docker_available() -> bool:
     return shutil.which("docker") is not None
  
@@ -87,7 +189,14 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             "try --no-sandbox or install the tool in the sandbox image)"
         )
 
-    stdout_text, stdout_truncated = _cap_output(stdout_b, OUTPUT_CAP_STDOUT)
+    # Use smart pytest truncation when output looks like pytest.
+    # Bench mode uses a tighter cap to reduce token waste.
+    stdout_cap = 4000 if ctx.permission_mode == "bench" else OUTPUT_CAP_STDOUT
+    stdout_decoded = stdout_b.decode("utf-8", errors="replace")
+    if _looks_like_pytest(stdout_decoded):
+        stdout_text, stdout_truncated = _smart_cap_pytest(stdout_b, stdout_cap)
+    else:
+        stdout_text, stdout_truncated = _cap_output(stdout_b, stdout_cap)
     stderr_text, stderr_truncated = _cap_output(stderr_b, OUTPUT_CAP_STDERR - len(hint))
     stderr_text = stderr_text + hint
 

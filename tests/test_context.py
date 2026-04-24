@@ -2,7 +2,7 @@ from __future__ import annotations
  
 import json
  
-from squishy.context import build_system_prompt, detect_project, trim_history
+from squishy.context import build_system_prompt, detect_project, snip_old_tool_results, trim_history
  
  
 def test_detect_node_nextjs(tmp_path):
@@ -177,3 +177,36 @@ def test_trim_history_noop_orders_plan_status_after_primary_system():
     trimmed = trim_history(msgs)
     assert trimmed[0]["content"] == "sys"
     assert trimmed[1]["content"].startswith("<plan-status>")
+
+
+# --- snip_old_tool_results tests ---
+
+
+def test_snip_old_tool_results_truncates_old_large_tool():
+    big_content = "x" * 5000
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+        {"role": "tool", "tool_call_id": "c0", "name": "read_file", "content": big_content},
+        *[{"role": "assistant", "content": f"a{i}"} for i in range(8)],
+    ]
+    snip_old_tool_results(msgs, max_chars=2000, preserve_last_n=6)
+    snipped = msgs[2]["content"]
+    assert len(snipped) < len(big_content)
+    assert "[..." in snipped
+    assert "chars snipped" in snipped
+
+
+def test_snip_old_tool_results_preserves_recent():
+    big_content = "y" * 5000
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": "a0"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "tool", "tool_call_id": "c0", "name": "read_file", "content": big_content},
+    ]
+    snip_old_tool_results(msgs, max_chars=2000, preserve_last_n=6)
+    # Tool message is within the last 6 — should NOT be snipped
+    assert msgs[5]["content"] == big_content

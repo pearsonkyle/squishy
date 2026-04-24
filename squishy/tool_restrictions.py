@@ -13,11 +13,13 @@ READ_ONLY_TOOLS = frozenset({
     "read_file",
     "list_directory",
     "search_files",
+    "glob_files",
     "recall",
     "plan_task",
     "update_plan",
     "get_plan",
-    "log_blocker",
+    "save_note",
+    "show_diff",
 })
 
 MUTATING_TOOLS = frozenset({
@@ -30,6 +32,12 @@ SHELL_TOOLS = frozenset({
 })
 
 ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOLS
+
+# Plan tools excluded from bench mode to reduce schema size and prevent
+# the model from wasting turns on planning instead of fixing.
+_PLAN_TOOLS = frozenset({"plan_task", "update_plan", "get_plan"})
+
+BENCH_TOOLS = ALL_TOOLS - _PLAN_TOOLS
 
 # Shell commands allowed in plan mode. Single-word binaries are matched on the
 # first token; two-word entries (e.g. "git log") match on the first two.
@@ -51,21 +59,6 @@ READONLY_SHELL_THREE_WORD = frozenset({
 
 # Characters that can chain/redirect commands and escape the allowlist.
 _SHELL_METACHARS = ("|", ";", "&", ">", "<", "`", "$(")
-
-
-def is_read_only(tool_name: str) -> bool:
-    """Check if a tool is read-only (safe in plan mode)."""
-    return tool_name in READ_ONLY_TOOLS
-
-
-def is_mutating(tool_name: str) -> bool:
-    """Check if a tool mutates the filesystem."""
-    return tool_name in MUTATING_TOOLS
-
-
-def is_shell(tool_name: str) -> bool:
-    """Check if a tool executes shell commands."""
-    return tool_name in SHELL_TOOLS
 
 
 def is_readonly_shell(command: str) -> bool:
@@ -115,16 +108,13 @@ def get_allowed_tools(mode: str) -> frozenset[str]:
     """
     if mode == "yolo":
         return ALL_TOOLS
+    if mode == "bench":
+        return BENCH_TOOLS
     if mode == "edits":
         return READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOLS
     if mode == "plan":
         return READ_ONLY_TOOLS | SHELL_TOOLS
     return frozenset()
-
-
-def get_denied_tools(mode: str) -> frozenset[str]:
-    """Return set of tool names denied in given mode."""
-    return ALL_TOOLS - get_allowed_tools(mode)
 
 
 def check_permission(
@@ -168,12 +158,3 @@ def check_permission(
     return True, ""
 
 
-def get_tool_category(tool_name: str) -> str:
-    """Return category of tool for display purposes."""
-    if is_read_only(tool_name):
-        return "read-only"
-    if is_mutating(tool_name):
-        return "mutating"
-    if is_shell(tool_name):
-        return "shell"
-    return "unknown"

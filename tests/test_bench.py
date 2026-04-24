@@ -232,3 +232,16 @@ def test_classify_error_maps_common_cases():
 
     tr = TaskResult(success=False, error="plan-mode run finished without producing a plan_task")
     assert _classify_error(tr, verified=True) == "plan_mode_no_plan"
+
+
+def test_build_prompt_includes_env_error_guidance():
+    from squishy.bench.swebench import build_prompt
+
+    instance = {
+        "instance_id": "test__test-1",
+        "problem_statement": "A bug in foo.py",
+    }
+    prompt = build_prompt(instance)
+    assert "Environmental Error Handling" in prompt
+    assert "ImportError" in prompt
+    assert "DO NOT fix those import errors" in prompt

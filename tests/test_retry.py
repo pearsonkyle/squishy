@@ -120,6 +120,88 @@ async def test_parse_tool_call_tolerates_malformed_json():
     assert "expected JSON object" in tc.args["_tool_arg_error"]
 
 
+async def test_parse_xml_tool_calls_single():
+    """Parse a single XML tool call from Qwen3-Coder format."""
+    from squishy.client import _parse_xml_tool_calls
+
+    text = (
+        "<tool_call>\n"
+        "<function=read_file>\n"
+        "<parameter=path>\nsetup.py\n</parameter>\n"
+        "</function>\n"
+        "</tool_call>"
+    )
+    calls = _parse_xml_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].name == "read_file"
+    assert calls[0].args == {"path": "setup.py"}
+    assert calls[0].id == "call_0"
+
+
+async def test_parse_xml_tool_calls_multiple():
+    """Parse multiple XML tool calls in one response."""
+    from squishy.client import _parse_xml_tool_calls
+
+    text = (
+        "<tool_call>\n<function=read_file>\n"
+        "<parameter=path>foo.py</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "<tool_call>\n<function=edit_file>\n"
+        "<parameter=path>bar.py</parameter>\n"
+        "<parameter=old_str>x = 1</parameter>\n"
+        "<parameter=new_str>x = 2</parameter>\n"
+        "</function>\n</tool_call>"
+    )
+    calls = _parse_xml_tool_calls(text)
+    assert len(calls) == 2
+    assert calls[0].name == "read_file"
+    assert calls[0].args["path"] == "foo.py"
+    assert calls[1].name == "edit_file"
+    assert calls[1].args["old_str"] == "x = 1"
+    assert calls[1].args["new_str"] == "x = 2"
+
+
+async def test_parse_xml_tool_calls_json_value():
+    """JSON values in parameters are parsed as structured data."""
+    from squishy.client import _parse_xml_tool_calls
+
+    text = (
+        '<tool_call>\n<function=run_command>\n'
+        '<parameter=command>python test.py</parameter>\n'
+        '<parameter=timeout>30</parameter>\n'
+        '</function>\n</tool_call>'
+    )
+    calls = _parse_xml_tool_calls(text)
+    assert len(calls) == 1
+    assert calls[0].args["command"] == "python test.py"
+    assert calls[0].args["timeout"] == 30  # parsed as int, not string
+
+
+async def test_parse_xml_tool_calls_no_match():
+    """Returns empty list when no XML tool calls present."""
+    from squishy.client import _parse_xml_tool_calls
+
+    assert _parse_xml_tool_calls("just plain text") == []
+    assert _parse_xml_tool_calls("") == []
+
+
+async def test_strip_xml_tool_calls():
+    """Strips XML tool calls from text, preserving other content."""
+    from squishy.client import _strip_xml_tool_calls
+
+    text = (
+        "I'll read that file for you.\n"
+        "<tool_call>\n<function=read_file>\n"
+        "<parameter=path>setup.py</parameter>\n"
+        "</function>\n</tool_call>\n"
+        "Let me know if you need more."
+    )
+    result = _strip_xml_tool_calls(text)
+    assert "<tool_call>" not in result
+    assert "I'll read that file for you." in result
+    assert "Let me know if you need more." in result
+
+
 async def test_dispatch_surfaces_tool_arg_error():
     """Dispatcher turns ``_tool_arg_error`` into an actionable error message."""
     import tempfile

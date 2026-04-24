@@ -164,13 +164,14 @@ async def test_read_cache_invalidation_on_write(ctx, tmp_path):
     assert result.success
     # Note: cache_hit only appears on subsequent reads of same offset/limit
 
-    # Write new content (should invalidate cache)
-    await write_file.run({"path": "data.txt", "content": "version2\n"}, ctx)
+    # Edit content (should invalidate cache); write_file refuses existing files
+    from squishy.tools.fs import edit_file
+    await edit_file.run({"path": "data.txt", "old_str": "version1", "new_str": "version2"}, ctx)
 
     # Read again - should show new content (cache invalidated)
     result = await read_file.run({"path": "data.txt"}, ctx)
     assert result.success
-    # cache_hit should be False or not present since we invalidated the cache on write
+    # cache_hit should be False or not present since we invalidated the cache on edit
     if "cache_hit" in result.data:
         assert not result.data["cache_hit"]
     assert "version2" in result.data["content"]

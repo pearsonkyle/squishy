@@ -244,7 +244,7 @@ class TestPlanToolRestrictions:
             assert "plan_task" in allowed
             assert "update_plan" in allowed
             assert "get_plan" in allowed
-            assert "log_blocker" in allowed
+            # log_blocker was removed — its purpose is served by update_plan
 
 
 @pytest.mark.asyncio
@@ -268,37 +268,6 @@ class TestGetPlanTool:
         assert result.success
         assert result.data["plan"]["problem"] == "p"
         assert len(result.data["plan"]["steps"]) == 2
-
-
-@pytest.mark.asyncio
-class TestLogBlockerTool:
-    async def test_log_blocker_requires_plan(self, tmp_path) -> None:
-        from squishy.tools.plan import _log_blocker
-
-        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
-        result = await _log_blocker({"step_index": 1, "detail": "x"}, ctx)
-        assert not result.success
-        assert "no active plan" in result.error
-
-    async def test_log_blocker_requires_detail(self, tmp_path) -> None:
-        from squishy.tools.plan import _log_blocker, _plan_task
-
-        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
-        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
-        result = await _log_blocker({"step_index": 1, "detail": "  "}, ctx)
-        assert not result.success
-        assert "detail" in result.error
-
-    async def test_log_blocker_appends_evidence_without_status_change(self, tmp_path) -> None:
-        from squishy.tools.plan import _log_blocker, _plan_task
-
-        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
-        await _plan_task({"problem": "p", "solution": "s", "steps": ["a", "b"]}, ctx)
-        result = await _log_blocker({"step_index": 2, "detail": "docker missing"}, ctx)
-        assert result.success
-        assert ctx.plan.steps[1].status == "pending"
-        assert ctx.plan.steps[1].evidence[-1].kind == "blocker"
-        assert ctx.plan.steps[1].evidence[-1].detail == "docker missing"
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,9 @@ class ToolContext:
     plan: PlanState | None = None
     pending_plan_evidence: list[dict[str, Any]] = field(default_factory=list)
     plan_switch_prompted: bool = False
+    notes: dict[str, str] = field(default_factory=dict)
+    _cached_index: Any = field(default=None, repr=False)
+    files_read_count: dict[str, int] = field(default_factory=dict)
  
  
 @dataclass
@@ -55,8 +58,13 @@ class Tool:
         }
  
  
-def _short_json(d: dict[str, Any], limit: int = 4000) -> str:
+def _short_json(d: dict[str, Any], limit: int = 32000) -> str:
     import json
  
     s = json.dumps(d, ensure_ascii=False)
-    return s if len(s) <= limit else s[:limit] + "...<truncated>"
+    if len(s) <= limit:
+        return s
+    head = int(limit * 0.6)
+    tail = int(limit * 0.3)
+    snipped = len(s) - head - tail
+    return f"{s[:head]}\n[... {snipped} chars snipped ...]\n{s[-tail:]}"

@@ -23,6 +23,14 @@ from squishy.display import Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
 from squishy.plan_state import PlanState
+from squishy.session import (
+    create_session,
+    export_training,
+    export_training_to_file,
+    list_sessions,
+    load_messages,
+    load_session,
+)
 from squishy.tools.base import Tool
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
@@ -55,6 +63,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--init", action="store_true", help="Build .squishy/index.json before the REPL")
     p.add_argument("--no-summaries", action="store_true", help="When indexing, skip LLM summaries")
     p.add_argument("--index-concurrency", type=int, default=None, help="Parallel summary calls (default 4)")
+    p.add_argument("--resume", metavar="UUID", help="Resume a previous session by UUID")
+    p.add_argument("--session-dir", help="Session storage directory (env SQUISHY_SESSION_DIR)")
+    p.add_argument("--no-sessions", action="store_true", help="Disable session persistence")
     return p.parse_args(argv)
  
  
@@ -88,6 +99,10 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.index_summaries = False
     if args.index_concurrency is not None:
         cfg.index_concurrency = args.index_concurrency
+    if args.session_dir:
+        cfg.session_dir = args.session_dir
+    if args.no_sessions:
+        cfg.save_sessions = False
     return cfg
  
  
@@ -169,7 +184,7 @@ async def _amain() -> None:
                 await _run_one(cfg, client, display, None, msg, args.timeout)
             return
  
-        await _interactive(cfg, client, display, prompt_fn, args.timeout)
+        await _interactive(cfg, client, display, prompt_fn, args.timeout, resume_id=args.resume)
     finally:
         await client.aclose()
  
@@ -234,14 +249,57 @@ async def _prompt_switch_to_edits(
         display.info("Staying in plan mode.")
 
 
+async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeout: float | None) -> None:
+    """If a plan was just approved, auto-switch to edits mode and execute it."""
+    plan = agent.tool_ctx.plan
+    if not (
+        cfg.permission_mode == "plan"
+        and plan is not None
+        and plan.approved
+        and not agent.tool_ctx.plan_switch_prompted
+    ):
+        return
+    agent.tool_ctx.plan_switch_prompted = True
+    cfg.permission_mode = "edits"
+    display.info("[bold green]✓ Switched to edits mode[/]")
+    try:
+        await agent.run(EXECUTE_APPROVED_PLAN_PROMPT, timeout=timeout)
+    except AgentTimeout as e:
+        display.error(str(e))
+    except AgentCancelled:
+        display.warn("cancelled")
+    except LLMError as e:
+        display.error(f"LLM error: {e}")
+
+
+def _create_session_for_agent(cfg: Config, model_name: str) -> str | None:
+    """Create a session and return its ID, or None if disabled."""
+    if not cfg.save_sessions:
+        return None
+    try:
+        from squishy.tools import openai_schemas
+        tools = openai_schemas(cfg.permission_mode)
+        sess = create_session(
+            model=model_name,
+            working_dir=cfg.working_dir,
+            mode=cfg.permission_mode,
+            tools=tools,
+            root=cfg.session_dir,
+        )
+        return sess.id
+    except Exception:  # noqa: BLE001
+        return None
+
+
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
-    agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+    session_id = _create_session_for_agent(cfg, cfg.model)
+    agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
     try:
         # Inject file references before running
         message_with_files, references = inject_references(message, cfg.working_dir)
         if references:
             display.info(format_reference_list(references))
-        result = await agent.run(message_with_files, timeout=timeout)
+        await agent.run(message_with_files, timeout=timeout)
     except AgentTimeout as e:
         display.error(str(e))
         return
@@ -252,25 +310,10 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: 
         display.error(f"LLM error: {e}")
         return
 
-    # In plan mode, if a plan was approved, auto-switch to edits mode and execute.
-    if (
-        cfg.permission_mode == "plan"
-        and result.plan_state
-        and result.plan_state.get("approved")
-    ):
-        cfg.permission_mode = "edits"
-        display.info("[bold green]✓ Switched to edits mode[/]")
-        try:
-            await agent.run("Execute the approved plan.", timeout=timeout)
-        except AgentTimeout as e:
-            display.error(str(e))
-        except AgentCancelled:
-            display.warn("cancelled")
-        except LLMError as e:
-            display.error(f"LLM error: {e}")
+    await _auto_execute_plan(agent, cfg, display, timeout)
  
 
-async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignore[no-untyped-def]
+async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: str | None = None):  # type: ignore[no-untyped-def]
     kb = KeyBindings()
 
     @kb.add("s-tab")
@@ -283,8 +326,23 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
         bottom_toolbar=_bottom_toolbar(cfg, display),
     )
 
-    # Create initial agent
-    current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+    # Resume or create initial agent.
+    if resume_id:
+        try:
+            prev_messages = load_messages(resume_id, root=cfg.session_dir)
+            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=resume_id)
+            # Replace the fresh messages with the loaded ones.
+            current_agent.messages = prev_messages
+            current_agent._last_persisted_idx = len(prev_messages)
+            display.info(f"[session] resumed {resume_id[:12]}… ({len(prev_messages)} messages)")
+        except Exception as e:  # noqa: BLE001
+            display.error(f"failed to resume session {resume_id}: {e}")
+            return
+    else:
+        session_id = _create_session_for_agent(cfg, display.model or cfg.model)
+        current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
+        if session_id:
+            display.info(f"[session] {session_id[:12]}…")
 
     while True:
         try:
@@ -316,6 +374,9 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
                 "  /exit-plan                — exit plan mode with detailed plan\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
+                "  /session                  — show current session UUID\n"
+                "  /sessions                 — list recent sessions\n"
+                "  /export [UUID]            — export session as training JSONL\n"
                 "  /quit, /exit, /q          — exit squishy\n"
                 "\n"
                 "  !command                  — run shell command directly\n"
@@ -328,11 +389,14 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
-            # Rebuild agent with fresh conversation history
-            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn)
+            # Rebuild agent with fresh conversation history and new session.
+            session_id = _create_session_for_agent(cfg, display.model or cfg.model)
+            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
             # Show intro banner with discovered model name
             display.banner(cfg.base_url, display.model or cfg.model)
             display.info("session cleared.")
+            if session_id:
+                display.info(f"[session] {session_id[:12]}…")
             continue
         if line == "/status":
             display.status(cfg.permission_mode)
@@ -363,6 +427,54 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             else:
                 display.warn("usage: /mode plan|edits|yolo")
             continue
+        if line == "/session":
+            sid = current_agent.session_id
+            if sid:
+                display.info(f"[session] {sid}")
+            else:
+                display.info("[session] not active (sessions disabled)")
+            continue
+        if line == "/sessions":
+            sessions = list_sessions(limit=20, working_dir=cfg.working_dir, root=cfg.session_dir)
+            if not sessions:
+                display.info("no sessions found")
+            else:
+                lines = []
+                for s in sessions:
+                    short_id = s.id[:12]
+                    date = s.updated_at[:19] if s.updated_at else "?"
+                    lines.append(
+                        f"  {short_id}  {date}  {s.mode:<6}  "
+                        f"turns={s.turns}  tokens={s.tokens}  {s.status}"
+                    )
+                display.info("\n".join(lines))
+            continue
+        if line.startswith("/export"):
+            _, _, rest = line.partition(" ")
+            export_id = rest.strip() or (current_agent.session_id or "")
+            if not export_id:
+                display.warn("no session to export (provide UUID or start a session)")
+                continue
+            # Resolve short IDs by prefix match.
+            if len(export_id) < 32:
+                all_sessions = list_sessions(limit=100, root=cfg.session_dir)
+                matches = [s for s in all_sessions if s.id.startswith(export_id)]
+                if len(matches) == 1:
+                    export_id = matches[0].id
+                elif len(matches) > 1:
+                    display.warn(f"ambiguous prefix '{export_id}' — matches {len(matches)} sessions")
+                    continue
+                else:
+                    display.warn(f"no session matching '{export_id}'")
+                    continue
+            try:
+                from pathlib import Path
+                out_path = Path(cfg.session_dir) / f"{export_id[:12]}_training.jsonl"
+                export_training_to_file(export_id, out_path, root=cfg.session_dir)
+                display.info(f"[export] {out_path}")
+            except Exception as e:  # noqa: BLE001
+                display.error(f"export failed: {e}")
+            continue
         if line.startswith("/"):
             display.warn(f"unknown command: {line}")
             continue
@@ -382,27 +494,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout):  # type: ignor
             display.error(f"LLM error: {e}")
             continue
 
-        # If we're in plan mode and the agent just got a plan approved by the user,
-        # auto-switch to edits mode and trigger plan execution.
-        if cfg.permission_mode == "plan":
-            plan = current_agent.tool_ctx.plan
-            if plan is not None and plan.approved and not current_agent.tool_ctx.plan_switch_prompted:
-                current_agent.tool_ctx.plan_switch_prompted = True
-                # Auto-switch to edits mode (user already consented by approving the plan)
-                cfg.permission_mode = "edits"
-                display.info("[bold green]✓ Switched to edits mode[/]")
-                # Trigger the agent to execute the approved plan
-                try:
-                    await current_agent.run(
-                        EXECUTE_APPROVED_PLAN_PROMPT,
-                        timeout=timeout,
-                    )
-                except AgentTimeout as e:
-                    display.error(str(e))
-                except AgentCancelled:
-                    display.warn("cancelled")
-                except LLMError as e:
-                    display.error(f"LLM error: {e}")
+        await _auto_execute_plan(current_agent, cfg, display, timeout)
 
 
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:

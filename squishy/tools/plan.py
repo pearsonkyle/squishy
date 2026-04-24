@@ -301,65 +301,6 @@ get_plan = Tool(
 )
 
 
-async def _log_blocker(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    """Attach a blocker note to a step without changing its status.
+PLAN_TOOLS: list[Tool] = [plan_task, update_plan, get_plan]
 
-    Useful for recording environment issues, missing tools, or unclear
-    requirements that the model wants surfaced without mutating the step's
-    progress state.
-    """
-    step_index = args.get("step_index")
-    detail = args.get("detail", "")
-
-    if not isinstance(step_index, int):
-        return ToolResult(False, error="`step_index` is required (integer, 1-based)")
-    if not isinstance(detail, str) or not detail.strip():
-        return ToolResult(False, error="`detail` is required (non-empty string)")
-
-    plan = ctx.plan
-    if plan is None:
-        return ToolResult(False, error="no active plan — call plan_task first")
-
-    idx = step_index - 1
-    if idx < 0 or idx >= len(plan.steps):
-        return ToolResult(False, error=f"step_index {step_index} out of range (1-{len(plan.steps)})")
-
-    step = plan.steps[idx]
-    step.evidence.append(PlanEvidence(kind="blocker", detail=detail.strip()))
-    save_plan(ctx.working_dir, plan)
-    return ToolResult(
-        True,
-        data={"step_index": step_index, "evidence_count": len(step.evidence)},
-        display=f"Logged blocker on step {step_index}: {detail.strip()[:120]}",
-    )
-
-
-log_blocker = Tool(
-    name="log_blocker",
-    description=(
-        "Record a blocker or concern against a plan step without changing its "
-        "status. Use when environment issues, missing tools, or unclear "
-        "requirements surface mid-execution — a separate tool from `update_plan` "
-        "so you can log noise without marking the step blocked."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "step_index": {
-                "type": "integer",
-                "description": "1-based index of the step the blocker relates to",
-            },
-            "detail": {
-                "type": "string",
-                "description": "Short description of the blocker or concern",
-            },
-        },
-        "required": ["step_index", "detail"],
-    },
-    run=_log_blocker,
-)
-
-
-PLAN_TOOLS: list[Tool] = [plan_task, update_plan, get_plan, log_blocker]
-
-__all__ = ["plan_task", "update_plan", "get_plan", "log_blocker", "PLAN_TOOLS"]
+__all__ = ["plan_task", "update_plan", "get_plan", "PLAN_TOOLS"]

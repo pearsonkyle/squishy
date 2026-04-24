@@ -162,9 +162,10 @@ class Display:
         for i, step in enumerate(data.get("steps", []), 1):
             desc = step if isinstance(step, str) else step.get("description", "")
             status = "" if isinstance(step, str) else step.get("status", "pending")
-            status_icon = {"done": "[green]✓[/]", "in-progress": "[cyan]▶[/]", "skipped": "[dim]—[/]"}.get(
-                status, "[dim]○[/]"
-            )
+            from squishy.plan_state import STATUS_ICONS
+            raw_icon = STATUS_ICONS.get(status, "○")
+            color = {"done": "green", "in-progress": "cyan", "skipped": "dim", "blocked": "red"}.get(status, "dim")
+            status_icon = f"[{color}]{raw_icon}[/{color}]"
             lines.append(f"  {status_icon} {i}. {desc}")
 
         if data.get("files_to_create"):
@@ -249,21 +250,3 @@ class Display:
         else:
             self.console.print(f"{bar} {percent}% ({current}/{total})")
 
-    def tool_categories(self, mode: str) -> None:
-        """Display tools organized by category for given mode."""
-        from squishy.tool_restrictions import get_allowed_tools, get_denied_tools
-        
-        allowed = get_allowed_tools(mode)
-        denied = get_denied_tools(mode)
-        
-        self.console.rule("TOOL CATEGORIES", style="blue")
-        
-        if allowed:
-            self.console.print(f"\n[bold green]ALLOWED IN {mode.upper()}[/]:")
-            for tool in sorted(allowed):
-                self.console.print(f"  ✓ {tool}")
-        
-        if denied:
-            self.console.print(f"\n[bold red]DENIED IN {mode.upper()}[/]:")
-            for tool in sorted(denied):
-                self.console.print(f"  ✗ {tool}")

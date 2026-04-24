@@ -76,7 +76,11 @@ async def _recall(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     limit = min(int(args.get("limit", DEFAULT_LIMIT)), MAX_RESULTS)
     depth = max(0, min(depth, 4))
  
-    idx = load_index(ctx.working_dir)
+    idx = ctx._cached_index
+    if idx is None:
+        idx = load_index(ctx.working_dir)
+        if idx is not None:
+            ctx._cached_index = idx
     if idx is None:
         return ToolResult(
             False,
@@ -115,8 +119,8 @@ recall = Tool(
     description=(
         "Search the repo index for relevant files, dirs, or symbols. Returns ranked "
         "entries with path, kind, line range, and summary. Use this before "
-        "list_directory or search_files when you need to locate the right module. "
-        "Requires /init to have been run."
+        "read_file, list_directory, or search_files when you need to locate the "
+        "right module or function. Requires /init to have been run."
     ),
     parameters={
         "type": "object",

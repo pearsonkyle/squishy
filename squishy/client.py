@@ -9,6 +9,7 @@ from __future__ import annotations
  
 import json
 import logging
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -49,6 +50,7 @@ class CompletionResult:
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
     usage: dict[str, int] | None = field(default_factory=dict)
+    reasoning: str = ""  # Qwen3 thinking / chain-of-thought (separate from text)
 
     @property
     def prompt_tokens(self) -> int:
@@ -164,16 +166,26 @@ class Client:
  
         raise LLMError("unreachable")  # pragma: no cover
  
+    def _build_create_kwargs(
+        self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return dict(
+            model=self.model,
+            messages=messages,
+            tools=tools or None,
+            tool_choice="auto" if tools else None,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            # Enable Qwen3 thinking mode — the model uses the `reasoning` field
+            # for chain-of-thought, which improves tool-call formatting.
+            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
+        )
+
     async def _complete_sync(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> CompletionResult:
         resp = await self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,  # type: ignore[arg-type]
-            tools=tools or None,  # type: ignore[arg-type]
-            tool_choice="auto" if tools else None,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            **self._build_create_kwargs(messages, tools),
             stream=False,
         )
         choice = resp.choices[0]
@@ -181,11 +193,23 @@ class Client:
         calls: list[ToolCall] = []
         for tc in getattr(msg, "tool_calls", None) or []:
             calls.append(_parse_tool_call(tc.id, tc.function.name, tc.function.arguments or "{}"))
+        # Capture reasoning separately for training data export.
+        reasoning = getattr(msg, "reasoning", None) or ""
+        # Fallback: some models (Qwen3 thinking mode) put text in `reasoning`.
+        text = msg.content or reasoning or ""
+        # Fallback: parse XML tool calls from text when server doesn't parse them.
+        if not calls and text:
+            xml_calls = _parse_xml_tool_calls(text)
+            if xml_calls:
+                calls = xml_calls
+                text = _strip_xml_tool_calls(text)
+                log.debug("parsed %d XML tool call(s) from text", len(calls))
         return CompletionResult(
-            text=msg.content or "",
+            text=text,
             tool_calls=calls,
             finish_reason=choice.finish_reason or "",
             usage=_usage_dict(resp.usage),
+            reasoning=reasoning,
         )
  
     async def _complete_stream(
@@ -195,16 +219,12 @@ class Client:
         on_text: OnTextFn | None,
     ) -> CompletionResult:
         stream: AsyncIterator[Any] = await self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,  # type: ignore[arg-type]
-            tools=tools or None,  # type: ignore[arg-type]
-            tool_choice="auto" if tools else None,
-            temperature=self.temperature,
-            max_tokens=self.max_tokens,
+            **self._build_create_kwargs(messages, tools),
             stream=True,
         )
  
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tc_buf: dict[int, dict[str, str]] = {}
         finish_reason = ""
         usage: dict[str, int] = {}
@@ -217,7 +237,12 @@ class Client:
                     usage = _usage_dict(chunk_usage)
                 continue
             delta = chunk.choices[0].delta
-            content = getattr(delta, "content", None)
+            # Capture reasoning separately for training data export.
+            delta_reasoning = getattr(delta, "reasoning", None)
+            if delta_reasoning:
+                reasoning_parts.append(delta_reasoning)
+            # Fallback: Qwen3 thinking mode streams into `reasoning` not `content`.
+            content = getattr(delta, "content", None) or delta_reasoning
             if content:
                 text_parts.append(content)
                 if on_text is not None:
@@ -248,14 +273,68 @@ class Client:
             )
             for i in sorted(tc_buf)
         ]
+        text = "".join(text_parts)
+        reasoning = "".join(reasoning_parts)
+        # Fallback: parse XML tool calls from streamed text when server doesn't.
+        if not calls and text:
+            xml_calls = _parse_xml_tool_calls(text)
+            if xml_calls:
+                calls = xml_calls
+                text = _strip_xml_tool_calls(text)
+                log.debug("parsed %d XML tool call(s) from stream", len(calls))
         return CompletionResult(
-            text="".join(text_parts),
+            text=text,
             tool_calls=calls,
             finish_reason=finish_reason,
             usage=usage,
+            reasoning=reasoning,
         )
  
  
+# Regex for Qwen3-style XML tool calls:
+#   <tool_call>
+#   <function=NAME>
+#   <parameter=KEY>VALUE</parameter>
+#   ...
+#   </function>
+#   </tool_call>
+_XML_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=(\w+)>(.*?)</function>\s*</tool_call>",
+    re.DOTALL,
+)
+_XML_PARAM_RE = re.compile(
+    r"<parameter=(\w+)>(.*?)</parameter>",
+    re.DOTALL,
+)
+
+
+def _parse_xml_tool_calls(text: str) -> list[ToolCall]:
+    """Extract tool calls from XML-formatted text (Qwen3-Coder fallback).
+
+    Returns an empty list if no XML tool calls are found.
+    """
+    calls: list[ToolCall] = []
+    for i, m in enumerate(_XML_TOOL_CALL_RE.finditer(text)):
+        name = m.group(1)
+        body = m.group(2)
+        args: dict[str, Any] = {}
+        for pm in _XML_PARAM_RE.finditer(body):
+            key = pm.group(1)
+            raw = pm.group(2).strip()
+            # Try to parse as JSON for structured values (lists, dicts, numbers).
+            try:
+                args[key] = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                args[key] = raw
+        calls.append(ToolCall(id=f"call_{i}", name=name, args=args))
+    return calls
+
+
+def _strip_xml_tool_calls(text: str) -> str:
+    """Remove XML tool call blocks from text, returning remaining content."""
+    return _XML_TOOL_CALL_RE.sub("", text).strip()
+
+
 def _parse_tool_call(call_id: str, name: str, arguments: str) -> ToolCall:
     try:
         args = json.loads(arguments)
