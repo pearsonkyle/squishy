@@ -20,7 +20,7 @@ from typing import Any
 
 from squishy.client import Client, CompletionResult, ToolCall
 from squishy.config import Config
-from squishy.context import build_system_prompt, compact_messages, detect_project, snip_old_tool_results, trim_history
+from squishy.context import build_system_prompt, compact_messages, detect_project, trim_history
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.index.store import has_index
@@ -86,8 +86,8 @@ class _LoopState:
     quality_skips: int = 0
     total_tool_calls: dict[str, int] = field(default_factory=dict)
     prose_completions: int = 0
-    prior_created: set[str] = field(default_factory=set)
-    prior_edited: set[str] = field(default_factory=set)
+    prior_created_len: int = 0
+    prior_edited_len: int = 0
     # Phase-budget tracking (bench/yolo).
     phase: str = "explore"          # "explore" | "fix" | "verify"
     explore_turns: int = 0
@@ -104,6 +104,7 @@ class _LoopState:
     recent_edit_fail_files: set[str] = field(default_factory=set)  # cleared after successful read
     # Re-anchoring.
     last_reanchor_turn: int = 0
+    problem_text: str | None = None
     # Compaction-resilient loop detection: tracks consecutive identical calls
     # independently of message history (which gets trimmed).
     last_call_key: str = ""         # "tool_name:args_hash" of previous dispatch
@@ -204,6 +205,13 @@ class Agent:
     def _plan_snapshot(self) -> dict[str, Any] | None:
         return self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else None
 
+    def _sync_display_stats(self, st: _LoopState, turn: int) -> None:
+        """Update display stats and print summary."""
+        if self.display:
+            self.display.stats.prompt_tokens = st.total_prompt_tokens
+            self.display.stats.completion_tokens = st.completion_tokens
+            self.display.summary(turn, time.monotonic() - st.start)
+
     def _build_result(
         self, st: _LoopState, *, success: bool, final_text: str = "", error: str = "",
         turn: int,
@@ -273,7 +281,8 @@ class Agent:
 
     def _refresh_plan_status_message(self) -> None:
         """Drop any prior plan-status system message; append a fresh one."""
-        self.messages[:] = [m for m in self.messages if not is_plan_status_message(m)]
+        if any(is_plan_status_message(m) for m in self.messages):
+            self.messages[:] = [m for m in self.messages if not is_plan_status_message(m)]
         plan = self.tool_ctx.plan
         if plan is None:
             return
@@ -283,7 +292,8 @@ class Agent:
 
     def _refresh_notes_message(self) -> None:
         """Drop any prior notes system message; append a fresh one."""
-        self.messages[:] = [m for m in self.messages if not is_notes_message(m)]
+        if any(is_notes_message(m) for m in self.messages):
+            self.messages[:] = [m for m in self.messages if not is_notes_message(m)]
         if not self.tool_ctx.notes:
             return
         rendered = render_notes(self.tool_ctx.notes)
@@ -301,7 +311,6 @@ class Agent:
 
         Returns a TaskResult to end the run, or a string signal:
           "continue" — a nudge was injected, loop should continue
-          "success"  — never returned (success is via TaskResult)
         """
         in_plan = self.config.permission_mode == "plan"
         plan = self.tool_ctx.plan
@@ -397,10 +406,7 @@ class Agent:
         st.prose_completions += 1
         if completion.text:
             self.messages.append(_prose_msg(completion.text, completion.reasoning))
-        if self.display:
-            self.display.stats.prompt_tokens = st.total_prompt_tokens
-            self.display.stats.completion_tokens = st.completion_tokens
-            self.display.summary(turn, time.monotonic() - st.start)
+        self._sync_display_stats(st, turn)
         return self._build_result(
             st, success=True, final_text=completion.text, turn=turn,
         )
@@ -482,15 +488,16 @@ class Agent:
 
     def _apply_stuck_detection(self, st: _LoopState, is_bench: bool) -> None:
         """Track file-mutation progress and inject stuck nudges in bench mode."""
-        made_progress = bool(
-            st.files_created - st.prior_created or st.files_edited - st.prior_edited
+        made_progress = (
+            len(st.files_created) > st.prior_created_len
+            or len(st.files_edited) > st.prior_edited_len
         )
         if made_progress:
             st.turns_without_progress = 0
         else:
             st.turns_without_progress += 1
-        st.prior_created = set(st.files_created)
-        st.prior_edited = set(st.files_edited)
+        st.prior_created_len = len(st.files_created)
+        st.prior_edited_len = len(st.files_edited)
 
         if (
             is_bench
@@ -532,6 +539,7 @@ class Agent:
 
     def _update_phase(
         self, st: _LoopState, dispatched: list[tuple[ToolCall, dict[str, Any]]],
+        *, turn: int = 0,
     ) -> TaskResult | None:
         """Update phase tracking after tool dispatch (bench/yolo only).
 
@@ -597,7 +605,7 @@ class Agent:
             return self._build_result(
                 st, success=True,
                 final_text="Fix applied. Agent exhausted edit-verify cycle budget.",
-                turn=0,  # will be overwritten by caller
+                turn=turn,
             )
 
         # Post-edit read-only warning.
@@ -774,26 +782,27 @@ class Agent:
         if turn < reanchor_interval or turn - st.last_reanchor_turn < reanchor_interval:
             return
 
-        # Extract the problem text from the first user message.
-        problem_text = None
-        for msg in self.messages:
-            if msg.get("role") == "user" and not str(msg.get("content", "")).startswith("[system]"):
-                content = str(msg.get("content", ""))
-                if "## Problem" in content:
-                    problem_text = content.split("## Problem", 1)[1].split("## Hints")[0].strip()
-                break
+        # Use cached problem text if available; otherwise scan and cache.
+        if st.problem_text is None:
+            for msg in self.messages:
+                if msg.get("role") == "user" and not str(msg.get("content", "")).startswith("[system]"):
+                    content = str(msg.get("content", ""))
+                    if "## Problem" in content:
+                        text = content.split("## Problem", 1)[1].split("## Hints")[0].strip()
+                        if len(text) > 500:
+                            text = text[:500] + "..."
+                        st.problem_text = text
+                    break
 
-        if not problem_text:
+        if not st.problem_text:
             return
-        if len(problem_text) > 500:
-            problem_text = problem_text[:500] + "..."
 
         st.last_reanchor_turn = turn
         self.messages.append({
             "role": "user",
             "content": (
                 f"[system] REMINDER — The original bug you are fixing:\n"
-                f"{problem_text}\n\n"
+                f"{st.problem_text}\n\n"
                 "Stay focused on THIS bug. Do not fix unrelated issues."
             ),
         })
@@ -814,6 +823,9 @@ class Agent:
                     st.problem_files = _extract_problem_files(str(msg.get("content", "")))
                     break
 
+        _cached_perm_mode = self.config.permission_mode
+        _cached_schemas = openai_schemas(_cached_perm_mode)
+
         for turn in range(1, self.config.max_turns + 1):
             # Finish countdown: force-finish if the model keeps calling tools
             # after a test passed.
@@ -829,19 +841,17 @@ class Agent:
                 st.finish_countdown -= 1
 
             self.tool_ctx.permission_mode = self.config.permission_mode
-            schemas = openai_schemas(self.config.permission_mode)
+            if self.config.permission_mode != _cached_perm_mode:
+                _cached_perm_mode = self.config.permission_mode
+                _cached_schemas = openai_schemas(_cached_perm_mode)
+            schemas = _cached_schemas
 
             # Re-inject fresh system messages each turn.
             if not is_bench:
                 self._refresh_plan_status_message()
             self._refresh_notes_message()
 
-            # Free pre-pass: snip old tool results before LLM compaction.
-            # This may reduce estimated tokens enough to skip the expensive
-            # LLM-based compaction entirely.
-            snip_old_tool_results(self.messages)
-
-            # Layer 2 compaction + trim.
+            # Layer 2 compaction + trim (trim_history calls snip_old_tool_results).
             msg_count_before = len(self.messages)
             if getattr(self.client, "context_window", 0) > 0:
                 self.messages[:] = await compact_messages(
@@ -853,6 +863,8 @@ class Agent:
             self.messages[:] = trim_history(
                 self.messages, max_messages=self.config.max_history_messages
             )
+            # Reset persistence index after compaction/trim shrinks the list.
+            self._last_persisted_idx = len(self.messages)
 
             # After compaction/trim, inject a note about files already read
             # so the model doesn't blindly re-read them.
@@ -901,6 +913,9 @@ class Agent:
 
             # --- Compaction-resilient loop detection (bench/yolo only) ---
             # Build a key from all tool calls this turn and compare to previous.
+            # Skip when explore_blocked is active to avoid force-terminating
+            # on intentionally blocked retries (explore_blocked computed below).
+            explore_blocked = False
             if _is_constrained:
                 call_key = _call_key(completion.tool_calls)
                 if call_key == st.last_call_key:
@@ -1083,14 +1098,11 @@ class Agent:
                     outcome.get("plan_approved")
                     and self.config.permission_mode == "plan"
                 ):
-                    if self.display:
-                        self.display.stats.prompt_tokens = st.total_prompt_tokens
-                        self.display.stats.completion_tokens = st.completion_tokens
-                        self.display.summary(turn, time.monotonic() - start)
+                    self._sync_display_stats(st, turn)
                     plan = self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else {}
                     return self._build_result(
                         st, success=True,
-                        final_text=f"Plan approved: {plan.get('plan') or plan.get('problem', '')}".strip(),
+                        final_text=f"Plan approved: {plan.get('problem', '')}".strip(),
                         turn=turn,
                     )
 
@@ -1125,7 +1137,8 @@ class Agent:
                             }
                         )
                         self.consecutive_reads_without_recall = 0
-                        continue
+                        # Break the inner tool loop and restart the outer turn loop.
+                        break
 
             # Plan-mode investigation nudge.
             if self.config.permission_mode == "plan" and not is_bench:
@@ -1159,16 +1172,15 @@ class Agent:
                             return self._build_result(st, success=False, error=msg, turn=turn)
 
             # Phase tracking and budgets (bench/yolo).
-            phase_result = self._update_phase(st, dispatched_pairs)
+            phase_result = self._update_phase(st, dispatched_pairs, turn=turn)
             if isinstance(phase_result, TaskResult):
-                phase_result.turns_used = turn
                 return phase_result
 
             # Bench/yolo: if a test passed after edits, nudge agent to finish
             # and start a 2-turn countdown.
             if _is_constrained and st.test_passed_after_edit:
                 st.test_passed_after_edit = False  # consume the flag
-                st.finish_countdown = 2
+                st.finish_countdown = 1
                 self.messages.append(
                     {
                         "role": "user",
@@ -1226,9 +1238,7 @@ class Agent:
         msg = f"max turns ({self.config.max_turns}) reached"
         if self.display:
             self.display.warn(msg)
-            self.display.stats.prompt_tokens = st.total_prompt_tokens
-            self.display.stats.completion_tokens = st.completion_tokens
-            self.display.summary(self.config.max_turns, time.monotonic() - start)
+            self._sync_display_stats(st, self.config.max_turns)
         return self._build_result(st, success=False, error=msg, turn=self.config.max_turns)
 
     async def _handle_plan_approval(
@@ -1272,7 +1282,8 @@ class Agent:
 
     def _record_plan_evidence(self, tc: ToolCall, outcome: ToolResult) -> None:
         """Record tool outcome as plan evidence when an approved plan is active."""
-        ran_command = tc.name == "run_command" and outcome.data.get("exit_code") is not None
+        exit_code = outcome.data.get("exit_code")
+        ran_command = tc.name == "run_command" and exit_code is not None
         if not (outcome.success or ran_command):
             return
         if self.tool_ctx.plan is None or not self.tool_ctx.plan.approved:
@@ -1288,7 +1299,7 @@ class Agent:
             self.tool_ctx.pending_plan_evidence.append({
                 "kind": "run_command",
                 "command": str(tc.args.get("command", "")),
-                "exit_code": int(data.get("exit_code", 0)) if isinstance(data.get("exit_code"), int) else None,
+                "exit_code": int(exit_code) if isinstance(exit_code, int) else None,
                 "detail": str(data.get("stderr") or data.get("stdout") or "").strip()[:300],
             })
 
@@ -1422,7 +1433,7 @@ def _brief(tc: ToolCall) -> str:
     return ""
 
 
-_EXPLORE_TOOLS = frozenset({"read_file", "list_directory", "search_files", "glob_files", "recall"})
+_EXPLORE_TOOLS = frozenset({"read_file", "list_directory", "search_files", "glob_files"})
 _TEST_CMD_KEYWORDS = ("pytest", "unittest", "python -m test", "python -m pytest", "test_")
 
 

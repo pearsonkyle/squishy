@@ -56,8 +56,6 @@ def _format_tree(root: Node, prefix: str = "", is_last: bool = True) -> list[str
         is_child_last = i == len(children) - 1
         if root.kind == "repo":
             new_prefix = ""
-        elif root.kind == "dir":
-            new_prefix = f"{prefix}{'    ' if is_last else '│   '}"
         else:
             new_prefix = f"{prefix}{'    ' if is_last else '│   '}"
 
@@ -91,21 +89,19 @@ def _extract_key_symbols(index: Index, limit_per_file: int = 3) -> list[dict]:
     """Extract key classes and functions with their summaries."""
     symbols: list[dict] = []
 
+    # Build a {path: file_node} lookup to avoid O(N^2) walk
+    file_nodes: dict[str, Node] = {
+        n.path: n for n in index.root.walk() if n.kind == "file"
+    }
+
     for node in index.root.walk():
         if node.kind not in ("class", "function", "method"):
             continue
         if not node.summary:
             continue
 
-        # Get containing file info
-        file_node = None
-        for parent in index.root.walk():
-            if (
-                parent.kind == "file"
-                and node.path.startswith(parent.path)
-                and (not file_node or len(parent.path) > len(file_node.path))
-            ):
-                file_node = parent
+        # Get containing file info via exact path match
+        file_node = file_nodes.get(node.path)
 
         symbols.append({
             "name": node.name,
@@ -131,7 +127,7 @@ def _extract_key_symbols(index: Index, limit_per_file: int = 3) -> list[dict]:
     return result[:30]  # Overall limit
 
 
-def _generate_python_imports(index: Index) -> dict[str, list[str]]:
+def _generate_python_imports(index: Index, cwd: str) -> dict[str, list[str]]:
     """Extract import relationships for Python files."""
     imports: dict[str, list[str]] = defaultdict(list)
 
@@ -140,7 +136,7 @@ def _generate_python_imports(index: Index) -> dict[str, list[str]]:
             continue
 
         # Read file content
-        abs_path = os.path.join(os.getcwd(), node.path)
+        abs_path = os.path.join(cwd, node.path)
         try:
             with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
@@ -168,16 +164,19 @@ def _extract_summary(node: Node) -> str:
     return f"{node.kind} {node.name}"
 
 
-def generate_agents_md(index: Index, *, include_imports: bool = True) -> str:
+def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str = "") -> str:
     """Generate AGENTS.md content from an index.
 
     Args:
         index: The repo index to document
         include_imports: Include Python import relationships (default True)
+        cwd: Working directory for resolving file paths (defaults to os.getcwd())
 
     Returns:
         Markdown content for AGENTS.md
     """
+    if not cwd:
+        cwd = os.getcwd()
     lines: list[str] = []
 
     # Header
@@ -245,7 +244,7 @@ def generate_agents_md(index: Index, *, include_imports: bool = True) -> str:
     if include_imports:
         has_py = any(n.kind == "file" and n.path.endswith(".py") for n in index.root.walk())
         if has_py:
-            imports = _generate_python_imports(index)
+            imports = _generate_python_imports(index, cwd)
             if imports:
                 lines.append("## Imports")
                 lines.append("")
@@ -295,7 +294,7 @@ def save_agents_md(index: Index, cwd: str | os.PathLike[str]) -> Path:
     """
     from squishy.index.store import index_dir
 
-    content = generate_agents_md(index)
+    content = generate_agents_md(index, cwd=str(cwd))
     agents_path = index_dir(cwd) / "AGENTS.md"
     agents_path.write_text(content, encoding="utf-8")
     return agents_path

@@ -59,25 +59,34 @@ def _normalize_message(msg: dict[str, Any]) -> dict[str, Any]:
     """Normalize a message for storage.
 
     Converts tool_calls[].function.arguments from JSON strings to dicts
-    so the stored format matches trainer expectations.
+    so the stored format matches trainer expectations. Only copies when
+    modification is actually needed to avoid unnecessary allocations.
     """
+    tool_calls = msg.get("tool_calls")
+    if not tool_calls:
+        return msg
+
+    needs_copy = any(
+        isinstance((tc.get("function") or {}).get("arguments"), str)
+        for tc in tool_calls
+    )
+    if not needs_copy:
+        return msg
+
     out = dict(msg)
-    if "tool_calls" in out and out["tool_calls"]:
-        new_calls = []
-        for tc in out["tool_calls"]:
+    new_calls = []
+    for tc in tool_calls:
+        func = tc.get("function")
+        if isinstance(func, dict) and isinstance(func.get("arguments"), str):
             tc = dict(tc)
-            func = tc.get("function")
-            if isinstance(func, dict):
-                func = dict(func)
-                args = func.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        func["arguments"] = json.loads(args)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                tc["function"] = func
-            new_calls.append(tc)
-        out["tool_calls"] = new_calls
+            func = dict(func)
+            try:
+                func["arguments"] = json.loads(func["arguments"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+            tc["function"] = func
+        new_calls.append(tc)
+    out["tool_calls"] = new_calls
     return out
 
 
@@ -244,12 +253,9 @@ def export_training(
         messages[0] = {**messages[0], "tools": tools}
 
     # Ensure conversation ends with assistant message (trainer requirement).
-    # Drop trailing tool messages if needed.
-    while messages and messages[-1].get("role") not in ("assistant",):
-        if messages[-1].get("role") == "tool":
-            messages.pop()
-        else:
-            break
+    # Drop any trailing non-assistant messages (tool, user, system).
+    while messages and messages[-1].get("role") != "assistant":
+        messages.pop()
 
     return {"messages": messages}
 

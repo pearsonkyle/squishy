@@ -58,7 +58,7 @@ READONLY_SHELL_THREE_WORD = frozenset({
 })
 
 # Characters that can chain/redirect commands and escape the allowlist.
-_SHELL_METACHARS = ("|", ";", "&", ">", "<", "`", "$(")
+_SHELL_METACHARS = ("|", ";", "&", ">", "<", "`", "$(", "${", "\n", "\r")
 
 
 def is_readonly_shell(command: str) -> bool:
@@ -128,13 +128,15 @@ def check_permission(
     In plan mode, `run_command` is permitted only when its `command` is on the
     read-only allowlist.
     """
+    # MCP tools are always allowed (external capabilities).
+    if tool_name.startswith("mcp__"):
+        return True, ""
+
     allowed = get_allowed_tools(mode)
 
     if tool_name not in allowed:
         if mode == "plan":
             return False, "refused: plan mode is read-only"
-        if mode == "edits" and tool_name in SHELL_TOOLS:
-            return False, "prompt"
         return False, f"refused: tool {tool_name} not available in {mode} mode"
 
     # Plan-mode gating for run_command.

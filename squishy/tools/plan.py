@@ -80,7 +80,7 @@ async def _plan_task(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         for f in files_to_modify:
             display_lines.append(f"  ~ {f}")
 
-    display_text = "\n".join(line for line in display_lines if line is not None)
+    display_text = "\n".join(display_lines)
 
     return ToolResult(
         True,

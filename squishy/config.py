@@ -18,9 +18,10 @@ class Config:
         )
     )
     api_key: str = field(
+        repr=False,
         default_factory=lambda: os.environ.get(
             "SQUISHY_API_KEY", os.environ.get("OPENAI_API_KEY", "local")
-        )
+        ),
     )
     model: str = field(
         default_factory=lambda: os.environ.get("SQUISHY_MODEL", "local-model")

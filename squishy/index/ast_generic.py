@@ -135,7 +135,7 @@ def header_comment(source: str, ext: str) -> str:
             line = lines[i].strip()
             if not line.startswith(lang.line_comment):
                 break
-            out.append(line.lstrip(lang.line_comment).strip())
+            out.append(line.removeprefix(lang.line_comment).strip())
             i += 1
  
     return " ".join(s for s in out if s)[:400]

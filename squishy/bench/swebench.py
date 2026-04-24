@@ -18,11 +18,13 @@ is delegated to the upstream harness:
 from __future__ import annotations
  
 import asyncio
+import json as _json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any
- 
+
 from squishy.api import Squishy
 from squishy.bench.runner import BenchResult
 from squishy.errors import BenchError
@@ -42,6 +44,8 @@ async def prepare_workspace(instance: dict[str, Any], root: str | Path) -> Path:
     instance_id = instance["instance_id"]
     repo = instance["repo"]
     base_commit = instance["base_commit"]
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", base_commit):
+        raise BenchError(f"invalid base_commit (must be hex SHA): {base_commit!r}")
     dest = Path(root) / instance_id
  
     if (dest / ".git").exists():
@@ -149,7 +153,7 @@ async def capture_patch(workspace: Path, base_commit: str) -> str:
     """Return a unified diff of workspace changes since ``base_commit``."""
     await _git(["add", "-A"], cwd=workspace)
     rc, out, err = await _git(
-        ["diff", "--no-color", base_commit, "--"], cwd=workspace
+        ["diff", "--cached", "--no-color", base_commit, "--"], cwd=workspace
     )
     if rc != 0:
         raise BenchError(f"git diff failed: {err}")
@@ -269,7 +273,6 @@ def _extract_diagnostics(task_result: Any) -> dict[str, Any]:
                 func = tc.get("function", {})
                 if func.get("name") == "read_file":
                     try:
-                        import json as _json
                         args = _json.loads(func.get("arguments", "{}"))
                         path = args.get("path", "?")
                         read_paths[path] = read_paths.get(path, 0) + 1
@@ -315,7 +318,7 @@ async def _git(args: list[str], *, cwd: str | Path | None = None) -> tuple[int, 
     )
     stdout_b, stderr_b = await proc.communicate()
     return (
-        proc.returncode or 0,
+        proc.returncode if proc.returncode is not None else 0,
         stdout_b.decode("utf-8", errors="replace"),
         stderr_b.decode("utf-8", errors="replace"),
     )

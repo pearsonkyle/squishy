@@ -159,10 +159,10 @@ class Display:
         lines.append(f"[bold green]Solution:[/] {data.get('solution', '')}")
         lines.append("")
         lines.append("[bold yellow]Steps:[/]")
+        from squishy.plan_state import STATUS_ICONS
         for i, step in enumerate(data.get("steps", []), 1):
             desc = step if isinstance(step, str) else step.get("description", "")
             status = "" if isinstance(step, str) else step.get("status", "pending")
-            from squishy.plan_state import STATUS_ICONS
             raw_icon = STATUS_ICONS.get(status, "○")
             color = {"done": "green", "in-progress": "cyan", "skipped": "dim", "blocked": "red"}.get(status, "dim")
             status_icon = f"[{color}]{raw_icon}[/{color}]"

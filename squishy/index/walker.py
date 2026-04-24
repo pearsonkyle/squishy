@@ -71,10 +71,17 @@ def _gitignored(rel_posix: str, patterns: list[str]) -> bool:
     # Match against full relative path and each path segment.
     parts = rel_posix.split("/")
     for pat in patterns:
-        if fnmatch.fnmatch(rel_posix, pat):
-            return True
-        if any(fnmatch.fnmatch(p, pat) for p in parts):
-            return True
+        # fnmatch doesn't support **; strip leading **/ and match the
+        # remainder against the full path and each segment.
+        stripped = pat
+        while stripped.startswith("**/"):
+            stripped = stripped[3:]
+        candidates = [pat, stripped] if stripped != pat else [pat]
+        for p in candidates:
+            if fnmatch.fnmatch(rel_posix, p):
+                return True
+            if any(fnmatch.fnmatch(seg, p) for seg in parts):
+                return True
     return False
  
  

@@ -7,10 +7,12 @@ from __future__ import annotations
  
 import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
 from squishy.index.store import has_index
+from squishy.tools.fs import SKIP_DIRS
 
 MAX_HISTORY = 10  # system + first user + last 8 = 10
  
@@ -109,6 +111,7 @@ def build_system_prompt(
         project_block += f"Test: {project.test_command}\n"
 
     index_block = _index_header(cwd)
+    mcp_block = _mcp_block()
     instructions_block = load_agent_instructions(cwd)
     mode_block = _mode_block(mode, cwd)
     recall_rule = _recall_rule(cwd)
@@ -147,7 +150,7 @@ def build_system_prompt(
 
 ## Top-level files
 {', '.join(files) if files else '(empty)'}
-{index_block}{instructions_block}"""
+{index_block}{mcp_block}{instructions_block}"""
  
  
 _INSTRUCTION_SOURCES: tuple[tuple[str, str], ...] = (
@@ -285,6 +288,24 @@ def _mode_block(mode: str, cwd: str) -> str:
     )
 
 
+def _mcp_block() -> str:
+    """Return a system prompt section listing available MCP tools."""
+    try:
+        from squishy.mcp.tools import get_mcp_tools
+        tools = get_mcp_tools()
+    except Exception:
+        return ""
+    if not tools:
+        return ""
+    lines = [f"- `{t.name}`: {t.description}" for t in tools]
+    return (
+        "\n## MCP Tools\n"
+        "External tools available via MCP (Model Context Protocol):\n"
+        + "\n".join(lines) + "\n"
+        "Call these tools by name like any built-in tool.\n"
+    )
+
+
 def _index_header(cwd: str) -> str:
     """Return a compact, ~200-token block summarizing the cached repo index.
  
@@ -318,8 +339,7 @@ def _index_header(cwd: str) -> str:
     dir_counts.sort(key=lambda kv: -kv[1])
     top_dirs = ", ".join(f"{p} ({n})" for p, n in dir_counts[:5]) or "(flat)"
  
-    import time as _t
-    age_s = max(0.0, _t.time() - (meta.generated_at or 0.0))
+    age_s = max(0.0, time.time() - (meta.generated_at or 0.0))
     if age_s < 120:
         age = f"{int(age_s)}s"
     elif age_s < 7200:
@@ -339,7 +359,6 @@ def _index_header(cwd: str) -> str:
 def _top_level_files(cwd: str, limit: int = 50) -> list[str]:
     if not os.path.isdir(cwd):
         return []
-    from squishy.tools.fs import SKIP_DIRS
     out = []
     for name in sorted(os.listdir(cwd)):
         if name in SKIP_DIRS or name.startswith("."):
@@ -422,8 +441,8 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
 
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
-    remaining_budget = max_messages - len(system) - len(injected_msgs) - len(first_user)
-    tail = non_system[-remaining_budget:] if remaining_budget > 0 else []
+    remaining_budget = max(1, max_messages - len(system) - len(injected_msgs) - len(first_user))
+    tail = non_system[-remaining_budget:]
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
 
@@ -475,7 +494,14 @@ def find_compaction_split(
     target = int(total * keep_ratio)
     running = 0
     for i in range(len(messages) - 1, -1, -1):
-        running += _estimate_message_tokens([messages[i]])
+        m = messages[i]
+        content = m.get("content", "")
+        chars = len(content) if isinstance(content, str) else 0
+        for tc in m.get("tool_calls", []):
+            if isinstance(tc, dict):
+                func = tc.get("function", {})
+                chars += len(func.get("name", "")) + len(func.get("arguments", ""))
+        running += chars // 4
         if running >= target:
             return i
     return 0
@@ -540,6 +566,9 @@ async def compact_messages(
                 summary_parts.append(f"[{role}]: called {func.get('name', '?')}")
 
     old_text = "\n".join(summary_parts)
+    # Cap the text sent for summarization to avoid blowing up the compaction prompt.
+    if len(old_text) > 30_000:
+        old_text = old_text[:30_000] + "\n[... truncated for summarization ...]"
 
     # Summarize via LLM
     try:

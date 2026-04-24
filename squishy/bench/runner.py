@@ -89,7 +89,6 @@ async def run_batch(
     """
     sem = asyncio.Semaphore(concurrency)
     total = len(tasks)
-    results: list[BenchResult] = []
     completed = 0
     lock = asyncio.Lock()
  

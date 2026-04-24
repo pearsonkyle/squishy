@@ -39,9 +39,9 @@ def describe_staleness(cwd: str | os.PathLike[str]) -> str:
     for rel_path, stored_hash in meta.file_hashes.items():
         p = root / rel_path
         try:
-            mtime = p.stat().st_mtime
-            size = p.stat().st_size
-            
+            s = p.stat()
+            mtime = s.st_mtime
+
             # Flag files that are newer than index + grace
             if mtime > generated + STALE_GRACE_SECONDS:
                 stale_files.append(f"{rel_path} (changed {int(mtime - generated)}s ago)")

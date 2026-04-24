@@ -24,15 +24,33 @@ SEARCH_CAP = 200
  
 def _resolve(path: str, cwd: str) -> str:
     if os.path.isabs(path):
-        return path
+        return os.path.normpath(path)
     return os.path.normpath(os.path.join(cwd, path))
 
 
-def _invalidate_read_cache(ctx: ToolContext, path: str) -> None:
-    """Drop any cached reads for `path` after a mutating write/edit."""
-    for key in [k for k in ctx.files_read_meta if k[0] == path]:
+def _safe_resolve(path: str, cwd: str) -> tuple[str, str | None]:
+    """Resolve *path* relative to *cwd* and verify it stays inside *cwd*.
+
+    Returns ``(abs_path, None)`` on success, or ``("", error_msg)`` when the
+    resolved path escapes the working directory.
+    """
+    abs_path = _resolve(path, cwd)
+    real_abs = os.path.realpath(abs_path)
+    real_cwd = os.path.realpath(cwd)
+    try:
+        os.path.commonpath([real_abs, real_cwd])
+    except ValueError:
+        return "", f"path outside working directory: {path}"
+    if not (real_abs == real_cwd or real_abs.startswith(real_cwd + os.sep)):
+        return "", f"path outside working directory: {path}"
+    return abs_path, None
+
+
+def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
+    """Drop any cached reads for *abs_path* after a mutating write/edit."""
+    for key in [k for k in ctx.files_read_meta if k[0] == abs_path]:
         del ctx.files_read_meta[key]
-    ctx.files_read.pop(path, None)
+    ctx.files_read.pop(abs_path, None)
 
 
 def _collect_match_context(
@@ -62,7 +80,9 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = args.get("path")
     if not isinstance(path, str):
         return ToolResult(False, error="`path` is required (string)")
-    abs_path = _resolve(path, ctx.working_dir)
+    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    if err:
+        return ToolResult(False, error=err)
     if not os.path.isfile(abs_path):
         return ToolResult(False, error=f"file not found: {path}")
 
@@ -70,7 +90,7 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     limit = args.get("limit")
 
     # Hard cap: refuse after too many reads of the same path.
-    path_count = ctx.files_read_count.get(path, 0)
+    path_count = ctx.files_read_count.get(abs_path, 0)
     if path_count >= 5:
         return ToolResult(
             False,
@@ -86,7 +106,7 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     # cached content with an unmistakable marker so the LLM realizes it has
     # already seen this file. This prevents the model from re-requesting
     # reads after earlier turns were trimmed from history.
-    cache_key = (path, offset, limit)
+    cache_key = (abs_path, offset, limit)
     prior = ctx.files_read_meta.get(cache_key)
     if prior is not None:
         return ToolResult(
@@ -124,8 +144,8 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         "returned_lines": len(sliced),
     }
     # Track total reads per path (regardless of offset/limit).
-    ctx.files_read_count[path] = ctx.files_read_count.get(path, 0) + 1
-    path_reads = ctx.files_read_count[path]
+    ctx.files_read_count[abs_path] = ctx.files_read_count.get(abs_path, 0) + 1
+    path_reads = ctx.files_read_count[abs_path]
 
     data: dict[str, Any] = {
         "path": path,
@@ -152,7 +172,9 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     content = args.get("content")
     if not isinstance(path, str) or not isinstance(content, str):
         return ToolResult(False, error="`path` and `content` are required strings")
-    abs_path = _resolve(path, ctx.working_dir)
+    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    if err:
+        return ToolResult(False, error=err)
 
     # Hard guard: write_file is for creating NEW files only. Existing files
     # must be modified with edit_file — full rewrites via write_file are the
@@ -176,11 +198,12 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(content)
 
-    _invalidate_read_cache(ctx, path)
+    _invalidate_read_cache(ctx, abs_path)
+    encoded = content.encode("utf-8")
     return ToolResult(
         True,
-        data={"path": path, "bytes": len(content.encode("utf-8"))},
-        display=f"wrote {len(content.encode('utf-8'))} bytes",
+        data={"path": path, "bytes": len(encoded)},
+        display=f"wrote {len(encoded)} bytes",
     )
  
  
@@ -189,17 +212,18 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     old_str = args.get("old_str")
     new_str = args.get("new_str")
     replace_all = bool(args.get("replace_all", False))
-    if not all(isinstance(x, str) for x in (path, old_str, new_str)):
+    if not isinstance(path, str) or not isinstance(old_str, str) or not isinstance(new_str, str):
         return ToolResult(False, error="`path`, `old_str`, `new_str` are required strings")
-    assert isinstance(path, str) and isinstance(old_str, str) and isinstance(new_str, str)
  
-    abs_path = _resolve(path, ctx.working_dir)
+    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    if err:
+        return ToolResult(False, error=err)
     if not os.path.isfile(abs_path):
         return ToolResult(False, error=f"file not found: {path}")
- 
+
     with open(abs_path, encoding="utf-8", errors="replace") as f:
         text = f.read()
- 
+
     count = text.count(old_str)
     if count == 0:
         # Stage 1: try stripping trailing whitespace from each line
@@ -208,11 +232,16 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         stripped_count = text_stripped.count(old_stripped)
 
         if stripped_count == 1:
+            # Find the match position in the stripped text, then map it
+            # back to the original text so we only modify the matched region
+            # (preserving trailing whitespace in unrelated lines).
+            match_start = text_stripped.index(old_stripped)
+            match_end = match_start + len(old_stripped)
             new_stripped = "\n".join(line.rstrip() for line in new_str.split("\n"))
-            new_text = text_stripped.replace(old_stripped, new_stripped, 1)
+            new_text = text_stripped[:match_start] + new_stripped + text_stripped[match_end:]
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
-            _invalidate_read_cache(ctx, path)
+            _invalidate_read_cache(ctx, abs_path)
             old_lines = len(old_str.splitlines()) or 1
             new_lines = len(new_str.splitlines()) or 1
             return ToolResult(
@@ -310,7 +339,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(new_text)
 
-    _invalidate_read_cache(ctx, path)
+    _invalidate_read_cache(ctx, abs_path)
     old_lines = len(old_str.splitlines()) or 1
     new_lines = len(new_str.splitlines()) or 1
     return ToolResult(
@@ -331,10 +360,12 @@ async def _list_directory(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = args.get("path", ".")
     if not isinstance(path, str):
         return ToolResult(False, error="`path` must be a string")
-    abs_path = _resolve(path, ctx.working_dir)
+    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    if err:
+        return ToolResult(False, error=err)
     if not os.path.isdir(abs_path):
         return ToolResult(False, error=f"not a directory: {path}")
- 
+
     entries = []
     for name in sorted(os.listdir(abs_path)):
         if name in SKIP_DIRS or name.startswith("."):
@@ -357,9 +388,11 @@ async def _search_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     search_path = args.get("path", ".")
     glob = args.get("glob")
  
-    abs_path = (
-        _resolve(search_path, ctx.working_dir) if isinstance(search_path, str) else ctx.working_dir
+    abs_path, err = _safe_resolve(
+        search_path if isinstance(search_path, str) else ".", ctx.working_dir
     )
+    if err:
+        return ToolResult(False, error=err)
     if not os.path.exists(abs_path):
         return ToolResult(False, error=f"path not found: {search_path}")
  
@@ -580,7 +613,9 @@ async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not isinstance(pattern, str):
         return ToolResult(False, error="`pattern` is required (string glob)")
     path = args.get("path", ".")
-    abs_path = _resolve(path if isinstance(path, str) else ".", ctx.working_dir)
+    abs_path, err = _safe_resolve(path if isinstance(path, str) else ".", ctx.working_dir)
+    if err:
+        return ToolResult(False, error=err)
     if not os.path.isdir(abs_path):
         return ToolResult(False, error=f"not a directory: {path}")
 

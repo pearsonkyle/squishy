@@ -19,13 +19,12 @@ from prompt_toolkit.key_binding import KeyBindings
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display, Stats
+from squishy.display import Display, MODE_COLORS, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
 from squishy.plan_state import PlanState
 from squishy.session import (
     create_session,
-    export_training,
     export_training_to_file,
     list_sessions,
     load_messages,
@@ -33,7 +32,6 @@ from squishy.session import (
 )
 from squishy.tools.base import Tool
 
-MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
 EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
  
  
@@ -149,6 +147,7 @@ async def _amain() -> None:
         max_tokens=cfg.max_tokens,
         request_timeout=args.request_timeout,
         max_retries=args.max_retries,
+        thinking=cfg.thinking,
     )
 
     try:
@@ -159,14 +158,21 @@ async def _amain() -> None:
         # Falls back to 0 (no % shown) for endpoints that don't expose it.
         display.stats.context_window = client.context_window
 
-        if not await client.health():
-            display.error(f"Cannot reach OpenAI endpoint at {cfg.base_url}.")
-            display.info("Start LM Studio ('lms server start') or vLLM, then re-run.")
-            sys.exit(1)
- 
         if cfg.auto_init:
             await _run_init(cfg, client, display, summaries=cfg.index_summaries)
- 
+
+        # Initialize MCP servers (non-blocking).
+        try:
+            from squishy.mcp.tools import initialize_mcp
+            mcp_errors = await asyncio.to_thread(initialize_mcp)
+            for server, mcp_err in mcp_errors.items():
+                if mcp_err:
+                    display.warn(f"[mcp] {server}: {mcp_err}")
+                else:
+                    display.info(f"[mcp] {server}: connected")
+        except Exception as e:
+            display.warn(f"[mcp] init failed: {e}")
+
         async def prompt_fn(tool: Tool, args_: dict) -> bool:
             try:
                 reply = await asyncio.to_thread(input, "  approve? [y/N] ")
@@ -374,6 +380,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
                 "  /exit-plan                — exit plan mode with detailed plan\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
+                "  /mcp [list|reload|add|remove] — manage MCP servers\n"
                 "  /session                  — show current session UUID\n"
                 "  /sessions                 — list recent sessions\n"
                 "  /export [UUID]            — export session as training JSONL\n"
@@ -426,6 +433,10 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
                 display.info(f"mode → {rest}")
             else:
                 display.warn("usage: /mode plan|edits|yolo")
+            continue
+        if line.startswith("/mcp"):
+            _, _, mcp_rest = line.partition(" ")
+            await _handle_mcp_command(mcp_rest.strip(), display)
             continue
         if line == "/session":
             sid = current_agent.session_id
@@ -495,6 +506,64 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             continue
 
         await _auto_execute_plan(current_agent, cfg, display, timeout)
+
+
+async def _handle_mcp_command(rest: str, display: Display) -> None:
+    """Handle /mcp slash command."""
+    from squishy.mcp.tools import reload_mcp, get_connect_errors
+    from squishy.mcp.client import get_mcp_manager
+    from squishy.mcp.config import add_server_to_user_config, remove_server_from_user_config
+
+    parts = rest.split() if rest else []
+    subcmd = parts[0].lower() if parts else "list"
+
+    if subcmd == "reload":
+        display.info("[mcp] reloading...")
+        errors = await asyncio.to_thread(reload_mcp)
+        for server, err in errors.items():
+            if err:
+                display.warn(f"  {server}: {err}")
+            else:
+                display.info(f"  {server}: connected")
+    elif subcmd == "add":
+        if len(parts) < 3:
+            display.warn("usage: /mcp add <name> <command> [args...]")
+            return
+        name = parts[1]
+        command = parts[2]
+        cmd_args = parts[3:]
+        raw: dict = {"type": "stdio", "command": command}
+        if cmd_args:
+            raw["args"] = cmd_args
+        add_server_to_user_config(name, raw)
+        display.info(f"[mcp] added '{name}' — run /mcp reload to connect")
+    elif subcmd == "remove":
+        if len(parts) < 2:
+            display.warn("usage: /mcp remove <name>")
+            return
+        name = parts[1]
+        if remove_server_from_user_config(name):
+            display.info(f"[mcp] removed '{name}'")
+            await asyncio.to_thread(reload_mcp)
+        else:
+            display.warn(f"[mcp] server '{name}' not found")
+    else:
+        # Default: list servers and tools
+        mgr = get_mcp_manager()
+        servers = mgr.list_servers()
+        if not servers:
+            display.info("[mcp] no servers configured")
+            display.info("  add servers in ~/.squishy/mcp.json or .mcp.json")
+            return
+        display.info(f"[mcp] {len(servers)} server(s):")
+        total_tools = 0
+        for client in servers:
+            display.info(f"  {client.status_line()}")
+            for tool in client._tools:
+                display.info(f"    - {tool.qualified_name}: {tool.description[:60]}")
+                total_tools += 1
+        if total_tools:
+            display.info(f"  total: {total_tools} MCP tool(s)")
 
 
 async def _run_init(cfg: Config, client: Client, display: Display, *, summaries: bool) -> None:

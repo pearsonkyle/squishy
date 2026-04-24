@@ -123,8 +123,11 @@ def _smart_cap_pytest(raw: bytes, cap: int) -> tuple[str, bool]:
 
     result = "\n".join(kept)
     if len(result) > cap:
-        # Still too large — fall back to generic tail truncation
-        return _cap_output(raw, cap)
+        # Still too large — fall back to generic tail truncation.
+        # Use the already-decoded text to avoid re-decoding raw.
+        dropped = len(text) - cap
+        marker = f"…<truncated {dropped} bytes of head>\n"
+        return marker + text[-cap:], True
 
     # Prepend a marker if we dropped content
     dropped = len(text) - len(result)
@@ -132,7 +135,7 @@ def _smart_cap_pytest(raw: bytes, cap: int) -> tuple[str, bool]:
         marker = f"…<{dropped} chars of passing output trimmed>\n"
         result = marker + result
 
-    return result, True
+    return result, len(result) > cap
 
 
 def _docker_available() -> bool:
@@ -144,7 +147,14 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not isinstance(command, str):
         return ToolResult(False, error="`command` is required (string)")
     timeout = float(args.get("timeout") or DEFAULT_TIMEOUT)
-    cwd = args.get("cwd") or ctx.working_dir
+    raw_cwd = args.get("cwd")
+    if raw_cwd and isinstance(raw_cwd, str):
+        from squishy.tools.fs import _safe_resolve
+        cwd, cwd_err = _safe_resolve(raw_cwd, ctx.working_dir)
+        if cwd_err:
+            return ToolResult(False, error=cwd_err)
+    else:
+        cwd = ctx.working_dir
  
     sandboxed = ctx.use_sandbox and _docker_available()
 
@@ -200,7 +210,7 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     stderr_text, stderr_truncated = _cap_output(stderr_b, OUTPUT_CAP_STDERR - len(hint))
     stderr_text = stderr_text + hint
 
-    exit_code = proc.returncode or 0
+    exit_code = proc.returncode if proc.returncode is not None else 0
     success = exit_code == 0
     data: dict[str, Any] = {
         "command": command,

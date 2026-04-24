@@ -78,6 +78,7 @@ class Client:
     request_timeout: float = 120.0
     max_retries: int = 4
     context_window: int = 0  # discovered from endpoint; 0 = unknown (no % display)
+    thinking: bool = False
     """Our own retry count. The underlying SDK retries are disabled to avoid double-counting."""
  
     _client: AsyncOpenAI = field(init=False, repr=False)
@@ -164,22 +165,22 @@ class Client:
         except TRANSIENT_ERRORS as e:  # retries exhausted (reraise=True path)
             raise LLMError(f"transient error after {self.max_retries} retries: {e}") from e
  
-        raise LLMError("unreachable")  # pragma: no cover
- 
     def _build_create_kwargs(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        return dict(
+        kwargs = dict(
             model=self.model,
             messages=messages,
             tools=tools or None,
             tool_choice="auto" if tools else None,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+        )
+        if self.thinking:
             # Enable Qwen3 thinking mode — the model uses the `reasoning` field
             # for chain-of-thought, which improves tool-call formatting.
-            extra_body={"chat_template_kwargs": {"enable_thinking": True}},
-        )
+            kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": True}}
+        return kwargs
 
     async def _complete_sync(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]

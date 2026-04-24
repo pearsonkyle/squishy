@@ -102,7 +102,9 @@ class LocalTerminalBackend:
             workspace.mkdir(parents=True, exist_ok=True)
 
         for relpath, content in task.files.items():
-            full = workspace / relpath
+            full = (workspace / relpath).resolve()
+            if not full.is_relative_to(workspace.resolve()):
+                raise ValueError(f"path traversal in task files: {relpath}")
             full.parent.mkdir(parents=True, exist_ok=True)
             full.write_text(content, encoding="utf-8")
         return workspace
@@ -211,11 +213,18 @@ async def run_terminal_task(
 
     prediction["error_class"] = _classify_error(task_result, verified)
 
+    if not verified:
+        error_msg = f"verify failed: {verify_output[:200]}"
+    elif not task_result.success:
+        error_msg = task_result.error or ""
+    else:
+        error_msg = ""
+
     return BenchResult(
         task_id=task.id,
         success=task_result.success and verified,
         prediction=prediction,
-        error="" if verified else f"verify failed: {verify_output[:200]}",
+        error=error_msg,
         elapsed_s=task_result.elapsed_s,
         artifacts=artifacts,
     )
@@ -294,14 +303,16 @@ def load_tasks(path: str | Path) -> list[TerminalTask]:
  
  
 def _snapshot_workspace(workspace: Path) -> list[dict[str, Any]]:
-    return [
-        {
-            "path": str(path.relative_to(workspace)),
-            "size": path.stat().st_size,
-        }
-        for path in sorted(workspace.rglob("*"))
-        if path.is_file()
-    ]
+    result: list[dict[str, Any]] = []
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            size = path.stat().st_size
+        except OSError:
+            continue
+        result.append({"path": str(path.relative_to(workspace)), "size": size})
+    return result
 
 
 async def _run_shell(cmd: str, *, cwd: Path, timeout: float = 120.0) -> ShellResult:
@@ -325,7 +336,7 @@ async def _run_shell(cmd: str, *, cwd: Path, timeout: float = 120.0) -> ShellRes
         )
     return ShellResult(
         command=cmd,
-        exit_code=proc.returncode or 0,
+        exit_code=proc.returncode if proc.returncode is not None else 0,
         stdout=stdout_b.decode("utf-8", errors="replace"),
         stderr=stderr_b.decode("utf-8", errors="replace"),
     )

@@ -70,6 +70,7 @@ class Squishy:
             max_tokens=self.max_tokens,
             request_timeout=self.request_timeout,
             max_retries=self.max_retries,
+            thinking=self.thinking,
         )
 
     async def __aenter__(self) -> Squishy:

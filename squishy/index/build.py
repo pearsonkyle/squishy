@@ -200,13 +200,12 @@ async def _build_index_async(
 
     # Stage 2: Process files with bounded concurrency
     semaphore = asyncio.Semaphore(concurrency)
-    
-    async def _process_with_semaphore(task):
-        async with semaphore:
-            return await task
 
-    tasks = [_process_file_record(rec, prior_files) for rec in records]
-    results = await asyncio.gather(*[_process_with_semaphore(t) for t in tasks])
+    async def _bounded(rec: FileRecord) -> tuple[Node | None, int]:
+        async with semaphore:
+            return await _process_file_record(rec, prior_files)
+
+    results = await asyncio.gather(*[_bounded(rec) for rec in records])
 
     # Collect results
     file_nodes: list[Node] = []

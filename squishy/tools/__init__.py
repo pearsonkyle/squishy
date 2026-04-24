@@ -80,7 +80,7 @@ def openai_schemas(mode: str | None = None) -> list[dict[str, object]]:
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
     allowed = _get_allowed_tools(mode)
-    return [t.openai_schema() for t in ALL_TOOLS if t.name in allowed]
+    return [t.openai_schema() for t in ALL_TOOLS if t.name in allowed or t.name.startswith("mcp__")]
 
 
 __all__ = [

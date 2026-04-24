@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import hashlib
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -149,6 +150,7 @@ class Summarizer:
         summary = await self._ask(prompt, FILE_SUMMARY_MAX_TOKENS)
         if summary:
             node.summary = _first_line(summary)[:240]
+            node.last_summarized = time.time()
             self._files_summarized += 1
  
     async def _summarize_dirs(self, node: Node) -> None:
@@ -174,7 +176,7 @@ class Summarizer:
         # Update hash and regenerate summary if needed
         node.summary_hash = current_hash
         
-        if node.summary or self._budget_exhausted:
+        if self._budget_exhausted:
             return
         child_summaries = []
         for c in node.children[:8]:

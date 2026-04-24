@@ -15,6 +15,8 @@ import json
 import shlex
 from typing import Any
 
+from squishy.tools import REGISTRY
+
 
 def assess_response(
     tool_calls: list[Any],
@@ -90,10 +92,10 @@ def build_correction(reason: str) -> str:
     """Build a corrective system message based on the failure reason."""
     if reason.startswith("unknown_tool:"):
         tool_name = reason.split(":", 1)[1]
+        available = ", ".join(REGISTRY.keys())
         return (
             f"Tool '{tool_name}' does not exist. Available tools are: "
-            "read_file, write_file, edit_file, list_directory, search_files, "
-            "glob_files, run_command, show_diff, save_note, recall. "
+            f"{available}. "
             "Use one of these instead."
         )
 
