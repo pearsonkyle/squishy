@@ -12,6 +12,8 @@ import contextlib
 import os
 import sys
 
+from dotenv import load_dotenv
+
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
@@ -136,6 +138,9 @@ def run() -> None:
  
 
 async def _amain() -> None:
+    # Load .env file before any Config instantiation so env vars are available.
+    load_dotenv()
+
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
     display = Display()

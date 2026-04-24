@@ -280,25 +280,39 @@ class Agent:
             log.debug("session finish failed for %s", self.session_id, exc_info=True)
 
     def _refresh_plan_status_message(self) -> None:
-        """Drop any prior plan-status system message; append a fresh one."""
+        """Drop any prior plan-status system message; insert a fresh one after the primary system prompt.
+
+        System messages must remain at the beginning of the messages array
+        to satisfy LLM API requirements (e.g. "System message must be at
+        the beginning").
+        """
         if any(is_plan_status_message(m) for m in self.messages):
             self.messages[:] = [m for m in self.messages if not is_plan_status_message(m)]
         plan = self.tool_ctx.plan
         if plan is None:
             return
-        self.messages.append(
-            {"role": "system", "content": render_plan_status(plan)}
-        )
+        # Insert right after the primary system prompt (index 0/1) so the
+        # LLM always sees system messages first.
+        insert_idx = 1 if self.messages and self.messages[0].get("role") == "system" else 0
+        self.messages.insert(insert_idx, {"role": "system", "content": render_plan_status(plan)})
 
     def _refresh_notes_message(self) -> None:
-        """Drop any prior notes system message; append a fresh one."""
+        """Drop any prior notes system message; insert a fresh one after the primary system prompt.
+
+        System messages must remain at the beginning of the messages array
+        to satisfy LLM API requirements (e.g. "System message must be at
+        the beginning").
+        """
         if any(is_notes_message(m) for m in self.messages):
             self.messages[:] = [m for m in self.messages if not is_notes_message(m)]
         if not self.tool_ctx.notes:
             return
         rendered = render_notes(self.tool_ctx.notes)
         if rendered:
-            self.messages.append({"role": "system", "content": rendered})
+            # Insert right after the primary system prompt (index 0/1) so the
+            # LLM always sees system messages first.
+            insert_idx = 1 if self.messages and self.messages[0].get("role") == "system" else 0
+            self.messages.insert(insert_idx, {"role": "system", "content": rendered})
 
     # ------------------------------------------------------------------
     # Sub-concerns extracted from _run_loop

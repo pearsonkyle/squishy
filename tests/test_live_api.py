@@ -7,17 +7,27 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Load .env so tests pick up the user's configured base_url/model
+load_dotenv()
+
 from squishy.api import Squishy
 from squishy.plan_state import load_plan
+
+
+def _env(key: str, default: str) -> str:
+    """Read an environment variable from .env, falling back to *default*."""
+    return os.environ.get(key, default)
 
 
 async def test_health_check():
     """Verify the API can connect to the LLM server."""
     print("\n=== Test: Health Check ===")
     async with Squishy(
-        model="qwen/qwen3.6-35b-a3b",
-        base_url="http://localhost:1234/v1",
-        api_key="local",
+        model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+        base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+        api_key=_env("SQUISHY_API_KEY", "local"),
     ) as sq:
         healthy = await sq.health()
         print(f"Server healthy: {healthy}")
@@ -31,9 +41,9 @@ async def test_yolo_mode_simple_write():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
             max_turns=10,
         ) as sq:
@@ -60,9 +70,9 @@ async def test_yolo_mode_file_edit():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
             max_turns=10,
         ) as sq:
@@ -88,9 +98,9 @@ async def test_plan_mode_read_only():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="plan",
             max_turns=10,
         ) as sq:
@@ -115,9 +125,9 @@ async def test_edits_mode_with_plan():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
             max_turns=15,
         ) as sq:
@@ -149,9 +159,9 @@ async def test_plan_mode_step_tracking():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
             max_turns=15,
         ) as sq:
@@ -193,9 +203,9 @@ def divide(a, b):
 """)
 
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
             max_turns=15,
         ) as sq:
@@ -225,9 +235,9 @@ async def test_streaming_callback():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
             max_turns=5,
         ) as sq:
@@ -252,9 +262,9 @@ async def test_multiple_turns():
 
         # Turn 1: Create a file
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
             max_turns=10,
         ) as sq:
@@ -266,9 +276,9 @@ async def test_multiple_turns():
 
         # Turn 2: Modify the file
         async with Squishy(
-            model="qwen/qwen3.6-35b-a3b",
-            base_url="http://localhost:1234/v1",
-            api_key="local",
+            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
+            api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
             max_turns=10,
         ) as sq:

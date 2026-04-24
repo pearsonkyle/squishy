@@ -6,13 +6,16 @@ Subcommands:
 """
  
 from __future__ import annotations
- 
+
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
  
 from squishy.api import Squishy
 from squishy.bench.runner import BenchResult, PredictionWriter, run_batch
@@ -162,5 +165,7 @@ def _progress(result: BenchResult, done: int, total: int) -> None:
  
  
 def run() -> None:
+    # Load .env file so env vars are available for any Config usage.
+    load_dotenv()
     args = _parse()
     sys.exit(asyncio.run(_amain(args)))
