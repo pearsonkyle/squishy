@@ -26,14 +26,13 @@ from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.index.store import has_index
 from squishy.plan_state import (
     clear_plan,
-    is_plan_status_message,
     load_plan,
     render_plan_status,
     save_plan,
 )
 from squishy.quality import assess_response, build_correction
 from squishy.tools import PromptFn, ToolContext, ToolResult, REGISTRY, dispatch, openai_schemas
-from squishy.tools.scratchpad import is_notes_message, render_notes
+from squishy.tools.scratchpad import render_notes
 
 log = logging.getLogger("squishy.agent")
 
@@ -279,40 +278,60 @@ class Agent:
         except Exception:  # noqa: BLE001
             log.debug("session finish failed for %s", self.session_id, exc_info=True)
 
-    def _refresh_plan_status_message(self) -> None:
-        """Drop any prior plan-status system message; insert a fresh one after the primary system prompt.
+    def _refresh_system_injections(self) -> None:
+        """Merge notes and plan-status into the primary system message (index 0).
 
-        System messages must remain at the beginning of the messages array
-        to satisfy LLM API requirements (e.g. "System message must be at
-        the beginning").
+        Some LLM APIs (e.g. Ollama) only accept a single system message at
+        position 0.  Rather than injecting separate system messages, we append
+        notes and plan-status blocks to the existing system prompt so there is
+        always exactly one system message.
+
+        This method is idempotent: it drops any prior injected blocks before
+        re-adding them so content doesn't accumulate across turns.
         """
-        if any(is_plan_status_message(m) for m in self.messages):
-            self.messages[:] = [m for m in self.messages if not is_plan_status_message(m)]
+        if not self.messages:
+            return
+
+        # Strip any prior injected blocks (plan-status and notes) from the
+        # system message content so we don't accumulate duplicates across turns.
+        content = self.messages[0].get("content", "")
+        # Remove </notes>...</notes> block
+        content = re.sub(
+            r"\n<notes>.*?</notes>",
+            "",
+            content,
+            flags=re.DOTALL,
+        )
+        # Remove plan-status block (starts with "## Plan Status")
+        content = re.sub(
+            r"\n## Plan Status[\s\S]*?(?=\n\n|\Z)",
+            "",
+            content,
+        )
+        # Clean up trailing whitespace/newlines
+        content = re.sub(r"\n{3,}", "\n\n", content).rstrip()
+
         plan = self.tool_ctx.plan
-        if plan is None:
-            return
-        # Insert right after the primary system prompt (index 0/1) so the
-        # LLM always sees system messages first.
-        insert_idx = 1 if self.messages and self.messages[0].get("role") == "system" else 0
-        self.messages.insert(insert_idx, {"role": "system", "content": render_plan_status(plan)})
+        has_notes = bool(self.tool_ctx.notes)
+        has_plan = plan is not None
 
-    def _refresh_notes_message(self) -> None:
-        """Drop any prior notes system message; insert a fresh one after the primary system prompt.
-
-        System messages must remain at the beginning of the messages array
-        to satisfy LLM API requirements (e.g. "System message must be at
-        the beginning").
-        """
-        if any(is_notes_message(m) for m in self.messages):
-            self.messages[:] = [m for m in self.messages if not is_notes_message(m)]
-        if not self.tool_ctx.notes:
+        if not has_notes and not has_plan:
+            # Still update the message in case we stripped content
+            self.messages[0]["content"] = content
             return
-        rendered = render_notes(self.tool_ctx.notes)
-        if rendered:
-            # Insert right after the primary system prompt (index 0/1) so the
-            # LLM always sees system messages first.
-            insert_idx = 1 if self.messages and self.messages[0].get("role") == "system" else 0
-            self.messages.insert(insert_idx, {"role": "system", "content": rendered})
+
+        # Build the injection blocks
+        injection_parts: list[str] = []
+        if has_plan:
+            injection_parts.append(render_plan_status(plan))
+        if has_notes:
+            injection_parts.append(render_notes(self.tool_ctx.notes))
+
+        if not injection_parts:
+            return
+
+        injection_block = "\n\n".join(injection_parts)
+        self.messages[0]["content"] = content + "\n\n" + injection_block
 
     # ------------------------------------------------------------------
     # Sub-concerns extracted from _run_loop
@@ -862,8 +881,7 @@ class Agent:
 
             # Re-inject fresh system messages each turn.
             if not is_bench:
-                self._refresh_plan_status_message()
-            self._refresh_notes_message()
+                self._refresh_system_injections()
 
             # Layer 2 compaction + trim (trim_history calls snip_old_tool_results).
             msg_count_before = len(self.messages)
