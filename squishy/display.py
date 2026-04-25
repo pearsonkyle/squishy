@@ -7,6 +7,8 @@ import math
 from dataclasses import dataclass, field
 
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
@@ -67,6 +69,11 @@ class Display:
         self.console = Console()
         self.stats = Stats()
         self.model: str = ""
+        # Streaming markdown state
+        self._stream_buffer: str = ""
+        self._live_render: Markdown | None = None
+        self._live: Live | None = None
+        self._use_live: bool = False
 
     def banner(self, base_url: str, model: str) -> None:
         self.model = model
@@ -135,8 +142,49 @@ class Display:
         if s.strip():
             self.console.print(Text(s))
  
+    # Streaming markdown state (initialized in __init__)
+
     def streaming_text_chunk(self, s: str) -> None:
-        self.console.out(s, end="", highlight=False)
+        """Accumulate text chunks and render as streaming markdown.
+        
+        Uses Rich Live for smooth incremental rendering that updates
+        in place rather than printing each chunk below previous output.
+        """
+        self._stream_buffer += s
+        
+        if not self._use_live:
+            # First chunk: start Live rendering
+            self._use_live = True
+            self._live_render = Markdown(self._stream_buffer)
+            self._live = Live(
+                self._live_render,
+                console=self.console,
+                refresh_per_second=12,
+            )
+            self._live.start()
+        else:
+            # Update existing Live display
+            if self._live_render is not None:
+                self._live_render.update(Markdown(self._stream_buffer))
+            if self._live is not None:
+                self._live.refresh()
+
+    def flush_streaming_text(self) -> None:
+        """Finalize streaming text output. Call when a prose response completes.
+        
+        Stops the Live display and prints the final rendered markdown
+        as a permanent output.
+        """
+        if self._live is not None:
+            # Stop Live and render final state permanently
+            if self._live_render is not None:
+                self.console.print()  # blank line before
+                self.console.print(self._live_render)
+            self._live.stop()
+            self._live = None
+            self._live_render = None
+        self._stream_buffer = ""
+        self._use_live = False
  
     def info(self, s: str) -> None:
         self.console.print(f"[dim]{s}[/]")

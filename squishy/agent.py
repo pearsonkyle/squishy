@@ -352,6 +352,8 @@ class Agent:
         if in_plan and not is_bench and plan is None:
             if completion.text:
                 self.messages.append(_prose_msg(completion.text, completion.reasoning))
+                if self.display:
+                    self.display.flush_streaming_text()
             if st.plan_nudges >= self.config.max_plan_nudges:
                 msg = "plan-mode run finished without producing a plan_task"
                 if self.display:
@@ -383,6 +385,8 @@ class Agent:
         ):
             if completion.text:
                 self.messages.append(_prose_msg(completion.text, completion.reasoning))
+                if self.display:
+                    self.display.flush_streaming_text()
             remaining = "; ".join(
                 f"{i + 1}. {step.description}"
                 for i, step in enumerate(plan.unresolved_steps()[:4])
@@ -439,6 +443,9 @@ class Agent:
         st.prose_completions += 1
         if completion.text:
             self.messages.append(_prose_msg(completion.text, completion.reasoning))
+            # Flush streaming markdown display
+            if self.display:
+                self.display.flush_streaming_text()
         self._sync_display_stats(st, turn)
         return self._build_result(
             st, success=True, final_text=completion.text, turn=turn,

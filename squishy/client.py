@@ -222,6 +222,7 @@ class Client:
         stream: AsyncIterator[Any] = await self._client.chat.completions.create(
             **self._build_create_kwargs(messages, tools),
             stream=True,
+            stream_options={"include_usage": True},
         )
  
         text_parts: list[str] = []

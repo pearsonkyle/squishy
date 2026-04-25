@@ -122,7 +122,7 @@ def _bottom_toolbar(cfg: Config, display: Display):
         return FormattedText([
             ("", " "),
             (f"class:{color}", f"[{cfg.permission_mode}]"),
-            ("", f"  {token_str}  |  shift-tab: cycle mode  |  ctrl-d: exit"),
+            ("", f"  {token_str}  |  shift-tab: cycle mode  |  ctrl-j: newline  |  ctrl-d: exit"),
         ])
 
     return _render

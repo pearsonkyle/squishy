@@ -799,7 +799,7 @@ async def test_glob_files_tool():
         # Create a directory structure
         (working_dir / "src").mkdir()
         (working_dir / "tests").mkdir()
-        (working_dir / "src").write_text("main.py", "print('hello')\n")
+        (working_dir / "src" / "main.py").write_text("print('hello')\n")
         (working_dir / "src").joinpath("utils.py").write_text("def util(): pass\n")
         (working_dir / "tests").joinpath("test_main.py").write_text("def test_main(): pass\n")
         (working_dir / "tests").joinpath("test_utils.py").write_text("def test_util(): pass\n")
