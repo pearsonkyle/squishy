@@ -152,20 +152,31 @@ class TestDynamicRegistration:
 # ── tool_restrictions.py ─────────────────────────────────────────────────────
 
 class TestMCPPermissions:
-    def test_mcp_tools_allowed_in_all_modes(self):
+    def test_mcp_tools_gated_by_mode(self):
         from squishy.tool_restrictions import check_permission
 
-        for mode in ("plan", "edits", "yolo", "bench"):
+        # bench/yolo: auto-approve.
+        for mode in ("bench", "yolo"):
             allowed, reason = check_permission("mcp__ctx7__resolve", mode)
             assert allowed is True, f"MCP tool rejected in {mode} mode"
             assert reason == ""
+
+        # edits: requires user prompt (same as other mutating tools).
+        allowed, reason = check_permission("mcp__ctx7__resolve", "edits")
+        assert allowed is False
+        assert reason == "prompt"
+
+        # plan: refused outright (read-only mode).
+        allowed, reason = check_permission("mcp__ctx7__resolve", "plan")
+        assert allowed is False
+        assert "plan mode" in reason
 
 
 # ── tools/__init__.py schemas ────────────────────────────────────────────────
 
 class TestSchemaInclusion:
-    def test_mcp_tools_in_schemas_all_modes(self):
-        from squishy.tools import ALL_TOOLS, REGISTRY, openai_schemas
+    def test_mcp_tools_in_schemas_excludes_plan(self):
+        from squishy.tools import openai_schemas
 
         mcp_tool = MCPTool(
             server_name="test",
@@ -178,10 +189,15 @@ class TestSchemaInclusion:
         _register_tools_into_squishy([tool])
 
         try:
-            for mode in ("plan", "edits", "yolo", "bench"):
+            # MCP tools are exposed in non-plan modes.
+            for mode in ("edits", "yolo", "bench"):
                 schemas = openai_schemas(mode)
                 names = [s["function"]["name"] for s in schemas]
                 assert "mcp__test__schema_test" in names, f"MCP tool missing from {mode} schemas"
+            # ...but hidden in plan mode so the model can't even propose them.
+            schemas = openai_schemas("plan")
+            names = [s["function"]["name"] for s in schemas]
+            assert "mcp__test__schema_test" not in names
         finally:
             _register_tools_into_squishy([])
 

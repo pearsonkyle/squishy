@@ -20,6 +20,9 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next"}
 SEARCH_TIMEOUT = 15.0
 SEARCH_CAP = 200
+# Env vars that are safe to forward to ripgrep. Everything else (API keys,
+# AWS creds, etc.) is dropped so a malicious pattern can't reach them.
+_RG_ALLOWED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
  
  
 def _resolve(path: str, cwd: str) -> str:
@@ -179,7 +182,13 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     # Hard guard: write_file is for creating NEW files only. Existing files
     # must be modified with edit_file — full rewrites via write_file are the
     # main tool-misuse pathology observed in small-model coding sessions.
-    if os.path.isfile(abs_path):
+    # Use O_CREAT|O_EXCL ("x" mode) so the existence check and create are
+    # atomic: a concurrent writer can't sneak a symlink in between checks.
+    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+    try:
+        with open(abs_path, "x", encoding="utf-8") as f:
+            f.write(content)
+    except FileExistsError:
         return ToolResult(
             False,
             error=(
@@ -193,10 +202,6 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 "Do NOT retry write_file."
             ),
         )
-
-    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(content)
 
     _invalidate_read_cache(ctx, abs_path)
     encoded = content.encode("utf-8")
@@ -409,10 +414,14 @@ async def _rg_search(
     cmd = [rg, "-n", "--no-heading", "-S", pattern, abs_path]
     if isinstance(glob, str):
         cmd.extend(["-g", glob])
+    # Forward only a minimal env subset so ripgrep config / locale settings
+    # aren't bypassed, but local secrets (API keys, tokens) aren't exposed
+    # to a subprocess that can be steered by model-controlled patterns.
+    rg_env = {k: v for k, v in os.environ.items() if k in _RG_ALLOWED_ENV}
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            env=os.environ.copy(),
+            env=rg_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )

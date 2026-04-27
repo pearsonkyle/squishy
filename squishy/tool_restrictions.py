@@ -128,8 +128,21 @@ def check_permission(
     In plan mode, `run_command` is permitted only when its `command` is on the
     read-only allowlist.
     """
-    # MCP tools are always allowed (external capabilities).
+    # MCP tools (external capabilities). They have arbitrary side effects
+    # (an MCP server can expose anything — bash, file writes, network), so
+    # they're gated by the same permission ladder as built-in mutating tools:
+    #   - plan: refused (read-only mode shouldn't let arbitrary external
+    #     servers execute commands; users can switch modes if they trust them)
+    #   - edits: prompt for user approval, like other mutating tools
+    #   - bench/yolo: auto-approve
     if tool_name.startswith("mcp__"):
+        if mode == "plan":
+            return False, (
+                "refused: MCP tools are not available in plan mode. "
+                "Switch to edits/yolo mode if you want to invoke external servers."
+            )
+        if mode == "edits":
+            return False, "prompt"
         return True, ""
 
     allowed = get_allowed_tools(mode)

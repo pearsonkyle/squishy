@@ -45,18 +45,12 @@ def assess_response(
         if isinstance(args, dict) and args.get("_tool_arg_error"):
             return False, f"malformed_args:{name}"
 
-    # 3. Repeated identical tool call (same name + same args as previous turn)
-    if tool_calls:
-        prev_calls = _extract_prev_tool_calls(messages)
-        for tc in tool_calls:
-            name = getattr(tc, "name", "")
-            args = getattr(tc, "args", {})
-            args_json = _stable_json(args)
-            for pname, pargs_json in prev_calls:
-                if name == pname and args_json == pargs_json:
-                    return False, "repeated_tool_call"
-
-    # 4. Excessive same-file re-reads (same path+offset+limit 3+ times in last 4 turns)
+    # 3. Excessive same-file re-reads. Checked before the generic
+    # repeated_tool_call so the model gets the more specific correction
+    # message ("use save_note / recall instead of re-reading"). The current
+    # assistant message is already appended when this runs, so count >= 2
+    # means: this is the second time the same path+offset+limit appears in
+    # the last 8 assistant turns.
     for tc in tool_calls:
         name = getattr(tc, "name", "")
         if name == "read_file":
@@ -67,8 +61,21 @@ def assess_response(
                 args.get("limit"),
             )
             count = _count_recent_reads(messages, read_key, lookback=8)
-            if count >= 2:  # already read twice, this would be the 3rd
+            if count >= 2:
                 return False, "excessive_reread"
+
+    # 4. Repeated identical tool call. Looks at the last 3 assistant turns
+    # (not just the immediately previous one) so ABAB ping-pong patterns are
+    # caught: foo(a) → foo(b) → foo(a) gets flagged on the second foo(a).
+    if tool_calls:
+        prev_calls = _extract_prev_tool_calls(messages, lookback=3)
+        for tc in tool_calls:
+            name = getattr(tc, "name", "")
+            args = getattr(tc, "args", {})
+            args_json = _stable_json(args)
+            for pname, pargs_json in prev_calls:
+                if name == pname and args_json == pargs_json:
+                    return False, "repeated_tool_call"
 
     # 5. Repeated run_command (same command in last 3 assistant turns)
     for tc in tool_calls:
@@ -143,32 +150,40 @@ def build_correction(reason: str) -> str:
 
 
 
-def _extract_prev_tool_calls(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    """Extract (name, normalized_args_json) pairs from the SECOND most recent
-    assistant tool calls (skipping the current turn which was just appended).
+def _extract_prev_tool_calls(
+    messages: list[dict[str, Any]], lookback: int = 3,
+) -> list[tuple[str, str]]:
+    """Extract (name, normalized_args_json) pairs from up to ``lookback``
+    assistant turns preceding the current one.
+
+    The current turn's assistant message has already been appended by the time
+    this runs, so we skip the most recent assistant-with-tool-calls entry.
 
     Args are re-serialized via ``_stable_json`` so key ordering matches the
     caller's comparison in ``assess_response``.
     """
-    found_first = False
+    skipped_current = False
+    collected = 0
+    out: list[tuple[str, str]] = []
     for msg in reversed(messages):
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            if not found_first:
-                found_first = True
-                continue  # skip the current turn
-            out = []
-            for tc in msg["tool_calls"]:
-                func = tc.get("function", {})
-                name = func.get("name", "")
-                raw = func.get("arguments", "{}")
-                # Normalize: parse then re-serialize with sorted keys.
-                try:
-                    parsed = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    parsed = raw
-                out.append((name, _stable_json(parsed)))
-            return out
-    return []
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        if not skipped_current:
+            skipped_current = True
+            continue
+        for tc in msg["tool_calls"]:
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            raw = func.get("arguments", "{}")
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                parsed = raw
+            out.append((name, _stable_json(parsed)))
+        collected += 1
+        if collected >= lookback:
+            break
+    return out
 
 
 def _stable_json(d: dict[str, Any] | Any) -> str:

@@ -97,18 +97,11 @@ def build_system_prompt(
     project: ProjectInfo,
     thinking: bool = False,
     mode: str = "edits",
+    task_type: str = "coding",
 ) -> str:
     files = _top_level_files(cwd)
 
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
-
-    project_block = f"Language: {project.language}\n"
-    if project.framework:
-        project_block += f"Framework: {project.framework}\n"
-    if project.build_command:
-        project_block += f"Build: {project.build_command}\n"
-    if project.test_command:
-        project_block += f"Test: {project.test_command}\n"
 
     index_block = _index_header(cwd)
     mcp_block = _mcp_block()
@@ -116,18 +109,77 @@ def build_system_prompt(
     mode_block = _mode_block(mode, cwd)
     recall_rule = _recall_rule(cwd)
 
-    return f"""You are squishy, a local coding assistant that edits files and runs commands to complete the user's task.
+    if task_type == "general":
+        # Non-coding workflows: the working directory is treated as a notes /
+        # scratch / data folder. Build/test commands and "verify with tests"
+        # framing are dropped; save_note is highlighted as the way to record
+        # progress that survives history compaction.
+        role_line = (
+            "You are squishy, a general-purpose local assistant. The working directory "
+            "is a scratch / notes / data folder — not necessarily a code project. Use "
+            "the tools to research, organize, and produce whatever the user asks for: "
+            "notes, lists, plans, datasets, deck builds, research summaries."
+        )
+        rules_block = (
+            "## Rules\n"
+            "- Read existing files before editing them.\n"
+            "- `write_file` is for creating NEW files only. Use `edit_file` for existing files.\n"
+            "- Use relative paths. Working directory is already set.\n"
+            "- Use `save_note` to record findings, decisions, candidates, partial results. "
+            "Notes survive across long conversations even after older messages are trimmed.\n"
+            "- When you finish the user's task, respond with a plain text summary "
+            "(no tool call).\n"
+            "- Do not re-read a file you have already read with the same range. Use what "
+            "you have.\n"
+            f"{recall_rule}"
+        )
+        project_section = (
+            "## Working directory\n"
+            f"{cwd}\n\n"
+            "## Top-level files\n"
+            f"{', '.join(files) if files else '(empty)'}\n"
+        )
+    else:
+        role_line = (
+            "You are squishy, a local coding assistant that edits files and runs "
+            "commands to complete the user's task."
+        )
+        project_block = f"Language: {project.language}\n"
+        if project.framework:
+            project_block += f"Framework: {project.framework}\n"
+        if project.build_command:
+            project_block += f"Build: {project.build_command}\n"
+        if project.test_command:
+            project_block += f"Test: {project.test_command}\n"
+        rules_block = (
+            "## Rules\n"
+            "- Read files before editing them.\n"
+            "- `write_file` is for creating NEW files only. It will be refused on any "
+            "existing file. Always use `edit_file` for existing files.\n"
+            "- Use relative paths. Working directory is already set.\n"
+            "- Verify your work with `run_command` (run the tests or the program itself) "
+            "after making changes.\n"
+            "- Explore thoroughly when fixing bugs or implementing features - it's better "
+            "to understand the codebase than to guess.\n"
+            "- When you finish the user's task, respond with plain text summarizing what "
+            "you did (no tool call).\n"
+            "- Do not re-read a file you have already read in this conversation unless "
+            "you need a different line range. Use what you have.\n"
+            f"{recall_rule}"
+        )
+        project_section = (
+            "## Project\n"
+            f"{project_block}"
+            "## Working directory\n"
+            f"{cwd}\n\n"
+            "## Top-level files\n"
+            f"{', '.join(files) if files else '(empty)'}\n"
+        )
+
+    return f"""{role_line}
 
 {thinking_line}
-## Rules
-- Read files before editing them.
-- `write_file` is for creating NEW files only. It will be refused on any existing file. Always use `edit_file` for existing files.
-- Use relative paths. Working directory is already set.
-- Verify your work with `run_command` (run the tests or the program itself) after making changes.
-- Explore thoroughly when fixing bugs or implementing features - it's better to understand the codebase than to guess.
-- When you finish the user's task, respond with plain text summarizing what you did (no tool call).
-- Do not re-read a file you have already read in this conversation unless you need a different line range. Use what you have.
-{recall_rule}
+{rules_block}
 
 ## File References
 - Users can reference files in their input using `@filename` syntax.
@@ -143,14 +195,7 @@ def build_system_prompt(
 - This keeps the user informed of progress through their task.
 
 {mode_block}
-## Project
-{project_block}
-## Working directory
-{cwd}
-
-## Top-level files
-{', '.join(files) if files else '(empty)'}
-{index_block}{mcp_block}{instructions_block}"""
+{project_section}{index_block}{mcp_block}{instructions_block}"""
  
  
 _INSTRUCTION_SOURCES: tuple[tuple[str, str], ...] = (

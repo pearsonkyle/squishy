@@ -43,6 +43,7 @@ class Squishy:
     use_sandbox: bool = False
     sandbox_image: str = "python:3.11-slim"
     thinking: bool = False
+    task_type: str = "coding"
     max_consecutive_errors: int = 3
     max_plan_nudges: int = 4
     max_plan_investigation_turns: int = 4

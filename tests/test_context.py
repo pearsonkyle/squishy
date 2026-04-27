@@ -37,6 +37,28 @@ def test_build_system_prompt_includes_project_info(tmp_path):
     assert "python" in prompt.lower()
     assert "flask" in prompt.lower()
     assert "read files before editing" in prompt.lower()
+
+
+def test_build_system_prompt_general_task_type_drops_coding_framing(tmp_path):
+    """In task_type='general' the prompt should not push the model toward
+    edit_file / run_command / tests, and should highlight save_note instead."""
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\ndependencies = ["flask"]\n')
+    info = detect_project(str(tmp_path))
+    prompt = build_system_prompt(str(tmp_path), info, task_type="general").lower()
+    # No "verify with run_command / tests" framing.
+    assert "verify your work" not in prompt
+    assert "tests or the program itself" not in prompt
+    # No coding-assistant framing or framework/test-command leakage.
+    assert "coding assistant" not in prompt
+    assert "flask" not in prompt  # framework block is suppressed
+    # save_note is highlighted as the progress signal.
+    assert "save_note" in prompt
+
+
+def test_build_system_prompt_default_is_coding(tmp_path):
+    info = detect_project(str(tmp_path))
+    prompt = build_system_prompt(str(tmp_path), info).lower()
+    assert "coding assistant" in prompt
  
  
 def test_trim_history_preserves_system_and_first_user():

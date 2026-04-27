@@ -97,6 +97,9 @@ class _LoopState:
     env_fix_files: set[str] = field(default_factory=set)
     problem_files: set[str] = field(default_factory=set)
     env_error_count: int = 0
+    # Last turn we emitted the goal-drift nudge. Used as a cooldown so
+    # repeated env errors after a nudge can't spam the agent every turn.
+    env_nudge_turn: int = -10
     # Failed edit tracking.
     edit_failures_per_file: dict[str, int] = field(default_factory=dict)
     total_edit_failures: int = 0
@@ -141,6 +144,7 @@ class Agent:
             project,
             self.config.thinking,
             self.config.permission_mode,
+            getattr(self.config, "task_type", "coding"),
         )
         self.messages.append(
             {
@@ -528,6 +532,11 @@ class Agent:
 
     def _apply_stuck_detection(self, st: _LoopState, is_bench: bool) -> None:
         """Track file-mutation progress and inject stuck nudges in bench mode."""
+        # The "no edits = stuck" heuristic only applies to coding work.
+        # General tasks make progress through notes, searches, and external
+        # tool calls — pushing them toward edit_file would be wrong.
+        if getattr(self.config, "task_type", "coding") == "general":
+            return
         made_progress = (
             len(st.files_created) > st.prior_created_len
             or len(st.files_edited) > st.prior_edited_len
@@ -589,6 +598,10 @@ class Agent:
         Returns a TaskResult to force-finish, or None to continue.
         """
         if self.config.permission_mode not in ("bench", "yolo"):
+            return None
+        # Phase machine assumes an explore→fix→verify code-bug workflow.
+        # Skip it entirely for general (non-coding) tasks.
+        if getattr(self.config, "task_type", "coding") == "general":
             return None
 
         had_edit = False
@@ -726,7 +739,7 @@ class Agent:
             })
 
     def _check_goal_drift(
-        self, st: _LoopState, tc: ToolCall, outcome: dict[str, Any],
+        self, st: _LoopState, tc: ToolCall, outcome: dict[str, Any], turn: int,
     ) -> None:
         """Detect when the agent is fixing environmental issues instead of the bug."""
         if self.config.permission_mode not in ("bench", "yolo"):
@@ -752,8 +765,14 @@ class Agent:
             (len(st.env_fix_files) >= 2 and st.env_error_count >= 2)
             or st.env_error_count >= 3
         )
+        # Cooldown: don't re-fire the goal-drift nudge within 5 turns of the
+        # last one. The previous behaviour reset env_error_count to 0 each
+        # time, which let it re-accumulate and nudge every couple of turns.
+        if should_nudge and (turn - st.env_nudge_turn) < 5:
+            return
         if should_nudge:
-            st.env_error_count = 0  # reset to avoid spam
+            st.env_error_count = 0
+            st.env_nudge_turn = turn
             self.messages.append({
                 "role": "user",
                 "content": (
@@ -1082,7 +1101,7 @@ class Agent:
 
                 # Test failure nudge (bench/yolo).
                 self._inject_test_failure_nudge(st, tc, outcome)
-                self._check_goal_drift(st, tc, outcome)
+                self._check_goal_drift(st, tc, outcome, turn)
                 self._track_edit_failure(st, tc, outcome)
 
                 if outcome["success"]:
@@ -1216,10 +1235,15 @@ class Agent:
                 return phase_result
 
             # Bench/yolo: if a test passed after edits, nudge agent to finish
-            # and start a 2-turn countdown.
+            # and start a multi-turn countdown. We keep more than one turn so a
+            # model that emits one stray tool call after passing isn't
+            # immediately force-finished while it could still emit a clean
+            # prose summary. Also reset consecutive_errors so a flaky follow-up
+            # call doesn't flip success=False after a verified fix.
             if _is_constrained and st.test_passed_after_edit:
                 st.test_passed_after_edit = False  # consume the flag
-                st.finish_countdown = 1
+                st.finish_countdown = 2
+                st.consecutive_errors = 0
                 self.messages.append(
                     {
                         "role": "user",
@@ -1395,8 +1419,12 @@ class Agent:
         self._append_tool_result(tc, message=outcome.to_message())
 
         # Semantic anchoring: tag important tool results so they survive
-        # history trimming.
+        # history trimming. The signals depend on task_type — for coding
+        # tasks "successful edit" is the canonical progress signal; for
+        # general tasks save_note/recall results matter more because there
+        # may be no edits at all.
         if self.messages and self.messages[-1].get("role") == "tool":
+            task_type = getattr(self.config, "task_type", "coding")
             should_anchor = (
                 (tc.name == "run_command" and not outcome.success)
                 or (tc.name == "edit_file" and outcome.success)
@@ -1404,6 +1432,20 @@ class Agent:
                 or (tc.name == "read_file" and outcome.success
                     and self.tool_ctx.files_read_count.get(str(tc.args.get("path", "")), 0) <= 1)
             )
+            if task_type == "general":
+                # Non-coding work makes progress through notes and lookups.
+                # Without these anchors a deck-build or research session
+                # would get all of its real work compacted away.
+                should_anchor = should_anchor or (
+                    tc.name == "save_note" and outcome.success
+                ) or (
+                    tc.name == "recall" and outcome.success
+                    and outcome.data.get("count", 0) > 0
+                ) or (
+                    # External / MCP tool successes (web fetches, API calls,
+                    # etc.) are usually the whole point of a research task.
+                    tc.name.startswith("mcp__") and outcome.success
+                )
             if should_anchor:
                 self.messages[-1]["_squishy_anchor"] = True
 
@@ -1473,7 +1515,25 @@ def _brief(tc: ToolCall) -> str:
 
 
 _EXPLORE_TOOLS = frozenset({"read_file", "list_directory", "search_files", "glob_files"})
-_TEST_CMD_KEYWORDS = ("pytest", "unittest", "python -m test", "python -m pytest", "test_")
+# Polyglot test-runner detection. Anything containing one of these substrings
+# is treated as a test invocation by `_is_test_command`. We match substrings
+# (rather than first-token equality) so wrappers like `make test`,
+# `npm run test`, `python -m pytest` etc. all count.
+_TEST_CMD_KEYWORDS = (
+    # Python
+    "pytest", "unittest", "python -m test", "python -m pytest", "tox", "nox",
+    # JS / TS
+    "jest", "vitest", "mocha", "jasmine", "playwright test", "cypress run",
+    "npm test", "npm run test", "yarn test", "pnpm test", "pnpm run test",
+    # Rust / Go / Java / Ruby / .NET / Elixir / PHP / Haskell
+    "cargo test", "go test", "mvn test", "gradle test", "./gradlew test",
+    "rspec", "minitest", "rake test", "dotnet test", "mix test",
+    "phpunit", "pest", "stack test", "ctest", "ninja test", "bazel test",
+    # Generic wrappers
+    "make test", "just test",
+    # Bare prefix used by legacy harnesses
+    "test_",
+)
 
 
 def _is_test_command(cmd: str) -> bool:
@@ -1499,17 +1559,40 @@ def _extract_problem_files(text: str) -> set[str]:
     Returns a set of lowercased partial paths (e.g., ``{'sympy/core/power.py',
     'astropy/modeling/separable.py'}``).  Used for goal-drift heuristics — does
     not need to be perfectly accurate.
+
+    Paths containing traversal segments (``..``) or absolute/home prefixes are
+    rejected: these can't legitimately appear as project-relative paths and a
+    crafted problem statement could otherwise inject sensitive paths into the
+    drift heuristic.
     """
     paths: set[str] = set()
     for m in _PY_PATH_RE.finditer(text):
-        paths.add(m.group(1).lower())
+        candidate = m.group(1).lower()
+        if _is_safe_problem_path(candidate):
+            paths.add(candidate)
     for m in _MODULE_RE.finditer(text):
         parts = m.group(1).split(".")
         # module.submodule.name -> module/submodule/name.py + module/submodule.py
-        paths.add("/".join(parts).lower() + ".py")
+        full = "/".join(parts).lower() + ".py"
+        if _is_safe_problem_path(full):
+            paths.add(full)
         if len(parts) > 2:
-            paths.add("/".join(parts[:-1]).lower() + ".py")
+            parent = "/".join(parts[:-1]).lower() + ".py"
+            if _is_safe_problem_path(parent):
+                paths.add(parent)
     return paths
+
+
+def _is_safe_problem_path(p: str) -> bool:
+    """Reject paths that escape the project root or look like absolute paths."""
+    if not p:
+        return False
+    if p.startswith(("/", "~")):
+        return False
+    # ".." anywhere in the path string would let crafted problem text inject
+    # paths like ../../etc/passwd.py into goal-drift comparisons.
+    parts = p.replace("\\", "/").split("/")
+    return ".." not in parts
 
 
 def _call_key(tool_calls: list[ToolCall]) -> str:

@@ -66,6 +66,26 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--resume", metavar="UUID", help="Resume a previous session by UUID")
     p.add_argument("--session-dir", help="Session storage directory (env SQUISHY_SESSION_DIR)")
     p.add_argument("--no-sessions", action="store_true", help="Disable session persistence")
+    p.add_argument(
+        "--task-type",
+        choices=("coding", "general"),
+        default=None,
+        help=(
+            "'coding' (default) keeps SWE-bench-shaped behaviour; 'general' "
+            "uses a generic-assistant prompt and treats save_note/recall as "
+            "progress signals (env SQUISHY_TASK_TYPE)."
+        ),
+    )
+    # Advanced agent-loop tuning. These were defined in Config but had no CLI
+    # surface, which made bench experiments require monkey-patching.
+    p.add_argument("--max-explore-turns", type=int, default=None,
+                   help="Bench/yolo: turns spent reading before edits are forced")
+    p.add_argument("--max-fix-verify-cycles", type=int, default=None,
+                   help="Bench/yolo: edit→test cycles before the loop is broken")
+    p.add_argument("--max-stuck-turns", type=int, default=None,
+                   help="Bench: turns without file mutations before nudging")
+    p.add_argument("--max-consecutive-errors", type=int, default=None,
+                   help="Tool failures in a row before stopping")
     return p.parse_args(argv)
  
  
@@ -103,6 +123,16 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.session_dir = args.session_dir
     if args.no_sessions:
         cfg.save_sessions = False
+    if args.task_type:
+        cfg.task_type = args.task_type
+    if args.max_explore_turns is not None:
+        cfg.max_explore_turns = args.max_explore_turns
+    if args.max_fix_verify_cycles is not None:
+        cfg.max_fix_verify_cycles = args.max_fix_verify_cycles
+    if args.max_stuck_turns is not None:
+        cfg.max_stuck_turns = args.max_stuck_turns
+    if args.max_consecutive_errors is not None:
+        cfg.max_consecutive_errors = args.max_consecutive_errors
     return cfg
  
  

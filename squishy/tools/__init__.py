@@ -76,11 +76,19 @@ def openai_schemas(mode: str | None = None) -> list[dict[str, object]]:
     When `mode` is None, all tools are returned (backwards compatibility).
     When `mode` is set, only tools permitted in that mode are exposed — so the
     model never sees `write_file`/`edit_file` in plan mode, etc.
+
+    MCP tools are exposed in every mode except ``plan``. Plan mode is meant
+    to be read-only and external MCP servers can have arbitrary side effects,
+    so we hide them from the schema as well as rejecting them at dispatch.
     """
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
     allowed = _get_allowed_tools(mode)
-    return [t.openai_schema() for t in ALL_TOOLS if t.name in allowed or t.name.startswith("mcp__")]
+    expose_mcp = mode != "plan"
+    return [
+        t.openai_schema() for t in ALL_TOOLS
+        if t.name in allowed or (expose_mcp and t.name.startswith("mcp__"))
+    ]
 
 
 __all__ = [

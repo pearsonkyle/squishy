@@ -62,14 +62,31 @@ def test_assess_malformed_args():
 
 
 def test_assess_repeated_tool_call():
-    registry = {"read_file": object()}
-    # The function skips the first (most recent) assistant msg in messages,
-    # treating it as "the current turn". So we need the previous turn's
-    # assistant msg PLUS a "current turn" assistant msg in the messages list.
-    prev_msg = _assistant_msg_with_calls([("read_file", {"path": "foo.py"})])
-    current_msg = _assistant_msg_with_calls([("read_file", {"path": "foo.py"})])
+    # Use a non-read tool so excessive_reread (which is checked first for
+    # specificity) doesn't pre-empt repeated_tool_call. The function skips
+    # the most recent assistant msg, treating it as "the current turn".
+    registry = {"search_files": object()}
+    prev_msg = _assistant_msg_with_calls([("search_files", {"pattern": "TODO"})])
+    current_msg = _assistant_msg_with_calls([("search_files", {"pattern": "TODO"})])
     messages = [prev_msg, {"role": "tool", "content": "ok"}, current_msg]
-    tc = FakeToolCall(name="read_file", args={"path": "foo.py"})
+    tc = FakeToolCall(name="search_files", args={"pattern": "TODO"})
+    ok, reason = assess_response([tc], messages, registry)
+    assert ok is False
+    assert reason == "repeated_tool_call"
+
+
+def test_assess_repeated_tool_call_abab():
+    """ABAB ping-pong: foo(a) → foo(b) → foo(a) should flag on the second foo(a)."""
+    registry = {"search_files": object()}
+    messages = [
+        _assistant_msg_with_calls([("search_files", {"pattern": "TODO"})]),
+        {"role": "tool", "content": "ok"},
+        _assistant_msg_with_calls([("search_files", {"pattern": "FIXME"})]),
+        {"role": "tool", "content": "ok"},
+        # Current turn — repeats the FIRST call, not the immediately-previous one
+        _assistant_msg_with_calls([("search_files", {"pattern": "TODO"})]),
+    ]
+    tc = FakeToolCall(name="search_files", args={"pattern": "TODO"})
     ok, reason = assess_response([tc], messages, registry)
     assert ok is False
     assert reason == "repeated_tool_call"

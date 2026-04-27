@@ -32,6 +32,23 @@ async def test_write_file_rejects_any_existing_file(ctx, tmp_path):
     assert "edit_file" in r.error
 
 
+async def test_write_file_does_not_overwrite_via_dangling_symlink(ctx, tmp_path):
+    """Regression for the TOCTOU fix: even if a symlink exists at the target,
+    write_file must refuse rather than silently following it. The atomic 'x'
+    open mode makes this race-free."""
+    import os
+    target = tmp_path / "outside.txt"
+    target.write_text("original")
+    link = tmp_path / "link.txt"
+    os.symlink(target, link)
+
+    r = await write_file.run({"path": "link.txt", "content": "overwritten"}, ctx)
+    assert not r.success
+    assert "already exists" in r.error
+    # The original file behind the symlink was not modified.
+    assert target.read_text() == "original"
+
+
 async def test_edit_file_unique_match(ctx):
     await write_file.run({"path": "app.py", "content": "def a():\n    pass\n"}, ctx)
     r = await edit_file.run({"path": "app.py", "old_str": "def a()", "new_str": "def b()"}, ctx)
