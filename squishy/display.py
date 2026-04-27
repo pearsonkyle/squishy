@@ -163,11 +163,12 @@ class Display:
             )
             self._live.start()
         else:
-            # Update existing Live display
-            if self._live_render is not None:
-                self._live_render.update(Markdown(self._stream_buffer))
+            # Update existing Live display with a fresh Markdown renderable.
+            # Markdown is immutable, so replace it and call Live.update()
+            # (Markdown has no .update() method — that's a Live method).
+            self._live_render = Markdown(self._stream_buffer)
             if self._live is not None:
-                self._live.refresh()
+                self._live.update(self._live_render)
 
     def flush_streaming_text(self) -> None:
         """Finalize streaming text output. Call when a prose response completes.
