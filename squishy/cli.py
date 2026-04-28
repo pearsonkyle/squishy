@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
 
 from squishy.agent import Agent
 from squishy.client import Client
@@ -134,8 +135,25 @@ def _build_config(args: argparse.Namespace) -> Config:
     if args.max_consecutive_errors is not None:
         cfg.max_consecutive_errors = args.max_consecutive_errors
     return cfg
- 
- 
+
+
+# Style used for all inline confirmation prompts so typed text is always visible.
+_CONFIRM_STYLE = Style.from_dict({"": "bold"})
+
+
+async def _ask(prompt_text: str) -> str:
+    """Show a confirmation prompt with explicit styling so typed text is visible.
+
+    Uses prompt_toolkit's async prompt rather than bare ``input()`` to avoid
+    terminal-state conflicts when Rich Live rendering has just been active.
+    """
+    ps: PromptSession[str] = PromptSession(style=_CONFIRM_STYLE)
+    try:
+        return await ps.prompt_async(prompt_text)
+    except (EOFError, KeyboardInterrupt):
+        raise
+
+
 def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
@@ -210,7 +228,7 @@ async def _amain() -> None:
 
         async def prompt_fn(tool: Tool, args_: dict) -> bool:
             try:
-                reply = await asyncio.to_thread(input, "  approve? [y/N] ")
+                reply = await _ask("  approve? [y/N] ")
             except (EOFError, KeyboardInterrupt):
                 return False
             return reply.strip().lower() in ("y", "yes")
@@ -279,7 +297,7 @@ async def _prompt_switch_to_edits(
     success_text: str,
 ) -> None:
     try:
-        reply = await asyncio.to_thread(input, prompt_text)
+        reply = await _ask(prompt_text)
     except (EOFError, KeyboardInterrupt):
         display.info("Cancelled.")
         return
@@ -365,6 +383,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     session: PromptSession[str] = PromptSession(
         key_bindings=kb,
         bottom_toolbar=_bottom_toolbar(cfg, display),
+        style=_CONFIRM_STYLE,
     )
 
     # Resume or create initial agent.
