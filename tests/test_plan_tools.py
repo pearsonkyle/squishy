@@ -371,6 +371,19 @@ class TestDisplayPlanPanel:
             {"description": "Step 3", "status": "pending"},
         ])
 
+    def test_streaming_text_multi_chunk(self) -> None:
+        """Regression: rich.markdown.Markdown has no .update(); the Live
+        renderable must be swapped via Live.update() instead. Without this
+        the second chunk crashes with AttributeError."""
+        display = Display()
+        display.streaming_text_chunk("Hello ")
+        display.streaming_text_chunk("world")
+        display.streaming_text_chunk("!")
+        display.flush_streaming_text()
+        # Buffer must be reset so the next turn doesn't re-render prior text.
+        assert display._stream_buffer == ""
+        assert display._live is None
+
     def test_plan_progress_counts_skipped_in_resolved(self, capsys) -> None:
         """Resolved count should include skipped steps, not just done."""
         display = Display()

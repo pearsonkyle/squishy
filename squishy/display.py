@@ -153,21 +153,21 @@ class Display:
             return
         self._stream_buffer += s
 
+        new_render = Markdown(self._stream_buffer)
+        self._live_render = new_render
         if not self._use_live:
             self._use_live = True
-            self._live_render = Markdown(self._stream_buffer)
             self._live = Live(
-                self._live_render,
+                new_render,
                 console=self.console,
                 refresh_per_second=12,
                 transient=True,
             )
             self._live.start()
-        else:
-            if self._live_render is not None:
-                self._live_render.update(Markdown(self._stream_buffer))
-            if self._live is not None:
-                self._live.refresh()
+        elif self._live is not None:
+            # rich.markdown.Markdown has no .update(); swap the renderable
+            # on the Live object instead.
+            self._live.update(new_render, refresh=True)
 
     def flush_streaming_text(self) -> None:
         """Finalize streaming text output.
