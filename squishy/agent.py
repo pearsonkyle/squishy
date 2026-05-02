@@ -352,8 +352,6 @@ class Agent:
         if in_plan and not is_bench and plan is None:
             if completion.text:
                 self.messages.append(_prose_msg(completion.text, completion.reasoning))
-                if self.display:
-                    self.display.flush_streaming_text()
             if st.plan_nudges >= self.config.max_plan_nudges:
                 msg = "plan-mode run finished without producing a plan_task"
                 if self.display:
@@ -375,7 +373,9 @@ class Agent:
             )
             return "continue"
 
-        # Approved plan with unresolved steps — nudge to continue.
+        # Approved plan with unresolved steps — nudge to continue, but cap the
+        # number of nudges so the agent doesn't loop forever after producing a
+        # final answer (e.g., for an audit where steps are research-only).
         if (
             not is_bench
             and plan is not None
@@ -385,23 +385,33 @@ class Agent:
         ):
             if completion.text:
                 self.messages.append(_prose_msg(completion.text, completion.reasoning))
-                if self.display:
-                    self.display.flush_streaming_text()
-            remaining = "; ".join(
-                f"{i + 1}. {step.description}"
-                for i, step in enumerate(plan.unresolved_steps()[:4])
+            if st.plan_nudges < self.config.max_plan_nudges:
+                st.plan_nudges += 1
+                remaining = "; ".join(
+                    f"{i + 1}. {step.description}"
+                    for i, step in enumerate(plan.unresolved_steps()[:4])
+                )
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[system] You have an approved plan with unresolved steps. "
+                            "Either call `update_plan` to mark each remaining step "
+                            "(`done`/`skipped`/`blocked`) and continue, or call "
+                            "`finish_plan` to resolve all remaining steps at once "
+                            "and end the task. Do not just repeat the same prose. "
+                            f"Remaining: {remaining}"
+                        ),
+                    }
+                )
+                return "continue"
+            # Nudges exhausted — accept the prose answer and finish so we don't
+            # loop indefinitely on research/audit tasks.
+            st.prose_completions += 1
+            self._sync_display_stats(st, turn)
+            return self._build_result(
+                st, success=True, final_text=completion.text, turn=turn,
             )
-            self.messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "[system] You have an approved plan with unresolved steps. "
-                        "Continue working, then call `update_plan` before finishing. "
-                        f"Remaining steps: {remaining}"
-                    ),
-                }
-            )
-            return "continue"
 
         # Empty response — quality failure.
         if not (completion.text or "").strip():
@@ -929,13 +939,19 @@ class Agent:
                 )
             except LLMError as e:
                 if self.display:
+                    self.display.flush_streaming_text()
                     self.display.error(f"LLM error: {e}")
                 return self._build_result(
                     st, success=False, error=str(e), turn=turn - 1,
                 )
 
-            if completion.text and self.display:
-                self.display.console.print()
+            # Always finalize the streaming display before any further console
+            # output (tool headers, panels, prompts). Without this, subsequent
+            # turns concatenate into the same Live buffer and the prior
+            # narration is re-rendered on every refresh, producing repeated
+            # text and muddying the approval prompt area.
+            if self.display:
+                self.display.flush_streaming_text()
 
             st.total_prompt_tokens += completion.prompt_tokens
             st.completion_tokens += completion.completion_tokens
@@ -950,23 +966,21 @@ class Agent:
 
             self.messages.append(_assistant_msg(completion.text, completion.tool_calls, completion.reasoning))
 
-            # --- Compaction-resilient loop detection (bench/yolo only) ---
+            # --- Compaction-resilient loop detection (all modes) ---
             # Build a key from all tool calls this turn and compare to previous.
-            # Skip when explore_blocked is active to avoid force-terminating
-            # on intentionally blocked retries (explore_blocked computed below).
+            # In bench/yolo, threshold 7 so nudges (at 2) get a chance to work.
+            # In plan/edits, threshold 5 so the user isn't kept waiting for
+            # an obviously-stuck model.
             explore_blocked = False
-            if _is_constrained:
-                call_key = _call_key(completion.tool_calls)
-                if call_key == st.last_call_key:
-                    st.consecutive_identical += 1
-                else:
-                    st.consecutive_identical = 0
-                    st.last_call_key = call_key
+            call_key = _call_key(completion.tool_calls)
+            if call_key == st.last_call_key:
+                st.consecutive_identical += 1
+            else:
+                st.consecutive_identical = 0
+                st.last_call_key = call_key
 
-            if _is_constrained and st.consecutive_identical >= 7:
-                # Force-finish: model is stuck repeating the same call.
-                # Threshold raised from 4 to 7 to give nudge messages (at 2)
-                # more time to redirect the model.
+            loop_threshold = 7 if _is_constrained else 5
+            if st.consecutive_identical >= loop_threshold:
                 msg = (f"loop detected: same tool call repeated "
                        f"{st.consecutive_identical + 1} times consecutively")
                 if self.display:
@@ -977,6 +991,19 @@ class Agent:
                     final_text="Fix applied." if st.files_edited else "",
                     turn=turn,
                 )
+            # Mid-loop nudge — gentler in interactive modes.
+            if not _is_constrained and st.consecutive_identical >= 2:
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[system] You repeated the same tool call "
+                        f"{st.consecutive_identical + 1} times in a row with no "
+                        "new information. Either try a different action, call "
+                        "`finish_plan` if the work is done, or respond with a "
+                        "plain-text summary to end the turn. Do not repeat "
+                        "this call again."
+                    ),
+                })
             if _is_constrained and st.consecutive_identical >= 2:
                 if st.consecutive_identical >= 5:
                     # Escalated warning — model ignored initial nudge.
@@ -1283,21 +1310,35 @@ class Agent:
     async def _handle_plan_approval(
         self, tc: ToolCall, outcome: ToolResult,
     ) -> tuple[ToolResult, bool]:
-        """Handle plan_task approval flow. Returns (outcome, plan_approved)."""
+        """Handle plan_task approval flow. Returns (outcome, plan_approved).
+
+        ``prompt_fn`` may return:
+          - True / False: approve or decline.
+          - ``("feedback", "<text>")``: declined, but pass the user's feedback
+            back to the model so it can revise the plan.
+        """
         if self.display:
             self.display.plan_panel(outcome.data)
-        approved = True
+        reply: Any = True
+        feedback: str = ""
         if self.prompt_fn is not None:
             try:
                 from squishy.tools.base import Tool
 
-                approved = await self.prompt_fn(
+                reply = await self.prompt_fn(
                     Tool(name="plan_task", description="", parameters={},
                          run=lambda *_: None),  # type: ignore[arg-type]
                     tc.args,
                 )
             except (EOFError, KeyboardInterrupt):
-                approved = False
+                reply = False
+
+        if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == "feedback":
+            approved = False
+            feedback = str(reply[1] or "").strip()
+        else:
+            approved = bool(reply)
+
         if approved:
             if self.tool_ctx.plan is not None:
                 self.tool_ctx.plan.mark_approved()
@@ -1313,11 +1354,18 @@ class Agent:
                 display=outcome.display,
             )
             return outcome, True
+
         self.tool_ctx.plan = None
         self.tool_ctx.pending_plan_evidence.clear()
         self.tool_ctx.plan_switch_prompted = False
         clear_plan(self.tool_ctx.working_dir)
-        return ToolResult(False, error="Plan declined by user. Ask for changes or a new approach."), False
+        if feedback:
+            err = f"Plan declined. User feedback: {feedback}"
+            if self.display:
+                self.display.info(f"[plan] feedback: {feedback}")
+        else:
+            err = "Plan declined by user. Ask for changes or a new approach."
+        return ToolResult(False, error=err), False
 
     def _record_plan_evidence(self, tc: ToolCall, outcome: ToolResult) -> None:
         """Record tool outcome as plan evidence when an approved plan is active."""
@@ -1369,7 +1417,7 @@ class Agent:
         if self.display:
             if tc.name == "plan_task":
                 pass  # Panel already rendered in _handle_plan_approval.
-            elif outcome.success and tc.name == "update_plan":
+            elif outcome.success and tc.name in ("update_plan", "finish_plan"):
                 plan = self.tool_ctx.plan
                 if plan:
                     self.display.plan_progress([step.to_dict() for step in plan.steps])

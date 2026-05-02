@@ -22,7 +22,9 @@ from squishy.tools.shell import SHELL_TOOLS
 ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *PLAN_TOOLS, *SCRATCHPAD_TOOLS]
 REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
-PromptFn = Callable[[Tool, dict[str, object]], Awaitable[bool]]
+# PromptFn returns either a bool (approve/decline) or a ("feedback", str) tuple
+# where the string is free-text feedback the agent should use to revise.
+PromptFn = Callable[[Tool, dict[str, object]], Awaitable[Any]]
 
 
 def check_permission(
@@ -59,7 +61,10 @@ async def dispatch(
         if reason == "prompt":
             if prompt_fn is None:
                 return ToolResult(False, error="refused: user approval required (no TTY)")
-            if not await prompt_fn(tool, args):
+            reply = await prompt_fn(tool, args)
+            # prompt_fn may return a ("feedback", text) tuple for plan_task;
+            # for any non-plan tool we just treat that as a decline.
+            if reply is not True:
                 return ToolResult(False, error="refused: user declined")
         else:
             return ToolResult(False, error=reason)

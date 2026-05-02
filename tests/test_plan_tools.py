@@ -370,3 +370,77 @@ class TestDisplayPlanPanel:
             {"description": "Step 2", "status": "in-progress"},
             {"description": "Step 3", "status": "pending"},
         ])
+
+    def test_plan_progress_counts_skipped_in_resolved(self, capsys) -> None:
+        """Resolved count should include skipped steps, not just done."""
+        display = Display()
+        display.plan_progress([
+            {"description": "Step 1", "status": "done"},
+            {"description": "Step 2", "status": "skipped"},
+            {"description": "Step 3", "status": "skipped"},
+            {"description": "Step 4", "status": "pending"},
+        ])
+        captured = capsys.readouterr().out
+        # 1 done + 2 skipped = 3 resolved out of 4
+        assert "3/4 resolved" in captured
+        assert "2 skipped" in captured
+
+
+@pytest.mark.asyncio
+class TestFinishPlan:
+    async def test_finish_plan_marks_remaining_done(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task, _update_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["a", "b", "c"]},
+            ctx,
+        )
+        await _update_plan({"step_index": 1, "status": "done"}, ctx)
+        result = await _finish_plan({"status": "done", "summary": "all set"}, ctx)
+        assert result.success
+        assert result.data["affected_steps"] == [2, 3]
+        progress = result.data["plan"]["progress"]
+        assert progress["done"] == 3
+        assert progress["pending"] == 0
+
+    async def test_finish_plan_skipped(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["a", "b"]},
+            ctx,
+        )
+        result = await _finish_plan({"status": "skipped"}, ctx)
+        assert result.success
+        progress = result.data["plan"]["progress"]
+        assert progress["skipped"] == 2
+        assert progress["pending"] == 0
+
+    async def test_finish_plan_idempotent(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        await _finish_plan({}, ctx)
+        result = await _finish_plan({}, ctx)
+        assert result.success
+        assert result.data["affected_steps"] == []
+
+    async def test_finish_plan_no_active_plan(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        result = await _finish_plan({}, ctx)
+        assert not result.success
+        assert "no active plan" in result.error
+
+    async def test_finish_plan_invalid_status(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        result = await _finish_plan({"status": "blocked"}, ctx)
+        assert not result.success
+        assert "must be" in result.error

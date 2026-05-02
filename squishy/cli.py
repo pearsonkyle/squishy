@@ -24,7 +24,7 @@ from squishy.config import Config
 from squishy.display import Display, MODE_COLORS, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
-from squishy.plan_state import PlanState
+from squishy.plan_state import clear_plan
 from squishy.session import (
     create_session,
     export_training_to_file,
@@ -178,12 +178,23 @@ async def _amain() -> None:
         except Exception as e:
             display.warn(f"[mcp] init failed: {e}")
 
-        async def prompt_fn(tool: Tool, args_: dict) -> bool:
+        async def prompt_fn(tool: Tool, args_: dict):
+            label = "  approve? [y/N or type feedback] " if tool.name == "plan_task" else "  approve? [y/N] "
             try:
-                reply = await asyncio.to_thread(input, "  approve? [y/N] ")
+                reply = await asyncio.to_thread(input, label)
             except (EOFError, KeyboardInterrupt):
                 return False
-            return reply.strip().lower() in ("y", "yes")
+            stripped = reply.strip()
+            lowered = stripped.lower()
+            if lowered in ("y", "yes"):
+                return True
+            if lowered in ("", "n", "no"):
+                return False
+            # Anything else is treated as a decline with free-text feedback
+            # the agent can use to revise its plan.
+            if tool.name == "plan_task":
+                return ("feedback", stripped)
+            return False
  
         if args.message:
             await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout)
@@ -303,6 +314,9 @@ def _create_session_for_agent(cfg: Config, model_name: str) -> str | None:
 
 
 async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
+    # One-shot invocations should not pick up a leftover plan from a previous
+    # interactive run.
+    clear_plan(cfg.working_dir)
     session_id = _create_session_for_agent(cfg, cfg.model)
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
     try:
@@ -350,6 +364,8 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             display.error(f"failed to resume session {resume_id}: {e}")
             return
     else:
+        # Fresh interactive session — never inherit a plan from a previous run.
+        clear_plan(cfg.working_dir)
         session_id = _create_session_for_agent(cfg, display.model or cfg.model)
         current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
         if session_id:
@@ -401,6 +417,10 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
+            # Drop any persisted plan so the next agent starts fresh —
+            # otherwise __post_init__ will silently reload the prior plan
+            # and the user sees "[plan] restored …" right after /clear.
+            clear_plan(cfg.working_dir)
             # Rebuild agent with fresh conversation history and new session.
             session_id = _create_session_for_agent(cfg, display.model or cfg.model)
             current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)

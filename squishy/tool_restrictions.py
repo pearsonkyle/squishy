@@ -18,6 +18,7 @@ READ_ONLY_TOOLS = frozenset({
     "plan_task",
     "update_plan",
     "get_plan",
+    "finish_plan",
     "save_note",
     "show_diff",
 })
@@ -35,7 +36,7 @@ ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOLS
 
 # Plan tools excluded from bench mode to reduce schema size and prevent
 # the model from wasting turns on planning instead of fixing.
-_PLAN_TOOLS = frozenset({"plan_task", "update_plan", "get_plan"})
+_PLAN_TOOLS = frozenset({"plan_task", "update_plan", "get_plan", "finish_plan"})
 
 BENCH_TOOLS = ALL_TOOLS - _PLAN_TOOLS
 

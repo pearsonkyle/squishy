@@ -141,6 +141,7 @@ def build_system_prompt(
 - The user will be asked to approve the plan before you proceed.
 - After the plan is approved, call `update_plan(step_index=N, status="done")` as you complete each step.
 - This keeps the user informed of progress through their task.
+- When you have finished the work (or for an audit/research task once you have produced your final answer), call `finish_plan(status="done")` once to resolve any remaining steps in a single call, then reply with your final summary. Do NOT keep calling `update_plan` on the same step or repeat the same prose — that is a stuck loop.
 
 {mode_block}
 ## Project

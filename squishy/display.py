@@ -47,6 +47,11 @@ ICONS = {
     "run_command": "[magenta]🔧[/]",
     "plan_task": "[cyan]📋[/]",
     "update_plan": "[cyan]📊[/]",
+    "finish_plan": "[green]🏁[/]",
+    "get_plan": "[cyan]📋[/]",
+    "save_note": "[cyan]📝[/]",
+    "recall": "[cyan]🔎[/]",
+    "glob_files": "[cyan]🔍[/]",
 }
 
 
@@ -138,51 +143,48 @@ class Display:
         for line in snippet:
             self.console.print(f"  [dim]│[/] {line}")
  
-    def text(self, s: str) -> None:
-        if s.strip():
-            self.console.print(Text(s))
- 
-    # Streaming markdown state (initialized in __init__)
-
     def streaming_text_chunk(self, s: str) -> None:
         """Accumulate text chunks and render as streaming markdown.
-        
+
         Uses Rich Live for smooth incremental rendering that updates
         in place rather than printing each chunk below previous output.
         """
+        if not s:
+            return
         self._stream_buffer += s
-        
+
         if not self._use_live:
-            # First chunk: start Live rendering
             self._use_live = True
             self._live_render = Markdown(self._stream_buffer)
             self._live = Live(
                 self._live_render,
                 console=self.console,
                 refresh_per_second=12,
+                transient=True,
             )
             self._live.start()
         else:
-            # Update existing Live display
             if self._live_render is not None:
                 self._live_render.update(Markdown(self._stream_buffer))
             if self._live is not None:
                 self._live.refresh()
 
     def flush_streaming_text(self) -> None:
-        """Finalize streaming text output. Call when a prose response completes.
-        
-        Stops the Live display and prints the final rendered markdown
-        as a permanent output.
+        """Finalize streaming text output.
+
+        Stops the transient Live display and prints the final rendered markdown
+        once as a permanent output. Always clears the buffer so successive
+        turns don't re-render previously streamed text.
         """
+        final_render = self._live_render
         if self._live is not None:
-            # Stop Live and render final state permanently
-            if self._live_render is not None:
-                self.console.print()  # blank line before
-                self.console.print(self._live_render)
             self._live.stop()
-            self._live = None
-            self._live_render = None
+        # transient=True clears the live area on stop, so print the final
+        # frame once for permanent display.
+        if final_render is not None and self._stream_buffer.strip():
+            self.console.print(final_render)
+        self._live = None
+        self._live_render = None
         self._stream_buffer = ""
         self._use_live = False
  
@@ -234,12 +236,27 @@ class Display:
         """Show a compact progress line for the active plan."""
         total = len(steps)
         done = sum(1 for s in steps if s.get("status") == "done")
+        skipped = sum(1 for s in steps if s.get("status") == "skipped")
         in_prog = sum(1 for s in steps if s.get("status") == "in-progress")
-        bar_filled = int(20 * done / total) if total else 0
-        bar_active = int(20 * in_prog / total) if total else 0
-        bar_empty = 20 - bar_filled - bar_active
-        bar = "[green]█[/]" * bar_filled + "[cyan]▓[/]" * bar_active + "[dim]░[/]" * bar_empty
-        self.console.print(f"  plan: {bar} {done}/{total} steps done")
+        blocked = sum(1 for s in steps if s.get("status") == "blocked")
+        if total:
+            bar_done = int(20 * done / total)
+            bar_skip = int(20 * skipped / total)
+            bar_active = int(20 * in_prog / total)
+            bar_block = int(20 * blocked / total)
+        else:
+            bar_done = bar_skip = bar_active = bar_block = 0
+        bar_empty = max(0, 20 - bar_done - bar_skip - bar_active - bar_block)
+        bar = (
+            "[green]█[/]" * bar_done
+            + "[cyan]▓[/]" * bar_active
+            + "[red]▓[/]" * bar_block
+            + "[dim]▒[/]" * bar_skip
+            + "[dim]░[/]" * bar_empty
+        )
+        resolved = done + skipped
+        suffix = f" ({skipped} skipped)" if skipped else ""
+        self.console.print(f"  plan: {bar} {resolved}/{total} resolved{suffix}")
  
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats
@@ -284,17 +301,4 @@ class Display:
             lines.append("tools:    all (unrestricted)")
         
         self.console.print("\n".join(lines))
-
-    def progress(self, current: int, total: int, message: str = "") -> None:
-        """Display progress indicator."""
-        percent = 100 if total == 0 else (current * 100) // total
-        
-        bar_width = 40
-        filled = int(bar_width * percent / 100)
-        bar = "█" * filled + "░" * (bar_width - filled)
-        
-        if message:
-            self.console.print(f"[dim]{message}[/] {bar} {percent}% ({current}/{total})")
-        else:
-            self.console.print(f"{bar} {percent}% ({current}/{total})")
 

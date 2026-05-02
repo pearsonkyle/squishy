@@ -368,7 +368,9 @@ async def test_agent_plan_mode_gives_up_after_tool_turn_nudges(tmp_path):
     result = await agent.run("plan please")
 
     assert not result.success
-    assert "plan_task" in result.error
+    # Either path should kill the run: the plan-task nudge budget OR the
+    # cross-mode loop detector. Both indicate the model never produced a plan.
+    assert "plan_task" in result.error or "loop detected" in result.error
 
 
 async def test_agent_restores_persisted_plan_state(tmp_path):

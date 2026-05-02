@@ -6,7 +6,7 @@ import pytest
 
 import squishy.cli as cli
 from squishy.config import Config
-from squishy.plan_state import PlanState
+from squishy.plan_state import PlanState, has_plan_file, plan_path, save_plan
 
 pytestmark = pytest.mark.asyncio
 
@@ -66,3 +66,42 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
     assert seen_agents[0].tool_ctx.plan_switch_prompted is True
     assert cfg.permission_mode == "edits"
     assert "[bold green]✓ Switched to edits mode[/]" in display.info_calls
+
+
+async def test_run_one_clears_stale_plan(monkeypatch, tmp_path):
+    """A one-shot invocation should not pick up a leftover plan from a
+    previous interactive run."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "edits"
+
+    # Seed a stale plan on disk to simulate a leftover from a prior session.
+    stale = PlanState.create(problem="old", solution="old", steps=["old"])
+    save_plan(tmp_path, stale)
+    assert has_plan_file(tmp_path)
+
+    class FakeClient:
+        pass
+
+    class FakeDisplay:
+        def info(self, _m: str) -> None: pass
+        def warn(self, _m: str) -> None: pass
+        def error(self, _m: str) -> None: pass
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self.tool_ctx = SimpleNamespace(plan=None, plan_switch_prompted=False)
+
+        async def run(self, _message, *, timeout=None):
+            return None
+
+    monkeypatch.setattr(cli, "Agent", FakeAgent)
+
+    await cli._run_one(
+        cfg, client=FakeClient(), display=FakeDisplay(),
+        prompt_fn=None, message="x", timeout=None,
+    )
+
+    # The stale plan file should have been cleared before the agent started.
+    assert not plan_path(tmp_path).exists()
