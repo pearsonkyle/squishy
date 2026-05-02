@@ -51,16 +51,19 @@ async def _save_note(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         content = content[:MAX_NOTE_CHARS] + "…(truncated)"
 
     # Evict oldest if at capacity (and this is a new key)
+    evicted_key = None
     if key not in ctx.notes and len(ctx.notes) >= MAX_NOTES:
-        oldest_key = next(iter(ctx.notes))
-        del ctx.notes[oldest_key]
+        evicted_key = next(iter(ctx.notes))
+        del ctx.notes[evicted_key]
 
     ctx.notes[key] = content
-    return ToolResult(
-        True,
-        data={"key": key, "saved": True, "total_notes": len(ctx.notes)},
-        display=f"saved note '{key}' ({len(content)} chars, {len(ctx.notes)} total)",
-    )
+    data: dict[str, Any] = {"key": key, "saved": True, "total_notes": len(ctx.notes)}
+    display = f"saved note '{key}' ({len(content)} chars, {len(ctx.notes)} total)"
+    if evicted_key:
+        data["evicted"] = evicted_key
+        data["warning"] = f"Note '{evicted_key}' was evicted to make room (max {MAX_NOTES} notes)"
+        display += f" — evicted oldest note '{evicted_key}'"
+    return ToolResult(True, data=data, display=display)
 
 
 save_note = Tool(
@@ -68,7 +71,7 @@ save_note = Tool(
     description=(
         "Persist a finding for future reference. Notes survive conversation "
         "trimming so you do not lose important context. Use this to record: "
-        "bug root cause, relevant file paths, test commands, error messages, "
+        "key findings, relevant file paths, important data, decisions, "
         "or any insight you want to remember across turns."
     ),
     parameters={

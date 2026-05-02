@@ -25,9 +25,6 @@ def _make_repo(root: Path) -> None:
     (root / "pkg" / "a.py").write_text('"""A module."""\ndef alpha(): return 1\n')
     (root / "pkg" / "b.py").write_text('"""B module."""\nclass Widget: pass\n')
     (root / "README.md").write_text("# demo")
-
-
-@pytest.mark.asyncio
 async def test_describe_deep_staleness_fresh() -> None:
     """Fresh index should report no staleness."""
     import tempfile
@@ -41,9 +38,6 @@ async def test_describe_deep_staleness_fresh() -> None:
         stale_info = describe_deep_staleness(str(root))
         assert not stale_info["stale"]
         assert stale_info["reason"] is None
-
-
-@pytest.mark.asyncio
 async def test_describe_deep_staleness_changed_file() -> None:
     """Changed file should be detected."""
     from pathlib import Path
@@ -63,9 +57,6 @@ async def test_describe_deep_staleness_changed_file() -> None:
         stale_info = describe_deep_staleness(str(root))
         assert stale_info["stale"]
         assert "changed" in (stale_info.get("reason") or "")
-
-
-@pytest.mark.asyncio
 async def test_describe_deep_staleness_new_file() -> None:
     """New file should be detected."""
     from pathlib import Path

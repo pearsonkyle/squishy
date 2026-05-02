@@ -9,29 +9,24 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import os
 import sys
 
 from dotenv import load_dotenv
-
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.styles import Style
 
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display, MODE_COLORS, Stats
+from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
-from squishy.plan_state import PlanState
 from squishy.session import (
     create_session,
     export_training_to_file,
     list_sessions,
     load_messages,
-    load_session,
 )
 from squishy.tools.base import Tool
 
@@ -67,26 +62,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--resume", metavar="UUID", help="Resume a previous session by UUID")
     p.add_argument("--session-dir", help="Session storage directory (env SQUISHY_SESSION_DIR)")
     p.add_argument("--no-sessions", action="store_true", help="Disable session persistence")
-    p.add_argument(
-        "--task-type",
-        choices=("coding", "general"),
-        default=None,
-        help=(
-            "'coding' (default) keeps SWE-bench-shaped behaviour; 'general' "
-            "uses a generic-assistant prompt and treats save_note/recall as "
-            "progress signals (env SQUISHY_TASK_TYPE)."
-        ),
-    )
-    # Advanced agent-loop tuning. These were defined in Config but had no CLI
-    # surface, which made bench experiments require monkey-patching.
-    p.add_argument("--max-explore-turns", type=int, default=None,
-                   help="Bench/yolo: turns spent reading before edits are forced")
-    p.add_argument("--max-fix-verify-cycles", type=int, default=None,
-                   help="Bench/yolo: edit→test cycles before the loop is broken")
-    p.add_argument("--max-stuck-turns", type=int, default=None,
-                   help="Bench: turns without file mutations before nudging")
-    p.add_argument("--max-consecutive-errors", type=int, default=None,
-                   help="Tool failures in a row before stopping")
     return p.parse_args(argv)
  
  
@@ -124,36 +99,9 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.session_dir = args.session_dir
     if args.no_sessions:
         cfg.save_sessions = False
-    if args.task_type:
-        cfg.task_type = args.task_type
-    if args.max_explore_turns is not None:
-        cfg.max_explore_turns = args.max_explore_turns
-    if args.max_fix_verify_cycles is not None:
-        cfg.max_fix_verify_cycles = args.max_fix_verify_cycles
-    if args.max_stuck_turns is not None:
-        cfg.max_stuck_turns = args.max_stuck_turns
-    if args.max_consecutive_errors is not None:
-        cfg.max_consecutive_errors = args.max_consecutive_errors
     return cfg
-
-
-# Style used for all inline confirmation prompts so typed text is always visible.
-_CONFIRM_STYLE = Style.from_dict({"": "bold"})
-
-
-async def _ask(prompt_text: str) -> str:
-    """Show a confirmation prompt with explicit styling so typed text is visible.
-
-    Uses prompt_toolkit's async prompt rather than bare ``input()`` to avoid
-    terminal-state conflicts when Rich Live rendering has just been active.
-    """
-    ps: PromptSession[str] = PromptSession(style=_CONFIRM_STYLE)
-    try:
-        return await ps.prompt_async(prompt_text)
-    except (EOFError, KeyboardInterrupt):
-        raise
-
-
+ 
+ 
 def _bottom_toolbar(cfg: Config, display: Display):
     def _render():
         color = MODE_COLORS.get(cfg.permission_mode, "ansigray")
@@ -226,12 +174,20 @@ async def _amain() -> None:
         except Exception as e:
             display.warn(f"[mcp] init failed: {e}")
 
-        async def prompt_fn(tool: Tool, args_: dict) -> bool:
+        async def prompt_fn(tool: Tool, args_: dict) -> bool | str:
             try:
-                reply = await _ask("  approve? [y/N] ")
+                reply = await asyncio.to_thread(
+                    input, "  approve? [y/N] or type feedback: ",
+                )
             except (EOFError, KeyboardInterrupt):
                 return False
-            return reply.strip().lower() in ("y", "yes")
+            text = reply.strip()
+            if text.lower() in ("y", "yes"):
+                return True
+            if text.lower() in ("n", "no", ""):
+                return False
+            # Any other text is treated as feedback for the agent.
+            return text
  
         if args.message:
             await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout)
@@ -297,7 +253,7 @@ async def _prompt_switch_to_edits(
     success_text: str,
 ) -> None:
     try:
-        reply = await _ask(prompt_text)
+        reply = await asyncio.to_thread(input, prompt_text)
     except (EOFError, KeyboardInterrupt):
         display.info("Cancelled.")
         return
@@ -383,7 +339,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     session: PromptSession[str] = PromptSession(
         key_bindings=kb,
         bottom_toolbar=_bottom_toolbar(cfg, display),
-        style=_CONFIRM_STYLE,
     )
 
     # Resume or create initial agent.
@@ -446,7 +401,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             continue
         if line in ("/clear", "/new"):
             # Clear terminal screen
-            os.system("clear" if os.name != "nt" else "cls")
+            print("\033[H\033[2J", end="", flush=True)
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
@@ -564,9 +519,9 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:
     """Handle /mcp slash command."""
-    from squishy.mcp.tools import reload_mcp, get_connect_errors
     from squishy.mcp.client import get_mcp_manager
     from squishy.mcp.config import add_server_to_user_config, remove_server_from_user_config
+    from squishy.mcp.tools import reload_mcp
 
     parts = rest.split() if rest else []
     subcmd = parts[0].lower() if parts else "list"

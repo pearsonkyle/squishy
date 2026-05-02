@@ -14,8 +14,6 @@ from typing import Any
 from squishy.index.store import has_index
 from squishy.tools.fs import SKIP_DIRS
 
-MAX_HISTORY = 10  # system + first user + last 8 = 10
- 
  
 @dataclass
 class ProjectInfo:
@@ -97,11 +95,18 @@ def build_system_prompt(
     project: ProjectInfo,
     thinking: bool = False,
     mode: str = "edits",
-    task_type: str = "coding",
 ) -> str:
     files = _top_level_files(cwd)
 
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
+
+    project_block = f"Language: {project.language}\n"
+    if project.framework:
+        project_block += f"Framework: {project.framework}\n"
+    if project.build_command:
+        project_block += f"Build: {project.build_command}\n"
+    if project.test_command:
+        project_block += f"Test: {project.test_command}\n"
 
     index_block = _index_header(cwd)
     mcp_block = _mcp_block()
@@ -109,93 +114,49 @@ def build_system_prompt(
     mode_block = _mode_block(mode, cwd)
     recall_rule = _recall_rule(cwd)
 
-    if task_type == "general":
-        # Non-coding workflows: the working directory is treated as a notes /
-        # scratch / data folder. Build/test commands and "verify with tests"
-        # framing are dropped; save_note is highlighted as the way to record
-        # progress that survives history compaction.
-        role_line = (
-            "You are squishy, a general-purpose local assistant. The working directory "
-            "is a scratch / notes / data folder — not necessarily a code project. Use "
-            "the tools to research, organize, and produce whatever the user asks for: "
-            "notes, lists, plans, datasets, deck builds, research summaries."
-        )
-        rules_block = (
-            "## Rules\n"
-            "- Read existing files before editing them.\n"
-            "- `write_file` is for creating NEW files only. Use `edit_file` for existing files.\n"
-            "- Use relative paths. Working directory is already set.\n"
-            "- Use `save_note` to record findings, decisions, candidates, partial results. "
-            "Notes survive across long conversations even after older messages are trimmed.\n"
-            "- When you finish the user's task, respond with a plain text summary "
-            "(no tool call).\n"
-            "- Do not re-read a file you have already read with the same range. Use what "
-            "you have.\n"
-            f"{recall_rule}"
-        )
-        project_section = (
-            "## Working directory\n"
-            f"{cwd}\n\n"
-            "## Top-level files\n"
-            f"{', '.join(files) if files else '(empty)'}\n"
-        )
-    else:
-        role_line = (
-            "You are squishy, a local coding assistant that edits files and runs "
-            "commands to complete the user's task."
-        )
-        project_block = f"Language: {project.language}\n"
-        if project.framework:
-            project_block += f"Framework: {project.framework}\n"
-        if project.build_command:
-            project_block += f"Build: {project.build_command}\n"
-        if project.test_command:
-            project_block += f"Test: {project.test_command}\n"
-        rules_block = (
-            "## Rules\n"
-            "- Read files before editing them.\n"
-            "- `write_file` is for creating NEW files only. It will be refused on any "
-            "existing file. Always use `edit_file` for existing files.\n"
-            "- Use relative paths. Working directory is already set.\n"
-            "- Verify your work with `run_command` (run the tests or the program itself) "
-            "after making changes.\n"
-            "- Explore thoroughly when fixing bugs or implementing features - it's better "
-            "to understand the codebase than to guess.\n"
-            "- When you finish the user's task, respond with plain text summarizing what "
-            "you did (no tool call).\n"
-            "- Do not re-read a file you have already read in this conversation unless "
-            "you need a different line range. Use what you have.\n"
-            f"{recall_rule}"
-        )
-        project_section = (
-            "## Project\n"
-            f"{project_block}"
-            "## Working directory\n"
-            f"{cwd}\n\n"
-            "## Top-level files\n"
-            f"{', '.join(files) if files else '(empty)'}\n"
-        )
+    is_bench = mode == "bench"
+    explore_rule = (
+        ""
+        if is_bench else
+        "- Explore thoroughly when working on tasks — understand the problem space before acting."
+    )
+    planning_block = "" if is_bench else (
+        "## Planning\n"
+        "- For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.\n"
+        "- `plan_task` is valid as soon as you have enough information to propose a solid approach — do not wait for exhaustive research.\n"
+        "- `files_to_modify` and `files_to_create` may be partial or empty when some file choices are still uncertain.\n"
+        "- The user will be asked to approve the plan before you proceed.\n"
+        "- After the plan is approved, call `update_plan(step_index=N, status=\"done\")` as you complete each step.\n"
+        "- This keeps the user informed of progress through their task.\n\n"
+    )
+    file_ref_block = "" if is_bench else (
+        "## File References\n"
+        "- Users can reference files in their input using `@filename` syntax.\n"
+        "- When a user includes `@some/path.py`, the full file contents are automatically injected into the conversation wrapped in `<file>` tags.\n"
+        "- File content is labeled with path and line count so you know exactly what file it is.\n\n"
+    )
 
-    return f"""{role_line}
+    return f"""You are squishy, a local assistant that helps with tasks by reading, writing, and organizing files, running commands, and managing information. You work with code, data, research, documents, and any other file-based tasks.
 
 {thinking_line}
-{rules_block}
+## Rules
+- Read files before editing them.
+- `write_file` is for creating NEW files only. It will be refused on any existing file. Always use `edit_file` for existing files.
+- Use relative paths. Working directory is already set.
+- Verify your work with `run_command` after making changes (e.g. run tests, check output, validate results).
+{"- " + explore_rule + chr(10) if explore_rule else ""}- When you finish the user's task, respond with plain text summarizing what you did (no tool call).
+- Do not re-read a file you have already read in this conversation unless you need a different line range. Use what you have.
+{recall_rule}
 
-## File References
-- Users can reference files in their input using `@filename` syntax.
-- When a user includes `@some/path.py`, the full file contents are automatically injected into the conversation wrapped in `<file>` tags.
-- File content is labeled with path and line count so you know exactly what file it is.
+{file_ref_block}{planning_block}{mode_block}
+## Project
+{project_block}
+## Working directory
+{cwd}
 
-## Planning
-- For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
-- `plan_task` is valid as soon as you have enough information to propose a solid approach — do not wait for exhaustive research.
-- `files_to_modify` and `files_to_create` may be partial or empty when some file choices are still uncertain.
-- The user will be asked to approve the plan before you proceed.
-- After the plan is approved, call `update_plan(step_index=N, status="done")` as you complete each step.
-- This keeps the user informed of progress through their task.
-
-{mode_block}
-{project_section}{index_block}{mcp_block}{instructions_block}"""
+## Top-level files
+{', '.join(files) if files else '(empty)'}
+{index_block}{mcp_block}{instructions_block}"""
  
  
 _INSTRUCTION_SOURCES: tuple[tuple[str, str], ...] = (
@@ -298,16 +259,41 @@ def _mode_block(mode: str, cwd: str) -> str:
         ) if index_available else ""
         return (
             "## Mode: bench\n"
-            "- All tools available. No approval prompts.\n"
-            "- Focus on fixing the bug directly. Do NOT call plan_task or update_plan.\n"
-            "- Follow the workflow: understand → locate → fix → verify → finish.\n"
+            "All tools available. No approval prompts. Do NOT call plan_task or update_plan.\n"
             f"{recall_line}"
-            "- Use `save_note` to persist key findings (bug location, test command,\n"
-            "  root cause) so you remember them across long conversations.\n"
-            "- Do NOT re-read files you have already read. Use `save_note` to store important\n"
-            "  content rather than reading the same file multiple times.\n"
-            "- Use `show_diff` before finishing to verify all your changes look correct.\n"
-            "- For bug fixes, ALWAYS run the specific test after making changes.\n"
+            "\n## Action Bias\n"
+            "You MUST call `edit_file` with your fix within your first 3 tool calls.\n"
+            "A wrong fix that you iterate on is MUCH better than more exploration.\n"
+            "Do NOT respond with prose until you have made at least one edit attempt.\n"
+            "\n## Workflow\n"
+            "1. **Understand** (0 calls): Read the problem statement. Extract file paths,\n"
+            "   class/function names, and expected vs actual behavior. If a traceback is\n"
+            "   included, the BOTTOM frame shows the file and line number. If a 'Relevant\n"
+            "   Code' section is provided, use those paths and line numbers directly.\n"
+            "2. **Locate** (1-2 calls): Read the relevant file.\n"
+            "   - If the problem names a file like `foo.bar.baz`, read `foo/bar.py` directly.\n"
+            "   - Use `read_file(path=..., offset=<line-50>, limit=100)` to see context.\n"
+            "   - Use `save_note` to record key content so you don't need to re-read.\n"
+            "3. **Fix** (1-2 calls): Make the smallest change that fixes the bug.\n"
+            "   - Use `edit_file(path=..., old_str=..., new_str=...)` — not `write_file`.\n"
+            "   - Include 2-3 lines of surrounding context in `old_str` for uniqueness.\n"
+            "   - If `edit_file` fails, re-read those exact lines and copy the text exactly.\n"
+            "4. **Verify** (1 call): Run the EXACT test from the 'Failing Tests' section.\n"
+            "   - CRITICAL: Use the `run_command` shown in the prompt (the V2 test_cmd).\n"
+            "     Do NOT substitute a different test file or test suite.\n"
+            "   - If it passes, respond with a text summary and stop.\n"
+            "   - If it fails, read the FULL error output, fix the issue, and test again.\n"
+            "\n## Guidelines\n"
+            "- Make the minimal change needed. Do not refactor or clean up unrelated code.\n"
+            "- Do not modify setup.py/pyproject.toml/requirements.\n"
+            "- Do NOT create repro scripts or standalone test files. Fix the source directly.\n"
+            "- Dependencies are pre-installed. If you see ImportError, try `pip install <pkg>` once.\n"
+            "- Only run the specific failing test listed in 'Failing Tests', not the full suite.\n"
+            "- If stuck after 3 attempts, re-read the problem and try a different approach.\n"
+            "- Bugs often span MULTIPLE files. After fixing the primary file, check if\n"
+            "  related files (imports, callers, tests) also need changes.\n"
+            "- After each test run, read the FULL error output carefully. Fix the\n"
+            "  specific assertion or exception shown, not what you assume is wrong.\n"
         )
     if mode == "yolo":
         return (
@@ -318,11 +304,11 @@ def _mode_block(mode: str, cwd: str) -> str:
             "  1. Call `update_plan(step_index=1, status=\"in-progress\")` to start step 1\n"
             "  2. Read necessary files with `read_file`\n"
             "  3. Make changes with `edit_file` (use `write_file` only for new files)\n"
-            "  4. Run tests/verify with `run_command`\n"
+            "  4. Verify with `run_command` (run tests, check output, validate results)\n"
             "  5. Call `update_plan(step_index=1, status=\"done\")` when complete\n"
             "  6. Repeat for remaining steps\n"
             "- Call `get_plan` if you lose track of where you are in the plan.\n"
-            "- For bug fixes, ALWAYS run tests after making changes to verify the fix works.\n"
+            "- ALWAYS verify your work after making changes.\n"
         )
     return (
         "## Mode: edits\n"
@@ -440,7 +426,7 @@ def snip_old_tool_results(
     return messages
 
 
-def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY) -> list[dict[str, Any]]:
+def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list[dict[str, Any]]:
     """Keep system + first user + last (max_messages - 2) messages.
 
     Ported from atlas-proxy/agent.go:41-50. Preserves initial intent while
@@ -456,37 +442,22 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
     result it has no record of requesting, and re-requests the same read).
     Leading tool messages are dropped until we hit an assistant or user turn.
 
-    Plan-status system messages (wrapped in ``<plan-status>…</plan-status>``)
-    are preserved alongside the primary system prompt so the model keeps its
-    current plan snapshot regardless of how many tool turns have passed.
     """
     # Layer 1: snip old tool results before trimming
     snip_old_tool_results(messages)
 
-    from squishy.plan_state import is_plan_status_message
-    from squishy.tools.scratchpad import is_notes_message
-
-    def _is_injected_system(m: dict[str, Any]) -> bool:
-        return is_plan_status_message(m) or is_notes_message(m)
-
-    system = [m for m in messages if m.get("role") == "system" and not _is_injected_system(m)]
-    injected_msgs = [m for m in messages if _is_injected_system(m)]
-    non_system = [
-        m for m in messages
-        if m.get("role") != "system" and not _is_injected_system(m)
-    ]
+    system = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
 
     if len(messages) <= max_messages:
-        # Still ensure injected system messages are ordered after the
-        # primary system prompt (they may have been appended later).
-        return system + injected_msgs + non_system
+        return system + non_system
 
     if not non_system:
-        return system + injected_msgs
+        return system
 
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
-    remaining_budget = max(1, max_messages - len(system) - len(injected_msgs) - len(first_user))
+    remaining_budget = max(1, max_messages - len(system) - len(first_user))
     tail = non_system[-remaining_budget:]
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
@@ -504,10 +475,22 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
         dropped_end = len(non_system) - (len(tail) if tail else 0)
         dropped = non_system[dropped_start:dropped_end]
         anchored = [m for m in dropped if m.get("_squishy_anchor")]
+        # Only re-inject anchored messages that won't be orphans.
+        # A tool message is an orphan if its matching assistant tool_calls
+        # message is not in the retained set.
+        retained_call_ids: set[str] = set()
+        for m in first_user + tail:
+            for tc in m.get("tool_calls", []):
+                if isinstance(tc, dict):
+                    retained_call_ids.add(tc.get("id", ""))
         for m in anchored[:3]:
+            if m.get("role") == "tool":
+                tcid = m.get("tool_call_id", "")
+                if tcid and tcid not in retained_call_ids:
+                    continue  # skip orphan tool result
             tail.insert(0, m)
 
-    return system + injected_msgs + first_user + tail
+    return system + first_user + tail
 
 
 # ── Layer 2: LLM-based context compaction ────────────────────────────────
@@ -567,9 +550,6 @@ async def compact_messages(
     Anchored messages (``_squishy_anchor``) in the old portion are pulled
     into the recent section to preserve high-value context.
     """
-    from squishy.plan_state import is_plan_status_message
-    from squishy.tools.scratchpad import is_notes_message
-
     est = _estimate_message_tokens(messages)
     if est <= int(context_limit * threshold):
         return messages
@@ -584,12 +564,27 @@ async def compact_messages(
     if len(non_system) < 4:
         return messages
 
-    split = find_compaction_split(non_system)
+    # Protect the first user message (contains problem statement / task
+    # instructions) from being summarized away.
+    first_user_idx = next(
+        (i for i, m in enumerate(non_system) if m.get("role") == "user"), None,
+    )
+    if first_user_idx is not None:
+        protected = non_system[first_user_idx]
+        compactable = non_system[:first_user_idx] + non_system[first_user_idx + 1:]
+    else:
+        protected = None
+        compactable = non_system
+
+    if len(compactable) < 4:
+        return messages
+
+    split = find_compaction_split(compactable)
     if split <= 0:
         return messages
 
-    old = non_system[:split]
-    recent = non_system[split:]
+    old = compactable[:split]
+    recent = compactable[split:]
 
     # Pull anchored messages from old section into recent
     anchored = [m for m in old if m.get("_squishy_anchor")]
@@ -608,7 +603,24 @@ async def compact_messages(
         elif m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 func = tc.get("function", {})
-                summary_parts.append(f"[{role}]: called {func.get('name', '?')}")
+                name = func.get("name", "?")
+                # Include key args (file paths, commands) for context
+                args_preview = ""
+                try:
+                    import json as _json
+                    args = _json.loads(func.get("arguments", "{}"))
+                    if "path" in args:
+                        args_preview = f"path={args['path']}"
+                    elif "command" in args:
+                        args_preview = f"cmd={str(args['command'])[:80]}"
+                    elif "query" in args:
+                        args_preview = f"query={args['query']}"
+                    elif "pattern" in args:
+                        args_preview = f"pattern={args['pattern']}"
+                except Exception:  # noqa: BLE001
+                    pass
+                detail = f"({args_preview})" if args_preview else ""
+                summary_parts.append(f"[{role}]: called {name}{detail}")
 
     old_text = "\n".join(summary_parts)
     # Cap the text sent for summarization to avoid blowing up the compaction prompt.
@@ -617,7 +629,6 @@ async def compact_messages(
 
     # Summarize via LLM
     try:
-        from squishy.errors import LLMError
         summary_prompt = (
             "Summarize this conversation history concisely. Preserve: "
             "file paths, function/class names, error messages, test commands, "
@@ -647,4 +658,7 @@ async def compact_messages(
         "content": "Understood. I have the context from earlier. Continuing.",
     }
 
-    return system + [summary_msg, ack_msg] + recent
+    # Re-inject the protected first user message right after system messages
+    # so it survives compaction and remains visible to the model.
+    protected_msgs = [protected] if protected is not None else []
+    return system + protected_msgs + [summary_msg, ack_msg] + recent

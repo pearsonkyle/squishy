@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from typing import Any
 
 import pytest
 
@@ -15,32 +13,7 @@ from squishy.display import Display
 from squishy.plan_state import load_plan, plan_path
 from squishy.tools.base import ToolContext
 
-pytestmark = pytest.mark.asyncio
-
-
-@dataclass
-class FakeClient:
-    script: list[CompletionResult]
-    calls_seen: list[list[dict[str, Any]]] = field(default_factory=list)
-    _i: int = 0
-
-    async def health(self) -> bool:
-        return True
-
-    async def complete(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        *,
-        stream: bool = True,
-        on_text: Any = None,
-    ) -> CompletionResult:
-        self.calls_seen.append(list(messages))
-        if self._i >= len(self.script):
-            return CompletionResult(text="done.", tool_calls=[])
-        result = self.script[self._i]
-        self._i += 1
-        return result
+from conftest import FakeClient
 
 
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:

@@ -10,10 +10,8 @@ Includes:
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from squishy.index.model import Index, Node
-
 
 # Default retention period: prune summaries older than this (30 days)
 DEFAULT_RETENTION_DAYS = 30

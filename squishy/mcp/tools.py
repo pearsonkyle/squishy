@@ -7,9 +7,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from squishy.tools.base import Tool, ToolContext, ToolResult
+
 from .client import get_mcp_manager
 from .config import load_mcp_configs
 from .types import MCPTool
@@ -18,8 +19,8 @@ log = logging.getLogger("squishy.mcp")
 
 _initialized = False
 _init_lock = threading.Lock()
-_connect_errors: Dict[str, Optional[str]] = {}
-_mcp_tools: List[Tool] = []
+_connect_errors: dict[str, str | None] = {}
+_mcp_tools: list[Tool] = []
 
 
 def _make_mcp_runner(qualified_name: str):
@@ -62,7 +63,7 @@ def _register_tools_into_squishy(tools: list[Tool]) -> None:
         _mcp_tools.append(tool)
 
 
-def initialize_mcp(verbose: bool = False) -> Dict[str, Optional[str]]:
+def initialize_mcp(verbose: bool = False) -> dict[str, str | None]:
     """Load configs, connect servers, register tools. Idempotent."""
     global _initialized, _connect_errors
 
@@ -95,7 +96,7 @@ def initialize_mcp(verbose: bool = False) -> Dict[str, Optional[str]]:
         return errors
 
 
-def reload_mcp() -> Dict[str, Optional[str]]:
+def reload_mcp() -> dict[str, str | None]:
     """Force reload: re-read configs, reconnect, re-register."""
     global _initialized
     with _init_lock:
@@ -108,5 +109,5 @@ def get_mcp_tools() -> list[Tool]:
     return list(_mcp_tools)
 
 
-def get_connect_errors() -> Dict[str, Optional[str]]:
+def get_connect_errors() -> dict[str, str | None]:
     return dict(_connect_errors)

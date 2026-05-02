@@ -244,16 +244,6 @@ def render_plan_status(plan: PlanState, *, step_desc_chars: int = 160) -> str:
     return "\n".join(lines)
 
 
-def is_plan_status_message(message: dict[str, Any]) -> bool:
-    """Return True if ``message`` is a previously-injected plan-status block."""
-    if message.get("role") != "system":
-        return False
-    content = message.get("content")
-    if not isinstance(content, str):
-        return False
-    return content.startswith(PLAN_STATUS_OPEN_TAG)
-
-
 def plan_dir(cwd: str | os.PathLike[str]) -> Path:
     return Path(cwd) / PLAN_DIR
 
@@ -306,7 +296,6 @@ __all__ = [
     "STEP_STATUSES",
     "clear_plan",
     "has_plan_file",
-    "is_plan_status_message",
     "load_plan",
     "plan_path",
     "render_plan_status",

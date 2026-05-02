@@ -22,7 +22,11 @@ from squishy.tools.shell import SHELL_TOOLS
 ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *PLAN_TOOLS, *SCRATCHPAD_TOOLS]
 REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
-PromptFn = Callable[[Tool, dict[str, object]], Awaitable[bool]]
+# prompt_fn return type:
+#   True  -> approved
+#   False -> declined (no feedback)
+#   str   -> declined with user feedback (passed to the agent)
+PromptFn = Callable[[Tool, dict[str, object]], Awaitable[bool | str]]
 
 
 def check_permission(
@@ -59,8 +63,10 @@ async def dispatch(
         if reason == "prompt":
             if prompt_fn is None:
                 return ToolResult(False, error="refused: user approval required (no TTY)")
-            if not await prompt_fn(tool, args):
-                return ToolResult(False, error="refused: user declined")
+            approval = await prompt_fn(tool, args)
+            if approval is not True:
+                feedback = f" {approval}" if isinstance(approval, str) else ""
+                return ToolResult(False, error=f"refused: user declined.{feedback}".rstrip())
         else:
             return ToolResult(False, error=reason)
 
@@ -76,18 +82,14 @@ def openai_schemas(mode: str | None = None) -> list[dict[str, object]]:
     When `mode` is None, all tools are returned (backwards compatibility).
     When `mode` is set, only tools permitted in that mode are exposed — so the
     model never sees `write_file`/`edit_file` in plan mode, etc.
-
-    MCP tools are exposed in every mode except ``plan``. Plan mode is meant
-    to be read-only and external MCP servers can have arbitrary side effects,
-    so we hide them from the schema as well as rejecting them at dispatch.
     """
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
     allowed = _get_allowed_tools(mode)
-    expose_mcp = mode != "plan"
     return [
-        t.openai_schema() for t in ALL_TOOLS
-        if t.name in allowed or (expose_mcp and t.name.startswith("mcp__"))
+        t.openai_schema()
+        for t in ALL_TOOLS
+        if t.name in allowed or (t.name.startswith("mcp__") and mode != "plan")
     ]
 
 

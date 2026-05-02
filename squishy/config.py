@@ -8,15 +8,6 @@ from dataclasses import dataclass, field
 PermissionMode = str  # "plan" | "edits" | "yolo" | "bench"
 MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo", "bench")
 
-# Task profiles change the system prompt and tune which signals count as
-# "progress" — see `context.build_system_prompt` and the agent loop's
-# anchoring logic. "coding" is the default and matches squishy's original
-# SWE-bench-shaped behaviour. "general" relaxes those assumptions: no
-# build/test commands in the prompt, no edit-as-progress bias, save_note
-# / search results count as anchors.
-TaskType = str  # "coding" | "general"
-TASK_TYPES: tuple[TaskType, ...] = ("coding", "general")
-
 
 @dataclass
 class Config:
@@ -45,9 +36,6 @@ class Config:
     )
     use_sandbox: bool = False
     thinking: bool = False
-    task_type: TaskType = field(
-        default_factory=lambda: os.environ.get("SQUISHY_TASK_TYPE", "coding")
-    )
     index_concurrency: int = 4
     max_tokens_per_index: int = 100_000
     auto_init: bool = False
@@ -60,11 +48,12 @@ class Config:
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
     max_tool_output_chars: int = 32_000
-    max_quality_retries: int = 2
+    max_quality_retries: int = 3
     compaction_threshold: float = 0.7
     max_stuck_turns: int = 3
+    max_system_nudges: int = 12  # cap total nudges to avoid flooding context
     # Phase-budget thresholds (bench/yolo modes only).
-    max_explore_turns: int = 8
+    max_explore_turns: int = 3
     max_fix_verify_cycles: int = 6
     max_post_edit_read_turns: int = 4
     # Session persistence.

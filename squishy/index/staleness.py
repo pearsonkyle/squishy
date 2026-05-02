@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from squishy.index.store import load_index, load_meta
+from squishy.index.store import load_meta
 from squishy.index.walker import walk_repo
 
 STALE_GRACE_SECONDS = 5.0  # ignore mtime jitter within the build window

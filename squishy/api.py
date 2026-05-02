@@ -43,16 +43,15 @@ class Squishy:
     use_sandbox: bool = False
     sandbox_image: str = "python:3.11-slim"
     thinking: bool = False
-    task_type: str = "coding"
-    max_consecutive_errors: int = 3
+    max_consecutive_errors: int = 8
     max_plan_nudges: int = 4
     max_plan_investigation_turns: int = 4
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
-    max_quality_retries: int = 2
+    max_quality_retries: int = 3
     compaction_threshold: float = 0.7
     max_stuck_turns: int = 3
-    max_explore_turns: int = 8
+    max_explore_turns: int = 3
     max_fix_verify_cycles: int = 6
     max_post_edit_read_turns: int = 4
     max_tool_output_chars: int = 32_000
@@ -94,11 +93,14 @@ class Squishy:
         timeout: float | None = None,
         on_text: Callable[[str], None] | None = None,
         session_id: str | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> TaskResult:
         """Run a single user turn to completion."""
         cfg = self._make_config(working_dir)
         display = _CallbackDisplay(on_text) if on_text else None
         agent = Agent(cfg, self._client, display=display, session_id=session_id)  # type: ignore[arg-type]
+        if extra_env:
+            agent.tool_ctx.extra_env.update(extra_env)
         return await agent.run(message, timeout=timeout)
 
     def _make_config(self, working_dir: str | None) -> Config:

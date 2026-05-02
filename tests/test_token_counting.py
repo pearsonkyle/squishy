@@ -2,10 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-import pytest
-
 from squishy.display import estimate_tokens
 
 
@@ -34,12 +30,13 @@ class TestEstimateTokens:
         assert estimate_tokens("こんにちは") == 2  # 5 chars / 4 = 1.25 -> 2
 
 
-@pytest.mark.asyncio
 class TestAgentTokenCounting:
     async def test_agent_counts_system_prompt_tokens(self, tmp_path) -> None:
         from squishy.agent import Agent
         from squishy.config import Config
         from squishy.display import Display
+
+        from squishy.client import CompletionResult
 
         class FakeClient:
             async def health(self) -> bool:
@@ -58,8 +55,6 @@ class TestAgentTokenCounting:
                     tool_calls=[],
                     usage={"prompt_tokens": 50, "completion_tokens": 10},
                 )
-
-        from dataclasses import dataclass
 
         cfg = Config()
         cfg.working_dir = str(tmp_path)

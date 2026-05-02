@@ -20,9 +20,6 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next"}
 SEARCH_TIMEOUT = 15.0
 SEARCH_CAP = 200
-# Env vars that are safe to forward to ripgrep. Everything else (API keys,
-# AWS creds, etc.) is dropped so a malicious pattern can't reach them.
-_RG_ALLOWED_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM")
  
  
 def _resolve(path: str, cwd: str) -> str:
@@ -49,11 +46,34 @@ def _safe_resolve(path: str, cwd: str) -> tuple[str, str | None]:
     return abs_path, None
 
 
+def _unescape_str(s: str) -> str:
+    """Unescape over-escaped characters in model-generated strings.
+
+    Models sometimes double-escape JSON strings, producing literal backslash
+    sequences like ``\\"`` or ``\\n`` that don't match actual file content.
+    This converts common escape sequences to their actual characters.
+    Only applied when the original string doesn't match; safe because real
+    backslash sequences in source code would already have matched.
+    """
+    if "\\" not in s:
+        return s
+    result = s
+    result = result.replace('\\"', '"')
+    result = result.replace("\\'", "'")
+    result = result.replace("\\n", "\n")
+    result = result.replace("\\t", "\t")
+    # Don't unescape \\ → \ (that would break actual backslash content)
+    return result
+
+
 def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
     """Drop any cached reads for *abs_path* after a mutating write/edit."""
     for key in [k for k in ctx.files_read_meta if k[0] == abs_path]:
         del ctx.files_read_meta[key]
     ctx.files_read.pop(abs_path, None)
+    # files_read is keyed by relative path, so also pop relative form.
+    rel_path = os.path.relpath(abs_path, ctx.working_dir)
+    ctx.files_read.pop(rel_path, None)
 
 
 def _collect_match_context(
@@ -89,26 +109,19 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not os.path.isfile(abs_path):
         return ToolResult(False, error=f"file not found: {path}")
 
-    offset = int(args.get("offset") or 0)
+    try:
+        offset = int(float(args.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
     limit = args.get("limit")
+    if limit is not None:
+        try:
+            limit = int(float(limit))
+        except (TypeError, ValueError):
+            limit = None
 
-    # Hard cap: refuse after too many reads of the same path.
-    path_count = ctx.files_read_count.get(abs_path, 0)
-    if path_count >= 5:
-        return ToolResult(
-            False,
-            error=(
-                f"Refused: you have already read '{path}' {path_count} times. "
-                "You have the content — use `save_note` to persist key parts if needed, "
-                "then call `edit_file` with your fix. Do NOT read this file again."
-            ),
-        )
-
-    # Duplicate-read dedup. When the same path is requested with the same
-    # offset+limit window as a prior read in this conversation, return the
-    # cached content with an unmistakable marker so the LLM realizes it has
-    # already seen this file. This prevents the model from re-requesting
-    # reads after earlier turns were trimmed from history.
+    # Duplicate-read dedup (checked BEFORE the hard cap so cached reads are
+    # always returned without counting against the limit).
     cache_key = (abs_path, offset, limit)
     prior = ctx.files_read_meta.get(cache_key)
     if prior is not None:
@@ -130,6 +143,20 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             display=f"cache hit ({prior['returned_lines']} lines, already read)",
         )
 
+    # Hard cap: refuse after too many reads of the same path.
+    # Exempt files where edit_file just failed — the model needs fresh content
+    # for an accurate old_str.
+    path_count = ctx.files_read_count.get(abs_path, 0)
+    if path_count >= 5 and abs_path not in ctx.edit_fail_files:
+        return ToolResult(
+            False,
+            error=(
+                f"Refused: you have already read '{path}' {path_count} times. "
+                "You have the content — use `save_note` to persist key parts if needed, "
+                "then call `edit_file` with your fix. Do NOT read this file again."
+            ),
+        )
+
     try:
         with open(abs_path, encoding="utf-8", errors="replace") as f:
             text = f.read()
@@ -137,7 +164,7 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         return ToolResult(False, error=str(e))
 
     lines = text.splitlines()
-    sliced = lines[offset : offset + int(limit)] if limit is not None else lines[offset:]
+    sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
     content = "\n".join(sliced)
 
     ctx.files_read[path] = content
@@ -182,13 +209,7 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     # Hard guard: write_file is for creating NEW files only. Existing files
     # must be modified with edit_file — full rewrites via write_file are the
     # main tool-misuse pathology observed in small-model coding sessions.
-    # Use O_CREAT|O_EXCL ("x" mode) so the existence check and create are
-    # atomic: a concurrent writer can't sneak a symlink in between checks.
-    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-    try:
-        with open(abs_path, "x", encoding="utf-8") as f:
-            f.write(content)
-    except FileExistsError:
+    if os.path.isfile(abs_path):
         return ToolResult(
             False,
             error=(
@@ -202,6 +223,10 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 "Do NOT retry write_file."
             ),
         )
+
+    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(content)
 
     _invalidate_read_cache(ctx, abs_path)
     encoded = content.encode("utf-8")
@@ -237,13 +262,24 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         stripped_count = text_stripped.count(old_stripped)
 
         if stripped_count == 1:
-            # Find the match position in the stripped text, then map it
-            # back to the original text so we only modify the matched region
-            # (preserving trailing whitespace in unrelated lines).
-            match_start = text_stripped.index(old_stripped)
-            match_end = match_start + len(old_stripped)
+            # Map match position from stripped text back to original lines
+            # so only the matched region loses trailing whitespace.
+            orig_lines = text.split("\n")
+
+            # Determine which lines the match covers in the stripped text.
+            pre_match = text_stripped[: text_stripped.index(old_stripped)]
+            start_line = pre_match.count("\n")
+            old_line_count = old_stripped.count("\n") + 1
+            end_line = start_line + old_line_count
+
             new_stripped = "\n".join(line.rstrip() for line in new_str.split("\n"))
-            new_text = text_stripped[:match_start] + new_stripped + text_stripped[match_end:]
+            before = "\n".join(orig_lines[:start_line])
+            after = "\n".join(orig_lines[end_line:])
+            parts = [p for p in (before, new_stripped, after) if p]
+            new_text = "\n".join(parts) if parts else ""
+            # Preserve trailing newline if original had one
+            if text.endswith("\n") and not new_text.endswith("\n"):
+                new_text += "\n"
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
             _invalidate_read_cache(ctx, abs_path)
@@ -276,6 +312,46 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                     + context_snippets
                 ),
             )
+
+        # Stage 1b: unescape over-escaped characters (e.g. \" → ", \n → newline)
+        # Models sometimes double-escape JSON strings, producing literal backslash
+        # sequences that don't match the actual file content.
+        old_unesc = _unescape_str(old_str)
+        new_unesc = _unescape_str(new_str)
+        if old_unesc != old_str:
+            unesc_count = text.count(old_unesc)
+            if unesc_count == 1 or (unesc_count > 1 and replace_all):
+                new_text = text.replace(old_unesc, new_unesc, -1 if replace_all else 1)
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                _invalidate_read_cache(ctx, abs_path)
+                old_lines = len(old_unesc.splitlines()) or 1
+                new_lines = len(new_unesc.splitlines()) or 1
+                return ToolResult(
+                    True,
+                    data={
+                        "path": path,
+                        "replacements": unesc_count if replace_all else 1,
+                        "old_lines": old_lines,
+                        "new_lines": new_lines,
+                        "old_str": old_unesc,
+                        "new_str": new_unesc,
+                        "note": "escape sequences normalized",
+                    },
+                    display=f"{old_lines} → {new_lines} lines (escape sequences normalized)",
+                )
+            if unesc_count > 1 and not replace_all:
+                context_snippets = _collect_match_context(
+                    text, old_unesc, max_matches=3, context_lines=2
+                )
+                return ToolResult(
+                    False,
+                    error=(
+                        f"old_str matched {unesc_count} times after unescaping. "
+                        f"Add more surrounding context or use replace_all=true. "
+                        f"Match sites:\n" + context_snippets
+                    ),
+                )
 
         # Stage 2: no match even after normalization — provide diagnostic hint
         old_lines_list = old_str.split("\n")
@@ -363,6 +439,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
 async def _list_directory(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = args.get("path", ".")
+    show_hidden = bool(args.get("show_hidden", False))
     if not isinstance(path, str):
         return ToolResult(False, error="`path` must be a string")
     abs_path, err = _safe_resolve(path, ctx.working_dir)
@@ -373,7 +450,9 @@ async def _list_directory(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     entries = []
     for name in sorted(os.listdir(abs_path)):
-        if name in SKIP_DIRS or name.startswith("."):
+        if name in SKIP_DIRS:
+            continue
+        if not show_hidden and name.startswith("."):
             continue
         full = os.path.join(abs_path, name)
         kind = "dir" if os.path.isdir(full) else "file"
@@ -414,14 +493,10 @@ async def _rg_search(
     cmd = [rg, "-n", "--no-heading", "-S", pattern, abs_path]
     if isinstance(glob, str):
         cmd.extend(["-g", glob])
-    # Forward only a minimal env subset so ripgrep config / locale settings
-    # aren't bypassed, but local secrets (API keys, tokens) aren't exposed
-    # to a subprocess that can be steered by model-controlled patterns.
-    rg_env = {k: v for k, v in os.environ.items() if k in _RG_ALLOWED_ENV}
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            env=rg_env,
+            env=os.environ.copy(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -528,10 +603,17 @@ edit_file = Tool(
  
 list_directory = Tool(
     name="list_directory",
-    description="List files and directories. Hides dotfiles and standard vendor dirs.",
+    description="List files and directories. Hides dotfiles by default (use show_hidden=true to include them).",
     parameters={
         "type": "object",
-        "properties": {"path": {"type": "string", "default": "."}},
+        "properties": {
+            "path": {"type": "string", "default": "."},
+            "show_hidden": {
+                "type": "boolean",
+                "default": False,
+                "description": "Include dotfiles/hidden files in the listing",
+            },
+        },
     },
     run=_list_directory,
 )
@@ -559,7 +641,10 @@ async def _show_diff(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = args.get("path")
     cmd = ["git", "diff"]
     if isinstance(path, str) and path.strip():
-        cmd += ["--", _resolve(path, ctx.working_dir)]
+        abs_path, err = _safe_resolve(path, ctx.working_dir)
+        if err:
+            return ToolResult(False, error=err)
+        cmd += ["--", abs_path]
 
     try:
         proc = await asyncio.create_subprocess_exec(

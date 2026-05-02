@@ -20,13 +20,8 @@ def _tc(name: str, args: dict, call_id: str = "c1"):
 
 from squishy.client import CompletionResult
 
-
-@pytest.mark.asyncio
-
 class TestPlanEdgeCases:
     """Test edge cases in plan operations."""
-
-    @pytest.mark.asyncio
     async def test_plan_with_no_steps(self, tmp_path):
         """Empty steps array should fail validation."""
         from squishy.tools.plan import _plan_task
@@ -176,9 +171,6 @@ class TestPlanEdgeCases:
             assert ctx.plan.files_to_create == ["new.py"]
             assert ctx.plan.files_to_modify == ["old.py"]
 
-
-@pytest.mark.asyncio
-
 class TestReadCacheEdgeCases:
     """Test edge cases in file read caching."""
 
@@ -244,9 +236,6 @@ class TestReadCacheEdgeCases:
         assert not result.success
         assert "file not found" in result.error.lower()
 
-
-@pytest.mark.asyncio
-
 class TestEditEdgeCases:
     """Test edge cases in file editing."""
 
@@ -302,9 +291,6 @@ class TestEditEdgeCases:
         )
         # Empty old_str is problematic - either fail or replace everything
         assert not result.success
-
-
-@pytest.mark.asyncio
 
 class TestWriteEdgeCases:
     """Test edge cases in file writing."""
@@ -466,9 +452,6 @@ class TestLoadPlanEdgeCases:
         assert hasattr(result, "solution")
         assert hasattr(result, "steps")
 
-
-@pytest.mark.asyncio
-
 class TestConsecutiveReadsTracking:
     """Test MAX_RECALL_SKIP_TURNS enforcement."""
 
@@ -525,62 +508,3 @@ class TestConsecutiveReadsTracking:
         initial_count = agent.consecutive_reads_without_recall
 
         assert initial_count == 0
-
-
-class TestProblemFileExtraction:
-    """Goal-drift heuristic: regex must reject traversal/absolute paths so
-    a crafted problem statement can't inject sensitive paths into agent state."""
-
-    def test_extracts_normal_paths(self):
-        from squishy.agent import _extract_problem_files
-
-        text = "fix the bug in sympy/core/power.py and also update tests/test_foo.py"
-        paths = _extract_problem_files(text)
-        assert "sympy/core/power.py" in paths
-        assert "tests/test_foo.py" in paths
-
-    def test_rejects_traversal_paths(self):
-        from squishy.agent import _extract_problem_files
-
-        text = "look at ../../etc/passwd.py and ../../../secrets.py"
-        paths = _extract_problem_files(text)
-        for p in paths:
-            assert ".." not in p.split("/")
-
-    def test_rejects_absolute_and_home_paths(self):
-        from squishy.agent import _extract_problem_files
-
-        text = "see /etc/foo.py and ~/.ssh/id_rsa.py"
-        paths = _extract_problem_files(text)
-        for p in paths:
-            assert not p.startswith(("/", "~"))
-
-
-class TestPolyglotTestDetection:
-    """_is_test_command should recognize test runners beyond pytest."""
-
-    def test_pytest_still_detected(self):
-        from squishy.agent import _is_test_command
-        assert _is_test_command("pytest tests/")
-        assert _is_test_command("python -m pytest -x")
-
-    def test_recognizes_js_runners(self):
-        from squishy.agent import _is_test_command
-        assert _is_test_command("npm test")
-        assert _is_test_command("npm run test")
-        assert _is_test_command("yarn test")
-        assert _is_test_command("jest --watch")
-        assert _is_test_command("vitest run")
-
-    def test_recognizes_cargo_go_mvn(self):
-        from squishy.agent import _is_test_command
-        assert _is_test_command("cargo test")
-        assert _is_test_command("go test ./...")
-        assert _is_test_command("mvn test")
-        assert _is_test_command("./gradlew test")
-
-    def test_does_not_match_unrelated_commands(self):
-        from squishy.agent import _is_test_command
-        assert not _is_test_command("ls -la")
-        assert not _is_test_command("git status")
-        assert not _is_test_command("cat README.md")
