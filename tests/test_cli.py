@@ -68,6 +68,23 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
     assert "[bold green]✓ Switched to edits mode[/]" in display.info_calls
 
 
+async def test_user_configured_model_via_args():
+    args = SimpleNamespace(model="my-model")
+    assert cli._user_configured_model(args) is True
+
+
+async def test_user_configured_model_via_env(monkeypatch):
+    monkeypatch.setenv("SQUISHY_MODEL", "env-model")
+    args = SimpleNamespace(model=None)
+    assert cli._user_configured_model(args) is True
+
+
+async def test_user_configured_model_default(monkeypatch):
+    monkeypatch.delenv("SQUISHY_MODEL", raising=False)
+    args = SimpleNamespace(model=None)
+    assert cli._user_configured_model(args) is False
+
+
 async def test_run_one_clears_stale_plan(monkeypatch, tmp_path):
     """A one-shot invocation should not pick up a leftover plan from a
     previous interactive run."""

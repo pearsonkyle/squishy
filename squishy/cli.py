@@ -69,6 +69,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
  
  
+def _user_configured_model(args: argparse.Namespace) -> bool:
+    """Return True if the user explicitly chose a model (via --model or env).
+
+    When False we let endpoint discovery fill in cfg.model so the banner
+    matches whatever requests are actually routed to. When True we keep the
+    user's choice (e.g. SQUISHY_MODEL from a .env) so a multi-model endpoint
+    doesn't make the banner contradict the requests being sent.
+    """
+    if args.model:
+        return True
+    return bool(os.environ.get("SQUISHY_MODEL"))
+
+
 def _build_config(args: argparse.Namespace) -> Config:
     cfg = Config()
     if args.base_url:
@@ -156,9 +169,16 @@ async def _amain() -> None:
     )
 
     try:
-        # Discover the actual model name from endpoint (also discovers context_window)
+        # Discover the endpoint's model list (also picks up context_window).
+        # Only adopt the discovered name when the user hasn't explicitly
+        # configured a model — otherwise the banner would show a different
+        # model than the one requests are routed to (e.g. when a .env file
+        # sets SQUISHY_MODEL but the endpoint has multiple models loaded).
         discovered_model = await client.discover_model_name()
-        display.banner(cfg.base_url, discovered_model)
+        if not _user_configured_model(args):
+            cfg.model = discovered_model
+            client.model = discovered_model
+        display.banner(cfg.base_url, cfg.model)
         # Use the discovered context window so the % usage display is meaningful.
         # Falls back to 0 (no % shown) for endpoints that don't expose it.
         display.stats.context_window = client.context_window
