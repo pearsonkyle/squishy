@@ -25,6 +25,8 @@ class ToolContext:
     notes: dict[str, str] = field(default_factory=dict)
     _cached_index: Any = field(default=None, repr=False)
     files_read_count: dict[str, int] = field(default_factory=dict)
+    edit_fail_files: set[str] = field(default_factory=set)
+    extra_env: dict[str, str] = field(default_factory=dict)
  
  
 @dataclass

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pytest
 
 from squishy.tools.fs import (
     edit_file,
@@ -10,7 +9,6 @@ from squishy.tools.fs import (
     write_file,
 )
 
-pytestmark = pytest.mark.asyncio
 
 
 async def test_write_and_read_roundtrip(ctx):
@@ -157,6 +155,63 @@ async def test_edit_file_trailing_whitespace_fuzzy_match(ctx):
     )
     assert r.success
     assert "trailing whitespace normalized" in (r.data.get("note", "") + (r.display or ""))
+
+
+async def test_edit_file_unescape_quotes(ctx):
+    """edit_file should auto-unescape over-escaped quotes in old_str/new_str."""
+    await write_file.run(
+        {"path": "docstr.py", "content": '"""Module docstring."""\nx = 1\n'}, ctx
+    )
+    # Model sends escaped quotes (\") that don't match actual quotes (")
+    r = await edit_file.run(
+        {
+            "path": "docstr.py",
+            "old_str": '\\"\\"\\"Module docstring.\\"\\"\\"',
+            "new_str": '\\"\\"\\"Updated docstring.\\"\\"\\"',
+        },
+        ctx,
+    )
+    assert r.success, r.error
+    assert "escape sequences normalized" in r.data.get("note", "")
+    content = (ctx.working_dir / "docstr.py").read_text() if hasattr(ctx.working_dir, "read_text") else open(ctx.working_dir + "/docstr.py").read()
+    assert '"""Updated docstring."""' in content
+
+
+async def test_edit_file_unescape_newlines(ctx):
+    """edit_file should auto-unescape literal \\n in new_str."""
+    await write_file.run(
+        {"path": "lines.py", "content": "line1\nline2\n"}, ctx
+    )
+    r = await edit_file.run(
+        {
+            "path": "lines.py",
+            "old_str": "line1\\nline2",
+            "new_str": "line1\\nline2\\nline3",
+        },
+        ctx,
+    )
+    assert r.success, r.error
+    content = open(ctx.working_dir + "/lines.py").read() if isinstance(ctx.working_dir, str) else (ctx.working_dir / "lines.py").read_text()
+    assert "line3" in content
+
+
+async def test_edit_file_unescape_not_applied_when_exact_match(ctx):
+    """Unescape should not fire when old_str already matches exactly."""
+    await write_file.run(
+        {"path": "esc.py", "content": 'path = "hello\\nworld"\n'}, ctx
+    )
+    # old_str with literal backslash-n should match the file exactly
+    r = await edit_file.run(
+        {
+            "path": "esc.py",
+            "old_str": 'path = "hello\\nworld"',
+            "new_str": 'path = "hello\\nworld\\n!"',
+        },
+        ctx,
+    )
+    assert r.success, r.error
+    # Should not have "escape sequences normalized" since exact match worked
+    assert r.data.get("note") is None
 
 
 async def test_edit_file_diagnostic_hint_on_miss(ctx):

@@ -235,13 +235,8 @@ def test_classify_error_maps_common_cases():
 
 
 def test_build_prompt_includes_env_error_guidance():
-    from squishy.bench.swebench import build_prompt
+    """Environmental error guidance is now in the system prompt (bench mode block)."""
+    from squishy.context import _mode_block
 
-    instance = {
-        "instance_id": "test__test-1",
-        "problem_statement": "A bug in foo.py",
-    }
-    prompt = build_prompt(instance)
-    assert "Environmental Error Handling" in prompt
-    assert "ImportError" in prompt
-    assert "DO NOT fix those import errors" in prompt
+    bench_block = _mode_block("bench", "/tmp")
+    assert "ImportError" in bench_block

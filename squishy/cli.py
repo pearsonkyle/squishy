@@ -9,11 +9,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import os
 import sys
 
 from dotenv import load_dotenv
-
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
@@ -21,16 +19,14 @@ from prompt_toolkit.key_binding import KeyBindings
 from squishy.agent import Agent
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display, MODE_COLORS, Stats
+from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
-from squishy.plan_state import PlanState
 from squishy.session import (
     create_session,
     export_training_to_file,
     list_sessions,
     load_messages,
-    load_session,
 )
 from squishy.tools.base import Tool
 
@@ -178,12 +174,20 @@ async def _amain() -> None:
         except Exception as e:
             display.warn(f"[mcp] init failed: {e}")
 
-        async def prompt_fn(tool: Tool, args_: dict) -> bool:
+        async def prompt_fn(tool: Tool, args_: dict) -> bool | str:
             try:
-                reply = await asyncio.to_thread(input, "  approve? [y/N] ")
+                reply = await asyncio.to_thread(
+                    input, "  approve? [y/N] or type feedback: ",
+                )
             except (EOFError, KeyboardInterrupt):
                 return False
-            return reply.strip().lower() in ("y", "yes")
+            text = reply.strip()
+            if text.lower() in ("y", "yes"):
+                return True
+            if text.lower() in ("n", "no", ""):
+                return False
+            # Any other text is treated as feedback for the agent.
+            return text
  
         if args.message:
             await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout)
@@ -397,7 +401,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             continue
         if line in ("/clear", "/new"):
             # Clear terminal screen
-            os.system("clear" if os.name != "nt" else "cls")
+            print("\033[H\033[2J", end="", flush=True)
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
@@ -515,9 +519,9 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:
     """Handle /mcp slash command."""
-    from squishy.mcp.tools import reload_mcp, get_connect_errors
     from squishy.mcp.client import get_mcp_manager
     from squishy.mcp.config import add_server_to_user_config, remove_server_from_user_config
+    from squishy.mcp.tools import reload_mcp
 
     parts = rest.split() if rest else []
     subcmd = parts[0].lower() if parts else "list"

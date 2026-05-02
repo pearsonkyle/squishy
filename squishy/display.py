@@ -12,7 +12,10 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
-MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
+from squishy.plan_state import STATUS_ICONS
+from squishy.tool_restrictions import get_allowed_tools
+
+MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta", "bench": "ansiyellow"}
 
 
 def estimate_tokens(text: str) -> int:
@@ -88,7 +91,8 @@ class Display:
 
     def turn_header(self, turn: int, max_turns: int, tool_name: str, brief: str) -> None:
         icon = ICONS.get(tool_name, "•")
-        self.console.print(f"[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]")
+        esc = "\\"  # Rich escape for literal bracket
+        self.console.print(f"[dim]{esc}[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]")
 
     def command_line(self, command: str) -> None:
         """Show the full shell command on its own line (markup-safe)."""
@@ -155,31 +159,32 @@ class Display:
         if not self._use_live:
             # First chunk: start Live rendering
             self._use_live = True
+            self._last_parse_len = 0
             self._live_render = Markdown(self._stream_buffer)
             self._live = Live(
                 self._live_render,
                 console=self.console,
-                refresh_per_second=12,
+                refresh_per_second=8,
             )
             self._live.start()
         else:
-            # Update existing Live display
-            if self._live_render is not None:
-                self._live_render.update(Markdown(self._stream_buffer))
-            if self._live is not None:
-                self._live.refresh()
+            # Throttle re-parsing: only rebuild Markdown every 50+ chars
+            # or on structural markdown characters
+            delta = len(self._stream_buffer) - getattr(self, "_last_parse_len", 0)
+            if delta >= 50 or any(c in s for c in "\n#*`-"):
+                self._live_render = Markdown(self._stream_buffer)
+                if self._live is not None:
+                    self._live.update(self._live_render)
+                self._last_parse_len = len(self._stream_buffer)
 
     def flush_streaming_text(self) -> None:
         """Finalize streaming text output. Call when a prose response completes.
-        
+
         Stops the Live display and prints the final rendered markdown
-        as a permanent output.
+        as a permanent output (once).
         """
         if self._live is not None:
-            # Stop Live and render final state permanently
-            if self._live_render is not None:
-                self.console.print()  # blank line before
-                self.console.print(self._live_render)
+            # Stop Live first (this renders the final frame automatically)
             self._live.stop()
             self._live = None
             self._live_render = None
@@ -207,7 +212,6 @@ class Display:
         lines.append(f"[bold green]Solution:[/] {data.get('solution', '')}")
         lines.append("")
         lines.append("[bold yellow]Steps:[/]")
-        from squishy.plan_state import STATUS_ICONS
         for i, step in enumerate(data.get("steps", []), 1):
             desc = step if isinstance(step, str) else step.get("description", "")
             status = "" if isinstance(step, str) else step.get("status", "pending")
@@ -259,8 +263,6 @@ class Display:
 
     def status(self, mode: str) -> None:
         """Display current configuration and tool availability."""
-        from squishy.tool_restrictions import get_allowed_tools
-
         allowed = get_allowed_tools(mode)
         
         self.console.rule(f"[bold]{mode.upper()} MODE[/]", style=MODE_COLORS.get(mode, "dim"))
@@ -285,16 +287,4 @@ class Display:
         
         self.console.print("\n".join(lines))
 
-    def progress(self, current: int, total: int, message: str = "") -> None:
-        """Display progress indicator."""
-        percent = 100 if total == 0 else (current * 100) // total
-        
-        bar_width = 40
-        filled = int(bar_width * percent / 100)
-        bar = "█" * filled + "░" * (bar_width - filled)
-        
-        if message:
-            self.console.print(f"[dim]{message}[/] {bar} {percent}% ({current}/{total})")
-        else:
-            self.console.print(f"{bar} {percent}% ({current}/{total})")
 

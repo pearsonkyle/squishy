@@ -10,7 +10,6 @@ import pytest
 from squishy.api import Squishy
 from squishy.client import CompletionResult, ToolCall
  
-pytestmark = pytest.mark.asyncio
  
  
 class _ScriptedClient:
@@ -97,3 +96,63 @@ async def test_squishy_aclose_closes_client(tmp_path):
         await sq.aclose()
  
     assert client.closed
+
+
+# -- Mode switching tests ------------------------------------------------------
+
+def test_tool_schemas_differ_by_mode():
+    """Tool schemas should differ between plan and edits modes."""
+    from squishy.tools import openai_schemas
+
+    plan_schemas = openai_schemas("plan")
+    edits_schemas = openai_schemas("edits")
+    yolo_schemas = openai_schemas("yolo")
+    bench_schemas = openai_schemas("bench")
+
+    plan_names = {s["function"]["name"] for s in plan_schemas}
+    edits_names = {s["function"]["name"] for s in edits_schemas}
+    yolo_names = {s["function"]["name"] for s in yolo_schemas}
+    bench_names = {s["function"]["name"] for s in bench_schemas}
+
+    # Plan mode should NOT have edit_file or write_file.
+    assert "edit_file" not in plan_names
+    assert "write_file" not in plan_names
+    # Edits and yolo should have edit_file.
+    assert "edit_file" in edits_names
+    assert "edit_file" in yolo_names
+    assert "edit_file" in bench_names
+    # All modes should have read_file.
+    assert "read_file" in plan_names
+    assert "read_file" in edits_names
+
+
+async def test_mode_switch_between_runs(tmp_path):
+    """Running with different permission modes should use different tool schemas."""
+    schemas_seen: list[list[dict]] = []
+
+    class _SchemaCapture(_ScriptedClient):
+        async def complete(self, messages, tools, **kwargs):
+            schemas_seen.append(tools)
+            return CompletionResult(text="done.", tool_calls=[])
+
+    # Each Squishy creates its own Client in __post_init__, so we use
+    # side_effect to return a fresh capture instance each time.
+    with patch("squishy.api.Client", side_effect=lambda **kw: _SchemaCapture([])):
+        # First run in plan mode
+        sq1 = Squishy(model="fake", permission_mode="plan")
+        await sq1.run("explore code", working_dir=str(tmp_path))
+        await sq1.aclose()
+
+        # Second run in edits mode
+        sq2 = Squishy(model="fake", permission_mode="edits")
+        await sq2.run("fix bug", working_dir=str(tmp_path))
+        await sq2.aclose()
+
+    assert len(schemas_seen) >= 2
+    # The plan run may produce multiple completions, so check the first
+    # and last captured schemas instead of indices 0 and 1.
+    plan_tools = {s["function"]["name"] for s in schemas_seen[0]}
+    edits_tools = {s["function"]["name"] for s in schemas_seen[-1]}
+    # Plan shouldn't have write tools, edits should.
+    assert "edit_file" not in plan_tools
+    assert "edit_file" in edits_tools

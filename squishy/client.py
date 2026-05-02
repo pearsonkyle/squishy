@@ -18,7 +18,6 @@ import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 from tenacity import (
     AsyncRetrying,
-    RetryError,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
@@ -158,8 +157,6 @@ class Client:
                     if stream:
                         return await self._complete_stream(messages, tools, on_text)
                     return await self._complete_sync(messages, tools)
-        except RetryError as e:  # pragma: no cover — AsyncRetrying with reraise=True
-            raise LLMError(f"retries exhausted: {e}") from e
         except APIStatusError as e:
             raise LLMError(f"LLM returned {e.status_code}: {e.message}") from e
         except TRANSIENT_ERRORS as e:  # retries exhausted (reraise=True path)
@@ -197,7 +194,8 @@ class Client:
         # Capture reasoning separately for training data export.
         reasoning = getattr(msg, "reasoning", None) or ""
         # Fallback: some models (Qwen3 thinking mode) put text in `reasoning`.
-        text = msg.content or reasoning or ""
+        # Use `is None` check so an explicit empty-string content doesn't leak reasoning.
+        text = msg.content if msg.content is not None else (reasoning or "")
         # Fallback: parse XML tool calls from text when server doesn't parse them.
         if not calls and text:
             xml_calls = _parse_xml_tool_calls(text)
@@ -243,12 +241,11 @@ class Client:
             delta_reasoning = getattr(delta, "reasoning", None)
             if delta_reasoning:
                 reasoning_parts.append(delta_reasoning)
-            # Fallback: Qwen3 thinking mode streams into `reasoning` not `content`.
-            content = getattr(delta, "content", None) or delta_reasoning
-            if content:
-                text_parts.append(content)
+            raw_content = getattr(delta, "content", None)
+            if raw_content is not None:
+                text_parts.append(raw_content)
                 if on_text is not None:
-                    result = on_text(content)
+                    result = on_text(raw_content)
                     if result is not None:
                         await result
             for tc in getattr(delta, "tool_calls", None) or []:
@@ -277,6 +274,10 @@ class Client:
         ]
         text = "".join(text_parts)
         reasoning = "".join(reasoning_parts)
+        # Fallback: use reasoning as text when no content was streamed
+        # (mirrors sync path: msg.content is None -> use reasoning).
+        if not text and reasoning:
+            text = reasoning
         # Fallback: parse XML tool calls from streamed text when server doesn't.
         if not calls and text:
             xml_calls = _parse_xml_tool_calls(text)

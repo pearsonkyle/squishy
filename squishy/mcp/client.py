@@ -5,14 +5,17 @@ import json
 import os
 import subprocess
 import threading
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .types import (
-    MCPServerConfig, MCPServerState, MCPTool, MCPTransport,
-    INIT_PARAMS, make_notification, make_request,
+    INIT_PARAMS,
+    MCPServerConfig,
+    MCPServerState,
+    MCPTool,
+    MCPTransport,
+    make_notification,
+    make_request,
 )
-
 
 # ── Stdio transport ───────────────────────────────────────────────────────────
 
@@ -25,14 +28,14 @@ class StdioTransport:
 
     def __init__(self, config: MCPServerConfig):
         self._config = config
-        self._process: Optional[subprocess.Popen] = None
+        self._process: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._next_id = 1
-        self._pending: Dict[int, dict] = {}   # id → {"event": Event, "result": ...}
-        self._reader: Optional[threading.Thread] = None
-        self._stderr_reader: Optional[threading.Thread] = None
+        self._pending: dict[int, dict] = {}   # id → {"event": Event, "result": ...}
+        self._reader: threading.Thread | None = None
+        self._stderr_reader: threading.Thread | None = None
         self._running = False
-        self._stderr_lines: List[str] = []
+        self._stderr_lines: list[str] = []
 
     # Only forward these env vars to MCP subprocesses to avoid leaking secrets.
     _SAFE_ENV_KEYS = ("PATH", "HOME", "USER", "LANG", "TERM", "LC_ALL")
@@ -88,7 +91,7 @@ class StdioTransport:
             self._process.stdin.write(line)
             self._process.stdin.flush()
 
-    def request(self, method: str, params: Optional[dict] = None, timeout: Optional[int] = None) -> dict:
+    def request(self, method: str, params: dict | None = None, timeout: int | None = None) -> dict:
         """Send a JSON-RPC request and wait for the response."""
         event = threading.Event()
         holder: dict = {"event": event, "result": None}
@@ -111,7 +114,7 @@ class StdioTransport:
             raise RuntimeError(f"MCP error {err.get('code')}: {err.get('message')}")
         return result.get("result", {})
 
-    def notify(self, method: str, params: Optional[dict] = None) -> None:
+    def notify(self, method: str, params: dict | None = None) -> None:
         """Send a JSON-RPC notification (no response expected)."""
         self._send_raw(make_notification(method, params))
 
@@ -141,12 +144,12 @@ class HttpTransport:
 
     def __init__(self, config: MCPServerConfig):
         self._config = config
-        self._session_url: Optional[str] = None
+        self._session_url: str | None = None
         self._lock = threading.Lock()
         self._next_id = 1
         self._client = None   # httpx.Client, loaded lazily
-        self._sse_thread: Optional[threading.Thread] = None
-        self._sse_pending: Dict[int, dict] = {}
+        self._sse_thread: threading.Thread | None = None
+        self._sse_pending: dict[int, dict] = {}
         self._running = False
 
     def _get_client(self):
@@ -172,7 +175,6 @@ class HttpTransport:
 
     def _start_sse(self) -> None:
         """Open SSE stream to get session endpoint, then start background reader."""
-        import httpx
         client = self._get_client()
         self._running = True
 
@@ -219,7 +221,7 @@ class HttpTransport:
         if not self._session_url:
             raise RuntimeError("SSE server did not send 'endpoint' event")
 
-    def request(self, method: str, params: Optional[dict] = None, timeout: Optional[int] = None) -> dict:
+    def request(self, method: str, params: dict | None = None, timeout: int | None = None) -> dict:
         with self._lock:
             req_id = self._next_id
             self._next_id += 1
@@ -248,7 +250,7 @@ class HttpTransport:
             raise RuntimeError(f"MCP error {err.get('code')}: {err.get('message')}")
         return result.get("result", {})
 
-    def notify(self, method: str, params: Optional[dict] = None) -> None:
+    def notify(self, method: str, params: dict | None = None) -> None:
         client = self._get_client()
         msg = make_notification(method, params)
         url = self._session_url or self._config.url
@@ -279,10 +281,10 @@ class MCPClient:
     def __init__(self, config: MCPServerConfig):
         self.config = config
         self.state = MCPServerState.DISCONNECTED
-        self._transport: Optional[Any] = None
+        self._transport: Any = None
         self._server_info: dict = {}
         self._capabilities: dict = {}
-        self._tools: List[MCPTool] = []
+        self._tools: list[MCPTool] = []
         self._error: str = ""
 
     def connect(self) -> None:
@@ -332,7 +334,7 @@ class MCPClient:
             and self._transport.alive
         )
 
-    def list_tools(self) -> List[MCPTool]:
+    def list_tools(self) -> list[MCPTool]:
         """Fetch tool list from server and cache as MCPTool objects."""
         if self.state != MCPServerState.CONNECTED:
             raise RuntimeError(f"MCP server '{self.config.name}' is not connected")
@@ -378,7 +380,7 @@ class MCPClient:
         is_error = result.get("isError", False)
         content = result.get("content", [])
 
-        parts: List[str] = []
+        parts: list[str] = []
         for block in content:
             btype = block.get("type", "")
             if btype == "text":
@@ -420,9 +422,9 @@ class MCPManager:
     """Manages all configured MCP server connections."""
 
     def __init__(self):
-        self._clients: Dict[str, MCPClient] = {}
+        self._clients: dict[str, MCPClient] = {}
         # Reverse map: sanitized server name → original server name.
-        self._name_map: Dict[str, str] = {}
+        self._name_map: dict[str, str] = {}
 
     def add_server(self, config: MCPServerConfig) -> MCPClient:
         if config.name in self._clients:
@@ -436,9 +438,9 @@ class MCPManager:
         self._name_map[sanitized] = config.name
         return client
 
-    def connect_all(self) -> Dict[str, Optional[str]]:
+    def connect_all(self) -> dict[str, str | None]:
         """Connect to all registered servers. Returns {name: error_or_None}."""
-        errors: Dict[str, Optional[str]] = {}
+        errors: dict[str, str | None] = {}
         for name, client in self._clients.items():
             if client.config.disabled:
                 errors[name] = "disabled"
@@ -451,8 +453,8 @@ class MCPManager:
                 errors[name] = str(e)
         return errors
 
-    def all_tools(self) -> List[MCPTool]:
-        tools: List[MCPTool] = []
+    def all_tools(self) -> list[MCPTool]:
+        tools: list[MCPTool] = []
         for client in self._clients.values():
             if client.state == MCPServerState.CONNECTED:
                 tools.extend(client._tools)
@@ -485,7 +487,7 @@ class MCPManager:
 
         return client.call_tool(original_name, arguments)
 
-    def list_servers(self) -> List[MCPClient]:
+    def list_servers(self) -> list[MCPClient]:
         return list(self._clients.values())
 
     def disconnect_all(self) -> None:
@@ -504,7 +506,7 @@ class MCPManager:
 
 # ── Module-level singleton ────────────────────────────────────────────────────
 
-_manager: Optional[MCPManager] = None
+_manager: MCPManager | None = None
 
 
 def get_mcp_manager() -> MCPManager:
