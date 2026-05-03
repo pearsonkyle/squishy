@@ -1,20 +1,37 @@
 from __future__ import annotations
 
-from squishy.config import MODES, Config
+from squishy.config import INTERACTIVE_MODES, MODES, Config
 from squishy.tool_restrictions import is_readonly_shell
 from squishy.tools import check_permission, openai_schemas
 from squishy.tools.fs import edit_file, read_file, write_file
 from squishy.tools.shell import run_command
 
 
-def test_cycle_mode_rotates_through_all_modes():
+def test_cycle_mode_rotates_through_interactive_modes_only():
+    """shift-tab cycle should never land on bench (benchmark-runner only)."""
     cfg = Config()
     cfg.permission_mode = "plan"
     seen = [cfg.permission_mode]
-    for _ in range(len(MODES)):
+    for _ in range(len(INTERACTIVE_MODES) * 2):
         seen.append(cfg.cycle_mode())
-    # After one full cycle plus the starting entry we expect each mode once
-    assert set(seen) == set(MODES)
+    assert "bench" not in seen
+    assert set(seen) == set(INTERACTIVE_MODES)
+
+
+def test_cycle_mode_from_bench_lands_on_first_interactive():
+    """If cfg was set to bench programmatically (e.g. by the bench runner),
+    cycling escapes back into the interactive set rather than rotating to
+    another non-interactive slot."""
+    cfg = Config()
+    cfg.permission_mode = "bench"
+    assert cfg.cycle_mode() == INTERACTIVE_MODES[0]
+    assert cfg.permission_mode in INTERACTIVE_MODES
+
+
+def test_modes_constant_still_includes_bench():
+    """MODES is the full universe (used by API validation); bench must
+    still appear there even though shift-tab won't land on it."""
+    assert "bench" in MODES
 
 
 def test_plan_mode_allows_reads_blocks_writes():
