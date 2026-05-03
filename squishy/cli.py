@@ -203,19 +203,34 @@ async def _amain() -> None:
         # Single mode cycler shared across this whole interactive session.
         # It's started around each agent.run() call so shift-tab works while
         # the model is busy. paused() temporarily releases stdin so the
-        # approval prompt's input() reads as a normal line.
+        # approval prompt's reader can take over cleanly.
         mode_cycler = ModeCycler(
             on_cycle=lambda: display.mode_changed(cfg.cycle_mode())
         )
+        # Dedicated PromptSession for approval prompts. Using
+        # prompt_toolkit instead of asyncio.to_thread(input) so Ctrl+C
+        # raises cleanly and stdin/terminal state is restored properly —
+        # the previous to_thread(input) path left the input thread
+        # blocked on stdin while the mode cycler resumed cbreak mode,
+        # which deadlocked the terminal.
+        approval_session: PromptSession[str] = PromptSession()
 
         async def prompt_fn(tool: Tool, args_: dict):
             label = "  approve? [y/N or type feedback] " if tool.name == "plan_task" else "  approve? [y/N] "
-            try:
-                with mode_cycler.paused():
-                    reply = await asyncio.to_thread(input, label)
-            except (EOFError, KeyboardInterrupt):
-                return False
-            stripped = reply.strip()
+            # Make sure any in-flight streaming markdown is finalised before
+            # we hand the terminal to prompt_toolkit, otherwise the live
+            # region and the prompt fight for the same screen rows.
+            display.flush_streaming_text()
+            with mode_cycler.paused():
+                try:
+                    reply = await approval_session.prompt_async(label)
+                except (EOFError, KeyboardInterrupt):
+                    # Treat both as "decline" but keep the run alive so the
+                    # user lands back at the REPL prompt instead of the
+                    # whole CLI exiting.
+                    display.info("declined.")
+                    return False
+            stripped = (reply or "").strip()
             lowered = stripped.lower()
             if lowered in ("y", "yes"):
                 return True
@@ -293,12 +308,16 @@ async def _prompt_switch_to_edits(
     prompt_text: str,
     success_text: str,
 ) -> None:
+    # Use prompt_toolkit instead of asyncio.to_thread(input) so Ctrl+C
+    # raises cleanly without leaving an orphan input thread blocked on
+    # stdin (which freezes the terminal).
+    session: PromptSession[str] = PromptSession()
     try:
-        reply = await asyncio.to_thread(input, prompt_text)
+        reply = await session.prompt_async(prompt_text)
     except (EOFError, KeyboardInterrupt):
         display.info("Cancelled.")
         return
-    if reply.strip().lower() in ("", "y", "yes"):
+    if (reply or "").strip().lower() in ("", "y", "yes"):
         cfg.permission_mode = "edits"
         display.set_mode("edits")
         display.info(success_text)
@@ -366,15 +385,20 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycle
     except AgentTimeout as e:
         display.error(str(e))
         return
-    except AgentCancelled:
+    except (AgentCancelled, KeyboardInterrupt):
+        display.flush_streaming_text()
         display.warn("cancelled")
         return
     except LLMError as e:
         display.error(f"LLM error: {e}")
         return
 
-    async with cycler:
-        await _auto_execute_plan(agent, cfg, display, timeout)
+    try:
+        async with cycler:
+            await _auto_execute_plan(agent, cfg, display, timeout)
+    except (AgentCancelled, KeyboardInterrupt):
+        display.flush_streaming_text()
+        display.warn("cancelled")
 
 
 class _NullModeCycler:
@@ -580,14 +604,24 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
                 await current_agent.run(message_with_files, timeout=timeout)
         except AgentTimeout as e:
             display.error(str(e))
-        except AgentCancelled:
+        except (AgentCancelled, KeyboardInterrupt):
+            # Ctrl+C inside agent.run lands here once asyncio cancels the
+            # task. Always make sure the streamed display is closed so the
+            # next REPL prompt doesn't draw on top of a half-rendered
+            # markdown live region.
+            display.flush_streaming_text()
             display.warn("cancelled")
+            continue
         except LLMError as e:
             display.error(f"LLM error: {e}")
             continue
 
-        async with cycler:
-            await _auto_execute_plan(current_agent, cfg, display, timeout)
+        try:
+            async with cycler:
+                await _auto_execute_plan(current_agent, cfg, display, timeout)
+        except (AgentCancelled, KeyboardInterrupt):
+            display.flush_streaming_text()
+            display.warn("cancelled")
 
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:
