@@ -21,6 +21,7 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
     class FakeDisplay:
         def __init__(self) -> None:
             self.info_calls: list[str] = []
+            self.mode: str = ""
 
         def info(self, message: str) -> None:
             self.info_calls.append(message)
@@ -30,6 +31,9 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
 
         def error(self, _message: str) -> None:
             pass
+
+        def set_mode(self, mode: str) -> None:
+            self.mode = mode
 
     seen_agents: list[FakeAgent] = []
 
@@ -104,6 +108,7 @@ async def test_run_one_clears_stale_plan(monkeypatch, tmp_path):
         def info(self, _m: str) -> None: pass
         def warn(self, _m: str) -> None: pass
         def error(self, _m: str) -> None: pass
+        def set_mode(self, _m: str) -> None: pass
 
     class FakeAgent:
         def __init__(self, *args, **kwargs):

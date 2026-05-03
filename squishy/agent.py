@@ -157,6 +157,8 @@ class Agent:
         self._persist_new_messages()
 
         self._check_index_staleness()
+        if self.display is not None:
+            self.display.set_mode(self.config.permission_mode)
         if self.display is not None and self.tool_ctx.plan is not None:
             self.display.info(f"[plan] restored {self.tool_ctx.plan.id}")
         if self.display is not None and self.config.permission_mode == "plan" and not self.has_index:
@@ -894,6 +896,8 @@ class Agent:
             if self.config.permission_mode != _cached_perm_mode:
                 _cached_perm_mode = self.config.permission_mode
                 _cached_schemas = openai_schemas(_cached_perm_mode)
+                if self.display is not None:
+                    self.display.set_mode(self.config.permission_mode)
             schemas = _cached_schemas
 
             # Re-inject fresh system messages each turn.
@@ -1393,7 +1397,10 @@ class Agent:
     async def _run_tool(self, turn: int, tc: ToolCall) -> dict[str, Any]:
         brief = _brief(tc)
         if self.display:
-            self.display.turn_header(turn, self.config.max_turns, tc.name, brief)
+            self.display.turn_header(
+                turn, self.config.max_turns, tc.name, brief,
+                mode=self.config.permission_mode,
+            )
 
         if tc.name == "run_command" and self.display:
             self.display.command_line(str(tc.args.get("command", "")))

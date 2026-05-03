@@ -74,11 +74,25 @@ class Display:
         self.console = Console()
         self.stats = Stats()
         self.model: str = ""
+        self.mode: str = ""
         # Streaming markdown state
         self._stream_buffer: str = ""
         self._live_render: Markdown | None = None
         self._live: Live | None = None
         self._use_live: bool = False
+
+    def set_mode(self, mode: str) -> None:
+        """Record the current permission mode so it can be shown alongside
+        live output (turn headers, mode change notifications, etc.)."""
+        self.mode = mode
+
+    def mode_tag(self, mode: str | None = None) -> str:
+        """Render a colorized [mode] tag suitable for inline output."""
+        m = mode or self.mode
+        if not m:
+            return ""
+        color = MODE_COLORS.get(m, "ansigray")
+        return f"[{color}]\\[{m}][/]"
 
     def banner(self, base_url: str, model: str) -> None:
         self.model = model
@@ -91,9 +105,22 @@ class Display:
             )
         )
 
-    def turn_header(self, turn: int, max_turns: int, tool_name: str, brief: str) -> None:
+    def turn_header(
+        self, turn: int, max_turns: int, tool_name: str, brief: str,
+        mode: str | None = None,
+    ) -> None:
         icon = ICONS.get(tool_name, "•")
-        self.console.print(f"[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]")
+        tag = self.mode_tag(mode)
+        prefix = f"{tag} " if tag else ""
+        self.console.print(
+            f"{prefix}[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]"
+        )
+
+    def mode_changed(self, mode: str) -> None:
+        """Inline notification that the user cycled the permission mode."""
+        self.set_mode(mode)
+        color = MODE_COLORS.get(mode, "ansigray")
+        self.console.print(f"  [{color}]◆ mode → {mode}[/]")
 
     def command_line(self, command: str) -> None:
         """Show the full shell command on its own line (markup-safe)."""

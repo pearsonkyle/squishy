@@ -371,6 +371,29 @@ class TestDisplayPlanPanel:
             {"description": "Step 3", "status": "pending"},
         ])
 
+    def test_turn_header_includes_mode(self, capsys) -> None:
+        """The mode tag should appear in turn headers so the user can see
+        which mode the agent is operating in mid-run."""
+        display = Display()
+        display.set_mode("plan")
+        display.turn_header(1, 30, "read_file", "foo.py")
+        out = capsys.readouterr().out
+        assert "[plan]" in out
+        assert "Turn 1/30" in out
+
+    def test_turn_header_no_mode_when_unset(self, capsys) -> None:
+        display = Display()
+        display.turn_header(1, 30, "read_file", "foo.py")
+        out = capsys.readouterr().out
+        assert "[plan]" not in out
+        assert "Turn 1/30" in out
+
+    def test_mode_changed_updates_state(self) -> None:
+        display = Display()
+        display.set_mode("plan")
+        display.mode_changed("edits")
+        assert display.mode == "edits"
+
     def test_streaming_text_multi_chunk(self) -> None:
         """Regression: rich.markdown.Markdown has no .update(); the Live
         renderable must be swapped via Live.update() instead. Without this
