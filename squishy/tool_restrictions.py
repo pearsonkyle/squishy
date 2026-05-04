@@ -6,6 +6,7 @@ and provides utilities to check if a tool is allowed.
 
 from __future__ import annotations
 
+import re
 import shlex
 from typing import Any
 
@@ -58,26 +59,70 @@ READONLY_SHELL_THREE_WORD = frozenset({
     "python -m pytest",  # only paired with --collect-only (enforced below)
 })
 
-# Characters that can chain/redirect commands and escape the allowlist.
-_SHELL_METACHARS = ("|", ";", "&", ">", "<", "`", "$(", "${", "\n", "\r")
+# Hard-rejected anywhere in a plan-mode command. These all enable
+# command substitution, env-var expansion, or stray newlines that
+# break our token analysis.
+_HARD_REJECT = ("`", "$(", "${", "\n", "\r")
+# File redirection — disallowed in plan mode because `> file` writes
+# to disk. Stderr fd swaps like `2>&1` are stripped before this check.
+_FILE_REDIRECT = ("<", ">")
+# Pure fd redirections that don't touch the filesystem (e.g. `2>&1`,
+# `1>&2`, `>&2`). Safe in plan mode — we strip them before tokenising.
+_FD_REDIRECT_RE = re.compile(r"\s*\d*>&\d+")
+# Operators that chain multiple commands. We split on these and require
+# every segment to independently be a read-only command.
+_CHAIN_RE = re.compile(r"\|\||&&|;|\|")
 
 
 def is_readonly_shell(command: str) -> bool:
-    """Return True if `command` is safe to run in plan mode.
+    """Return True if ``command`` is safe to run in plan mode.
 
-    A command is safe when it has no shell metacharacters (which could chain
-    in a mutating call) and its leading token (or two tokens, for things like
-    `git log`) is in the allowlist.
+    Plan mode allows:
+      * a single command whose leading token(s) are in the allowlist;
+      * stderr→stdout fd redirection (``2>&1``, ``>&2``) — fd swap only;
+      * pipes (``|``) and chains (``;``, ``&&``, ``||``) where *every*
+        segment is independently allowlisted.
+
+    Plan mode rejects:
+      * file redirection (``>``, ``<``) — would write or read arbitrary
+        paths;
+      * command substitution (`` ` ``, ``$(``, ``${``) — runs other
+        commands or expands variables we can't reason about;
+      * background jobs (``&``) and stray newlines.
     """
     if not isinstance(command, str):
         return False
     stripped = command.strip()
     if not stripped:
         return False
-    if any(mc in stripped for mc in _SHELL_METACHARS):
+
+    # Strip pure fd redirections before any other check so `ruff check . 2>&1`
+    # tokenises as just `ruff check .`.
+    stripped = _FD_REDIRECT_RE.sub("", stripped).strip()
+    if not stripped:
         return False
+
+    if any(mc in stripped for mc in _HARD_REJECT):
+        return False
+    if any(mc in stripped for mc in _FILE_REDIRECT):
+        return False
+
+    segments = [seg.strip() for seg in _CHAIN_RE.split(stripped) if seg.strip()]
+    if not segments:
+        return False
+    for seg in segments:
+        # Lone `&` (background) survives the chain split — reject it.
+        if "&" in seg:
+            return False
+        if not _segment_is_readonly(seg):
+            return False
+    return True
+
+
+def _segment_is_readonly(segment: str) -> bool:
+    """Check that a single command segment matches the readonly allowlist."""
     try:
-        tokens = shlex.split(stripped)
+        tokens = shlex.split(segment)
     except ValueError:
         return False
     if not tokens:
@@ -150,7 +195,10 @@ def check_permission(
                 "stat, tree, ruff check, mypy, pyright, "
                 "git status/log/diff/show/branch/blame/ls-files, "
                 "pytest --collect-only, python -m pytest --collect-only). "
-                "No pipes, redirects, or command chains."
+                "Pipes (`|`), chains (`;`, `&&`, `||`) and stderr redirects "
+                "(`2>&1`) are allowed when every segment is read-only. "
+                "File redirects (`>`, `<`), command substitution "
+                "(`` ` ``, `$(...)`) and background jobs (`&`) are not."
             )
 
     # Edits-mode shell prompt (only reached when tool IS in allowed set; for

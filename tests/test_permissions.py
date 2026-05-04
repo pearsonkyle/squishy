@@ -81,15 +81,45 @@ def test_is_readonly_shell_rejects_mutating_and_chained():
     assert not is_readonly_shell("cp x y")
     assert not is_readonly_shell("python script.py")  # runs arbitrary code
     assert not is_readonly_shell("pytest")  # bare pytest runs tests (can mutate)
-    # Metacharacter rejection — these contain safe heads but chain unsafe tails
+    # Each chain segment is checked independently — chains containing a
+    # mutating segment are still rejected.
     assert not is_readonly_shell("ls; rm x")
     assert not is_readonly_shell("ls && rm x")
     assert not is_readonly_shell("ls | xargs rm")
+    # File redirects always rejected — would write or read arbitrary paths.
     assert not is_readonly_shell("cat foo > bar")
     assert not is_readonly_shell("cat < bar")
+    assert not is_readonly_shell("ls &> out.log")
+    # Command substitution / variable expansion / background.
     assert not is_readonly_shell("echo `rm x`")
     assert not is_readonly_shell("echo $(rm x)")
+    assert not is_readonly_shell("echo ${HOME}")
     assert not is_readonly_shell("ls &")
+
+
+def test_is_readonly_shell_allows_pipes_between_readonly_segments():
+    """Plan mode should allow pipes when *every* segment is read-only —
+    e.g. piping linter output through `head` is a common ergonomics
+    pattern with no extra capability beyond the segments themselves."""
+    assert is_readonly_shell("ruff check . | head -100")
+    assert is_readonly_shell("rg foo | wc -l")
+    assert is_readonly_shell("ls -la | grep README")
+    assert is_readonly_shell("git log --oneline | head")
+
+
+def test_is_readonly_shell_allows_chains_of_readonly_segments():
+    assert is_readonly_shell("ls; pwd")
+    assert is_readonly_shell("git status && git log -1")
+    assert is_readonly_shell("which ruff || which mypy")
+
+
+def test_is_readonly_shell_allows_stderr_to_stdout_redirect():
+    """`2>&1` and friends are pure fd swaps with no filesystem touch."""
+    assert is_readonly_shell("ruff check . 2>&1")
+    assert is_readonly_shell("mypy 2>&1")
+    assert is_readonly_shell("ruff check . 2>&1 | head -100")
+    assert is_readonly_shell("ls 1>&2")
+    assert is_readonly_shell("git status 2>&1; git log -1 2>&1")
 
 
 def test_plan_mode_run_command_allowlist_via_check_permission():
