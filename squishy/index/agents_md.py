@@ -1,16 +1,17 @@
 """Generate AGENTS.md from repo index.
 
-Creates a human-readable project overview with:
-- Project structure (tree visualization)
-- Language distribution
-- Key classes and functions with summaries
-- Import/dependency hints (Python-specific)
+Creates a compact project overview for AI assistants. Prefers plain
+prose / lists over bold/italics and avoids per-line code fences so
+the file doesn't gratuitously eat context window when re-injected
+as part of the system prompt.
 """
 
 from __future__ import annotations
 
 import os
-from collections import defaultdict
+import re
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from squishy.index.model import Index, Node
@@ -19,6 +20,24 @@ from squishy.index.model import Index, Node
 # Don't include these in AGENTS.md (too noisy)
 SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", "dist", "build"}
 SKIP_FILES = {".gitignore", ".dockerignore", "Dockerfile"}
+
+# Modules that ship with Python; we use stdlib_module_names when available
+# (Python 3.10+) and fall back to a small hand-rolled set otherwise.
+_STDLIB: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", ()) or {
+    "abc", "argparse", "ast", "asyncio", "base64", "collections", "contextlib",
+    "copy", "csv", "dataclasses", "datetime", "enum", "errno", "fnmatch",
+    "functools", "glob", "gzip", "hashlib", "hmac", "html", "http", "io",
+    "ipaddress", "itertools", "json", "logging", "math", "mimetypes",
+    "operator", "os", "pathlib", "pickle", "pkgutil", "platform", "queue",
+    "random", "re", "secrets", "shlex", "shutil", "signal", "socket",
+    "sqlite3", "ssl", "string", "subprocess", "sys", "tempfile", "textwrap",
+    "threading", "time", "traceback", "types", "typing", "unicodedata",
+    "unittest", "urllib", "uuid", "warnings", "weakref", "xml", "zipfile",
+})
+
+# Top-level import patterns: "import foo", "from foo import ..." (capture foo's
+# leading component before any dot).
+_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)")
 
 
 def _is_skip_dir(path: str) -> bool:
@@ -127,33 +146,42 @@ def _extract_key_symbols(index: Index, limit_per_file: int = 3) -> list[dict]:
     return result[:30]  # Overall limit
 
 
-def _generate_python_imports(index: Index, cwd: str) -> dict[str, list[str]]:
-    """Extract import relationships for Python files."""
-    imports: dict[str, list[str]] = defaultdict(list)
+def _collect_external_deps(
+    index: Index, cwd: str, *, top_n: int = 20,
+) -> list[tuple[str, int]]:
+    """Return (module, file_count) for non-stdlib, non-self imports.
 
+    Replaces the previous per-file `import` dump, which repeated common
+    lines (`import json`, `import os`, etc.) in dozens of code fences
+    and chewed through the context window for almost no signal.
+    """
+    repo_pkg = (index.root.name or "").strip("/").split("/", 1)[0]
+    counter: Counter[str] = Counter()
     for node in index.root.walk():
         if node.kind != "file" or not node.path.endswith(".py"):
             continue
-
-        # Read file content
         abs_path = os.path.join(cwd, node.path)
         try:
-            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+            with open(abs_path, encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except OSError:
             continue
-
-        # Simple import detection (not AST-level accurate, but good enough)
-        for line in content.splitlines():
-            line = line.strip()
-            if line.startswith("import ") or line.startswith("from "):
-                # Extract module name
-                parts = line.split()
-                if len(parts) >= 2:
-                    mod = parts[1].split(".")[0]
-                    imports[node.path].append(line)
-
-    return dict(imports)
+        seen_in_file: set[str] = set()
+        for raw in content.splitlines():
+            m = _IMPORT_RE.match(raw)
+            if not m:
+                continue
+            top = m.group(1).split(".", 1)[0]
+            if not top or top in _STDLIB:
+                continue
+            if top in {repo_pkg, "squishy"}:  # ignore self-imports
+                continue
+            if top.startswith("_"):
+                continue
+            seen_in_file.add(top)
+        for mod in seen_in_file:
+            counter[mod] += 1
+    return counter.most_common(top_n)
 
 
 def _extract_summary(node: Node) -> str:
@@ -169,7 +197,7 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
 
     Args:
         index: The repo index to document
-        include_imports: Include Python import relationships (default True)
+        include_imports: Emit a deduped external-deps list (default True).
         cwd: Working directory for resolving file paths (defaults to os.getcwd())
 
     Returns:
@@ -179,13 +207,12 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
         cwd = os.getcwd()
     lines: list[str] = []
 
-    # Header
+    # Header — plain prose, no horizontal rules / italics. The file is fed
+    # back into the system prompt via load_agent_instructions, so every
+    # decoration costs context budget.
     lines.append("# AGENTS.md")
     lines.append("")
-    lines.append("This file is auto-generated by squishy `/init`. It provides a quick")
-    lines.append("overview of the project structure for AI assistants.")
-    lines.append("")
-    lines.append("---")
+    lines.append("Auto-generated by squishy /init. Project structure overview for AI assistants.")
     lines.append("")
 
     # Project stats
@@ -193,91 +220,77 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
     symbol_count = sum(
         1 for n in index.root.walk() if n.kind in ("class", "function", "method")
     )
-    lines.append(f"**Files:** {file_count}  |  **Symbols:** {symbol_count}")
+    lines.append(f"Files: {file_count}  Symbols: {symbol_count}")
     lines.append("")
 
     # Language distribution
     lang_stats = _get_language_stats(index)
     if lang_stats:
         lines.append("## Languages")
-        lines.append("")
         for ext, count in sorted(lang_stats.items(), key=lambda kv: -kv[1]):
-            lines.append(f"- `{ext}`: {count} file{'s' if count > 1 else ''}")
+            lines.append(f"- {ext}: {count}")
         lines.append("")
 
     # Directory structure (tree view)
     lines.append("## Structure")
     lines.append("")
-    tree_lines = _format_tree(index.root)
-    for line in tree_lines:
-        lines.append(line)
+    lines.extend(_format_tree(index.root))
     lines.append("")
 
     # Top-level directories
     top_dirs = _get_top_level_dirs(index)
     if top_dirs:
-        lines.append("## Top Directories")
-        lines.append("")
+        lines.append("## Top directories")
         for path, count in top_dirs:
             dir_name = os.path.basename(path) or "."
-            lines.append(f"- **{dir_name}/**: {count} file{'s' if count > 1 else ''}")
+            lines.append(f"- {dir_name}/: {count}")
         lines.append("")
 
-    # Key symbols
+    # Key symbols — drop the per-symbol kind bolding and the per-file
+    # backticks. Keep the file headers and one bullet per symbol.
     key_symbols = _extract_key_symbols(index)
     if key_symbols:
-        lines.append("## Key Symbols")
+        lines.append("## Key symbols")
         lines.append("")
         current_file = ""
         for sym in key_symbols:
             if sym["path"] != current_file:
                 current_file = sym["path"]
-                lines.append(f"### `{current_file}`")
-                lines.append("")
+                lines.append(f"### {current_file}")
             kind = sym["kind"]
             name = sym["name"]
             summary = sym["summary"]
-            lines.append(f"- **{kind} `{name}`**: {summary}")
+            lines.append(f"- {kind} {name} — {summary}")
         lines.append("")
 
-    # Python imports (if applicable)
+    # Replace the per-file imports dump with one deduped line of the most
+    # common external (non-stdlib, non-self) deps. This used to repeat
+    # `import json`, `import os` across every file in its own code fence.
     if include_imports:
-        has_py = any(n.kind == "file" and n.path.endswith(".py") for n in index.root.walk())
+        has_py = any(
+            n.kind == "file" and n.path.endswith(".py") for n in index.root.walk()
+        )
         if has_py:
-            imports = _generate_python_imports(index, cwd)
-            if imports:
-                lines.append("## Imports")
-                lines.append("")
-                for path, import_lines in sorted(imports.items())[:10]:  # Limit
-                    lines.append(f"### `{path}`")
-                    for imp in import_lines[:5]:  # Limit per file
-                        lines.append(f"```python\n{imp}\n```")
+            deps = _collect_external_deps(index, cwd)
+            if deps:
+                lines.append("## External deps")
+                lines.append(", ".join(name for name, _ in deps))
                 lines.append("")
 
-    # Planning workflow (for plan mode)
-    lines.append("## Planning Workflow")
+    # Planning workflow — minimal markup, no nested bold.
+    lines.append("## Planning workflow")
     lines.append("")
-    lines.append("When working in **plan mode**, follow this pattern:")
+    lines.append("In plan mode:")
     lines.append("")
-    lines.append("1. **Call `recall(query=...)` FIRST** to use the index and find relevant files")
-    lines.append("2. Make **1-2 targeted reads** to understand the problem")
-    lines.append("3. Call `plan_task(problem=..., solution=..., steps=[...])` with your plan")
-    lines.append("")
-    lines.append("Example:")
+    lines.append("1. recall(query=...) first — use the index to find relevant files")
+    lines.append("2. 1-2 targeted reads to understand the problem")
+    lines.append("3. plan_task(problem=..., solution=..., steps=[...])")
     lines.append("")
     lines.append(
-        "1. `recall(query='function name or feature you want to modify')`\n"
-        "2. `read_file(path='relevant_module.py', limit=50, offset=1)`\n"
-        "3. `plan_task(problem='What needs fixing', solution='How to fix it', steps=['Step 1', 'Step 2'])`\n"
-    )
-    lines.append(
-        "**Important**: Do NOT call `read_file`, `list_directory`, or `search_files` "
-        "without first using `recall`. The index at `.squishy/index.json` exists for efficient navigation."
+        "Do not call read_file, list_directory, or search_files without first "
+        "calling recall. The index lives at .squishy/index.json."
     )
     lines.append("")
-    lines.append("---")
-    lines.append("")
-    lines.append("*Generated by squishy. Edit with care - this file is auto-updated.*")
 
     return "\n".join(lines)
 
