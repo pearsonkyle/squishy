@@ -202,6 +202,14 @@ class Agent:
             raise AgentTimeout(f"task exceeded {timeout}s") from e
         except asyncio.CancelledError:
             raise AgentCancelled("task cancelled by caller") from None
+        except KeyboardInterrupt:
+            # Ctrl+C anywhere inside the run — including inside an approval
+            # prompt — should abort the whole turn, not just decline the
+            # current tool. Translate into our usual cancelled signal so
+            # the CLI's outer handler resets cleanly.
+            if self.display:
+                self.display.flush_streaming_text()
+            raise AgentCancelled("interrupted by user") from None
 
     def _plan_snapshot(self) -> dict[str, Any] | None:
         return self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else None
@@ -360,19 +368,29 @@ class Agent:
                     self.display.error(msg)
                 return self._build_result(st, success=False, error=msg, turn=turn)
             st.plan_nudges += 1
-            self.messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "[system] You are in plan mode. Stop explaining and call "
-                        "`plan_task` now with problem, solution, and steps. "
-                        "Use your best current understanding instead of waiting "
-                        "for exhaustive research. `files_to_modify` and "
-                        "`files_to_create` may be partial or empty if uncertain. "
-                        "Do not respond with prose until the plan is approved."
-                    ),
-                }
-            )
+            # If the model wrote a plan as a JSON literal in prose, call
+            # that out specifically — the generic "call plan_task" nudge
+            # is easy for weak models to misread as "describe a plan".
+            looks_like_json_plan = _looks_like_json_plan(completion.text or "")
+            if looks_like_json_plan:
+                content = (
+                    "[system] You wrote a JSON plan inside your message, but "
+                    "that does NOT count as planning. The user can only see "
+                    "and approve plans submitted via the `plan_task` tool. "
+                    "Take the same fields you just printed and pass them as "
+                    "tool arguments to `plan_task`. Do not paste JSON in prose "
+                    "again; call the tool now."
+                )
+            else:
+                content = (
+                    "[system] You are in plan mode. Stop explaining and call "
+                    "`plan_task` now with problem, solution, and steps. "
+                    "Use your best current understanding instead of waiting "
+                    "for exhaustive research. `files_to_modify` and "
+                    "`files_to_create` may be partial or empty if uncertain. "
+                    "Do not respond with prose until the plan is approved."
+                )
+            self.messages.append({"role": "user", "content": content})
             return "continue"
 
         # Approved plan with unresolved steps — nudge to continue, but cap the
@@ -1326,16 +1344,25 @@ class Agent:
         reply: Any = True
         feedback: str = ""
         if self.prompt_fn is not None:
+            from squishy.tools.base import Tool
             try:
-                from squishy.tools.base import Tool
-
                 reply = await self.prompt_fn(
                     Tool(name="plan_task", description="", parameters={},
                          run=lambda *_: None),  # type: ignore[arg-type]
                     tc.args,
                 )
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
                 reply = False
+            except KeyboardInterrupt:
+                # User wants to abort the whole turn, not just decline
+                # this plan. Drop the persisted plan so a future run
+                # starts clean, then propagate so Agent.run translates
+                # this into AgentCancelled.
+                self.tool_ctx.plan = None
+                self.tool_ctx.pending_plan_evidence.clear()
+                self.tool_ctx.plan_switch_prompted = False
+                clear_plan(self.tool_ctx.working_dir)
+                raise
 
         if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == "feedback":
             approved = False
@@ -1529,6 +1556,19 @@ def _brief(tc: ToolCall) -> str:
 
 _EXPLORE_TOOLS = frozenset({"read_file", "list_directory", "search_files", "glob_files"})
 _TEST_CMD_KEYWORDS = ("pytest", "unittest", "python -m test", "python -m pytest", "test_")
+
+
+def _looks_like_json_plan(text: str) -> bool:
+    """Heuristic: did the model write a plan_task JSON literal in prose?
+
+    The signature we care about is the simultaneous presence of the three
+    plan_task field names quoted as JSON keys. We don't try to parse —
+    just to detect the failure mode and route to a sharper nudge.
+    """
+    if not text or "{" not in text:
+        return False
+    needles = ('"problem"', '"solution"', '"steps"')
+    return all(n in text for n in needles)
 
 
 def _is_test_command(cmd: str) -> bool:

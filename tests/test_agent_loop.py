@@ -249,6 +249,68 @@ async def test_agent_plan_mode_gives_up_after_nudges(tmp_path):
     assert "plan_task" in result.error
 
 
+async def test_json_plan_in_prose_triggers_pointed_nudge(tmp_path):
+    """When the model writes the plan_task fields as JSON in prose, the
+    agent should nudge with the 'use the tool, not prose' wording so the
+    model self-corrects faster."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 4
+    cfg.max_plan_nudges = 2
+
+    json_plan = (
+        'Here is my plan:\n'
+        '{ "problem": "p", "solution": "s", "steps": ["a", "b"] }'
+    )
+    fake = FakeClient(
+        script=[CompletionResult(text=json_plan, tool_calls=[]) for _ in range(5)]
+    )
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    await agent.run("plan please")
+
+    nudges = [
+        m["content"] for m in agent.messages
+        if m.get("role") == "user" and str(m.get("content", "")).startswith("[system]")
+    ]
+    assert any("JSON plan inside your message" in n for n in nudges)
+
+
+async def test_ctrl_c_at_plan_approval_cancels_run(tmp_path):
+    """Ctrl+C at the approval prompt must abort the entire turn rather
+    than being silently downgraded to a 'decline'."""
+    from squishy.errors import AgentCancelled
+    from squishy.plan_state import plan_path
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(
+                tool_calls=[
+                    _tc(
+                        "plan_task",
+                        {"problem": "p", "solution": "s", "steps": ["a"]},
+                    )
+                ]
+            )
+        ]
+    )
+
+    async def hostile_prompt(_tool, _args):
+        raise KeyboardInterrupt
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=hostile_prompt)  # type: ignore[arg-type]
+    with pytest.raises(AgentCancelled):
+        await agent.run("plan please")
+
+    # The persisted plan must be cleared so the next run starts fresh.
+    assert not plan_path(tmp_path).exists()
+
+
 async def test_agent_completes_when_plan_task_approved(tmp_path):
     """A successful plan_task + user approval should terminate the run."""
     cfg = Config()

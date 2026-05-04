@@ -216,7 +216,11 @@ async def _amain() -> None:
         approval_session: PromptSession[str] = PromptSession()
 
         async def prompt_fn(tool: Tool, args_: dict):
-            label = "  approve? [y/N or type feedback] " if tool.name == "plan_task" else "  approve? [y/N] "
+            label = (
+                "  approve? [y / N=decline / feedback / ^C cancels] "
+                if tool.name == "plan_task"
+                else "  approve? [y/N, ^C cancels] "
+            )
             # Make sure any in-flight streaming markdown is finalised before
             # we hand the terminal to prompt_toolkit, otherwise the live
             # region and the prompt fight for the same screen rows.
@@ -224,12 +228,15 @@ async def _amain() -> None:
             with mode_cycler.paused():
                 try:
                     reply = await approval_session.prompt_async(label)
-                except (EOFError, KeyboardInterrupt):
-                    # Treat both as "decline" but keep the run alive so the
-                    # user lands back at the REPL prompt instead of the
-                    # whole CLI exiting.
+                except EOFError:
+                    # Ctrl+D — same as a polite decline.
                     display.info("declined.")
                     return False
+                # Ctrl+C is intentionally *not* caught here. We want it to
+                # propagate up through _handle_plan_approval and the agent
+                # loop so the entire turn is cancelled and the user lands
+                # back at the REPL prompt — instead of the agent silently
+                # treating it as "n" and continuing to chug.
             stripped = (reply or "").strip()
             lowered = stripped.lower()
             if lowered in ("y", "yes"):
