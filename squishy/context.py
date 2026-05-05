@@ -229,7 +229,8 @@ def _mode_block(mode: str, cwd: str) -> str:
             "- For any task that touches files, call `plan_task` first; don't write prose before the plan is approved.\n"
             "- Skip `plan_task` only for trivial reads (e.g. one file, no edits).\n"
             "- Aim for `plan_task` within 2-3 turns: recall → 1-2 targeted reads → plan.\n"
-            "- `run_command` accepts read-only tools only (ls, cat, grep, rg, ruff check, mypy, git status/log/diff, pytest --collect-only, …); the dispatcher will list the exact set if you guess wrong.\n"
+            "- Prefer the dedicated tools (`list_directory`, `read_file`, `search_files`, `glob_files`) — they always work. `run_command` accepts a small read-only allowlist (linters, `git` reads, `pytest --collect-only`, common inspection binaries); the dispatcher lists the exact set if you guess wrong.\n"
+            "- The shell already runs in the project root — don't prefix commands with `cd /abs/path && …` (use a relative path or pass `cwd`). `python -c \"…\"` and other arbitrary scripts are rejected; use the dedicated read tools instead.\n"
             "- After approval the user switches you into edits mode to execute the plan."
         )
     if mode == "bench":

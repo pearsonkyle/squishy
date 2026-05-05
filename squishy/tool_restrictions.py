@@ -47,6 +47,10 @@ READONLY_SHELL_BINARIES = frozenset({
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find",
     "pwd", "which", "file", "stat", "tree", "printenv", "echo",
     "ruff", "mypy", "pyright",
+    # `cd` writes nothing to disk. Allowing it as a segment lets the agent
+    # prefix chains like `cd subdir && ruff check .` without bouncing off
+    # the allowlist — every other segment is still checked independently.
+    "cd",
 })
 
 READONLY_SHELL_TWO_WORD = frozenset({
@@ -194,15 +198,18 @@ def check_permission(
         cmd = (args or {}).get("command", "") if isinstance(args, dict) else ""
         if not is_readonly_shell(cmd if isinstance(cmd, str) else ""):
             return False, (
-                "refused: plan mode allows only read-only shell commands "
-                "(ls, cat, head, tail, grep, rg, find, wc, pwd, which, file, "
-                "stat, tree, ruff check, mypy, pyright, "
-                "git status/log/diff/show/branch/blame/ls-files, "
-                "pytest --collect-only, python -m pytest --collect-only). "
-                "Pipes (`|`), chains (`;`, `&&`, `||`) and stderr redirects "
-                "(`2>&1`) are allowed when every segment is read-only. "
-                "File redirects (`>`, `<`), command substitution "
-                "(`` ` ``, `$(...)`) and background jobs (`&`) are not."
+                "refused: plan mode is read-only. Allowed binaries: "
+                "ls, cat, head, tail, wc, grep, rg, find, pwd, which, file, "
+                "stat, tree, printenv, echo, cd, ruff, mypy, pyright; "
+                "git status/log/diff/show/branch/blame/ls-files; "
+                "pytest --collect-only; python -m pytest --collect-only. "
+                "Pipes/chains and `2>&1` are fine if every segment is allowed. "
+                "Rejected: file redirects (`>`, `<`), command substitution "
+                "(`` ` ``, `$(...)`, `${...}`), background jobs (`&`), and "
+                "arbitrary scripts like `python -c`. "
+                "Note: `run_command` already runs in the project root — no `cd` needed. "
+                "For inspection, prefer the dedicated tools "
+                "(`list_directory`, `read_file`, `search_files`, `glob_files`)."
             )
 
     # Edits-mode shell prompt (only reached when tool IS in allowed set; for

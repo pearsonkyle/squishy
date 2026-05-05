@@ -113,6 +113,17 @@ def test_is_readonly_shell_allows_chains_of_readonly_segments():
     assert is_readonly_shell("which ruff || which mypy")
 
 
+def test_is_readonly_shell_allows_cd_prefix():
+    """Agents commonly chain `cd /abs/path && readonly_cmd`. `cd` writes
+    nothing, so the chain is safe as long as the trailing segment is."""
+    assert is_readonly_shell("cd /tmp")
+    assert is_readonly_shell("cd subdir && ruff check .")
+    assert is_readonly_shell("cd /Users/me/proj && mypy 2>&1 | head -100")
+    # cd chained with a mutating command is still rejected on the second
+    # segment.
+    assert not is_readonly_shell("cd /tmp && rm -rf foo")
+
+
 def test_is_readonly_shell_allows_stderr_to_stdout_redirect():
     """`2>&1` and friends are pure fd swaps with no filesystem touch."""
     assert is_readonly_shell("ruff check . 2>&1")
@@ -127,7 +138,7 @@ def test_plan_mode_run_command_allowlist_via_check_permission():
     assert allowed
     allowed, reason = check_permission(run_command, "plan", {"command": "rm x"})
     assert not allowed
-    assert "read-only shell" in reason
+    assert "read-only" in reason
     # Missing/blank command → denied
     allowed, _ = check_permission(run_command, "plan", {})
     assert not allowed
