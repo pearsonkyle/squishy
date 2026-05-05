@@ -14,9 +14,11 @@ from squishy.index.agents_md import generate_agents_md
 
 
 def _build(tmp_path):
-    return asyncio.get_event_loop().run_until_complete(
-        _build_index_async(str(tmp_path))
-    )
+    # Drive the async indexer from a sync test: asyncio.run creates a
+    # fresh loop, runs the coroutine to completion, and tears the loop
+    # down. The previous get_event_loop() call relied on a running loop
+    # that doesn't exist outside pytest-asyncio's coroutine tests.
+    return asyncio.run(_build_index_async(str(tmp_path)))
 
 
 def test_no_bold_or_italic_decoration(tmp_path):
