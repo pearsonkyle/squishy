@@ -61,9 +61,9 @@ def test_build_system_prompt_plan_mode_block(tmp_path: Path) -> None:
     prompt = build_system_prompt(str(tmp_path), ProjectInfo(), mode="plan")
     assert "Mode: plan" in prompt
     assert "plan_task" in prompt
-    assert "write_file" in prompt  # mentioned as forbidden
-    assert "No repo index is present yet" in prompt
-    assert "partial or empty if uncertain" in prompt
+    assert "write_file" in prompt  # mentioned as new-files-only in core rules
+    # Without an index the rules block points at /init.
+    assert "No repo index yet" in prompt
 
 
 def test_build_system_prompt_plan_mode_with_index_prefers_recall(tmp_path: Path) -> None:
@@ -73,7 +73,8 @@ def test_build_system_prompt_plan_mode_with_index_prefers_recall(tmp_path: Path)
 
     prompt = build_system_prompt(str(tmp_path), ProjectInfo(), mode="plan")
     assert "recall(query=" in prompt
-    assert "FIRST" in prompt
+    # The "no index" hint must vanish once an index exists.
+    assert "No repo index yet" not in prompt
 
 
 def test_build_system_prompt_edits_mode_block(tmp_path: Path) -> None:

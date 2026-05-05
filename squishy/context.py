@@ -98,60 +98,88 @@ def build_system_prompt(
     thinking: bool = False,
     mode: str = "edits",
 ) -> str:
-    files = _top_level_files(cwd)
+    """Assemble the system prompt.
 
+    Goals (after the rewrite):
+      * Each rule appears once. Recall, planning, and "use update_plan
+        after each step" used to be repeated across `## Rules`,
+        `## Planning`, and the per-mode block — now each lives in
+        exactly one place.
+      * No verbose example blocks (JSON shape, run_command allowlists)
+        in prose: the tool schemas already carry that content, and
+        runtime errors echo allowlists when the model gets them wrong.
+      * Single-line summary blocks (project, index, top-level files)
+        replace the previous 4-6 line versions.
+    """
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
 
-    project_block = f"Language: {project.language}\n"
-    if project.framework:
-        project_block += f"Framework: {project.framework}\n"
-    if project.build_command:
-        project_block += f"Build: {project.build_command}\n"
-    if project.test_command:
-        project_block += f"Test: {project.test_command}\n"
-
+    has_idx = has_index(cwd)
+    rules = _rules_block(has_idx)
+    mode_block = _mode_block(mode, cwd)
+    project_line = _project_line(project)
     index_block = _index_header(cwd)
+    top_files_block = "" if has_idx else _top_level_files_block(cwd)
     mcp_block = _mcp_block()
     instructions_block = load_agent_instructions(cwd)
-    mode_block = _mode_block(mode, cwd)
-    recall_rule = _recall_rule(cwd)
 
-    return f"""You are squishy, a local coding assistant that edits files and runs commands to complete the user's task.
+    parts = [
+        "You are squishy, a local coding assistant that edits files and runs commands to complete the user's task.",
+        "",
+        thinking_line.rstrip(),
+        rules,
+        mode_block,
+        f"## Project\n{project_line}",
+        f"## Working dir\n{cwd}",
+    ]
+    # Drop empty pieces (thinking_line collapses to "" when thinking is on).
+    parts = [p for p in parts if p]
+    body = "\n\n".join(parts)
+    # Tail blocks already start with their own leading "\n" or are empty.
+    return body + index_block + top_files_block + mcp_block + instructions_block
 
-{thinking_line}
-## Rules
-- Read files before editing them.
-- `write_file` is for creating NEW files only. It will be refused on any existing file. Always use `edit_file` for existing files.
-- Use relative paths. Working directory is already set.
-- Verify your work with `run_command` (run the tests or the program itself) after making changes.
-- Explore thoroughly when fixing bugs or implementing features - it's better to understand the codebase than to guess.
-- When you finish the user's task, respond with plain text summarizing what you did (no tool call).
-- Do not re-read a file you have already read in this conversation unless you need a different line range. Use what you have.
-{recall_rule}
 
-## File References
-- Users can reference files in their input using `@filename` syntax.
-- When a user includes `@some/path.py`, the full file contents are automatically injected into the conversation wrapped in `<file>` tags.
-- File content is labeled with path and line count so you know exactly what file it is.
+def _rules_block(has_idx: bool) -> str:
+    """Core rules. Recall guidance is folded in here so it's not
+    repeated inside every mode block."""
+    recall_line = (
+        "- Use `recall(query=...)` to navigate the codebase before reading files; an index lives at `.squishy/index.json`."
+        if has_idx
+        else "- No repo index yet. Use targeted `read_file`/`list_directory`/`search_files` to navigate; suggest `/init` to enable `recall`."
+    )
+    plan_line = (
+        "- For non-trivial work call `plan_task` early; after the plan is approved, call `update_plan(step_index=N, status=\"done\")` per step and `finish_plan` once at the end. Don't repeat `update_plan` on the same step."
+    )
+    return (
+        "## Rules\n"
+        "- Read files before editing them.\n"
+        "- `write_file` is for new files only. Use `edit_file` on anything that already exists.\n"
+        "- Use relative paths (working dir is set).\n"
+        "- After editing, verify with `run_command` (run tests or the program itself).\n"
+        "- Don't re-read a file you've already read unless you need a different range.\n"
+        "- `@filename` in user input injects that file inline wrapped in `<file>` tags.\n"
+        "- When the task is done, reply with a plain-text summary and no tool call.\n"
+        f"{recall_line}\n"
+        f"{plan_line}"
+    )
 
-## Planning
-- For complex tasks, call `plan_task` first to present a structured plan with problem, solution, steps, and files.
-- `plan_task` is valid as soon as you have enough information to propose a solid approach — do not wait for exhaustive research.
-- `files_to_modify` and `files_to_create` may be partial or empty when some file choices are still uncertain.
-- The user will be asked to approve the plan before you proceed.
-- After the plan is approved, call `update_plan(step_index=N, status="done")` as you complete each step.
-- This keeps the user informed of progress through their task.
-- When you have finished the work (or for an audit/research task once you have produced your final answer), call `finish_plan(status="done")` once to resolve any remaining steps in a single call, then reply with your final summary. Do NOT keep calling `update_plan` on the same step or repeat the same prose — that is a stuck loop.
 
-{mode_block}
-## Project
-{project_block}
-## Working directory
-{cwd}
+def _project_line(project: ProjectInfo) -> str:
+    """One-line project summary. Empty fields are skipped."""
+    bits = [f"language={project.language}"]
+    if project.framework:
+        bits.append(f"framework={project.framework}")
+    if project.build_command:
+        bits.append(f"build=`{project.build_command}`")
+    if project.test_command:
+        bits.append(f"test=`{project.test_command}`")
+    return " · ".join(bits)
 
-## Top-level files
-{', '.join(files) if files else '(empty)'}
-{index_block}{mcp_block}{instructions_block}"""
+
+def _top_level_files_block(cwd: str) -> str:
+    files = _top_level_files(cwd)
+    if not files:
+        return ""
+    return f"\n\n## Top-level files\n{', '.join(files)}\n"
  
  
 _INSTRUCTION_SOURCES: tuple[tuple[str, str], ...] = (
@@ -188,104 +216,41 @@ def load_agent_instructions(cwd: str) -> str:
     return "".join(parts)
 
 
-def _recall_rule(cwd: str) -> str:
-    """Return the 'use recall first' rule, strengthened when an index exists."""
-    index_path = os.path.join(cwd, ".squishy", "index.json")
-    if os.path.isfile(index_path):
-        return (
-            "- An index is present at `.squishy/index.json`. Before calling "
-            "`read_file` or `list_directory`, call `recall(query=...)` at least "
-            "once per new topic to locate the right files. Do not read files blindly."
-        )
-    return (
-        "- To locate files or symbols, prefer `recall(query=...)` over walking with "
-        "`list_directory` when an index is present."
-    )
-
-
 def _mode_block(mode: str, cwd: str) -> str:
-    index_available = has_index(cwd)
+    """Per-mode rules.
+
+    Each block is the *delta* on top of `## Rules` — anything already
+    in the core ruleset (recall, planning, update_plan, etc.) is not
+    repeated. Workflow examples and JSON shape blocks were dropped
+    because the tool schemas already document them.
+    """
     if mode == "plan":
-        index_guidance = (
-            "- **In plan mode, your FIRST tool call should ALWAYS be `recall(query=...)` to use the index.**\n"
-            "- After `recall`, make 1-2 targeted reads to understand the problem.\n"
-            "- Call `plan_task` within your first 2-3 turns. Usually: recall → targeted reads → plan.\n"
-            "- Do NOT call read_file, list_directory, or search_files without first using `recall`. The index exists for efficient navigation.\n"
-            "- If the user already named likely files, use `recall` first to verify location, then inspect directly.\n"
-            "- Example workflow in plan mode:\n"
-            '  1. `recall(query="function name or file pattern")`\n'
-            '  2. `read_file(path="relevant_file.py", offset=..., limit=...)`\n'
-            '  3. `plan_task(problem="...", solution="...", steps=["..."])`\n'
-        ) if index_available else (
-            "- No repo index is present yet, so you may use targeted `read_file`, `list_directory`, or `search_files` calls to investigate.\n"
-            "- Prefer 1-3 focused reads, then call `plan_task`; do not wait for exhaustive research.\n"
-            "- If navigation is difficult, ask the user to run `/init` or use it yourself once you are allowed to leave plan mode.\n"
-            "- Example workflow in plan mode without an index:\n"
-            '  1. `list_directory(path=".")`\n'
-            '  2. `read_file(path="relevant_file.py", offset=..., limit=...)`\n'
-            '  3. `plan_task(problem="...", solution="...", steps=["..."])`\n'
-        )
         return (
             "## Mode: plan (read-only)\n"
-            "- **CRITICAL: For ANY task requiring file changes, call `plan_task` FIRST.**\n"
-            "- Do NOT attempt implementation until after the plan is approved.\n"
-            "- For simple tasks (e.g., reading one file), you may skip plan_task.\n"
-            f"{index_guidance}"
-            "- Call `plan_task` as soon as you can explain the problem, solution, and concrete steps. `files_to_modify`/`files_to_create` may be partial or empty if uncertain.\n"
-            "- Do NOT end the turn with prose before calling `plan_task`.\n"
-            '  ```json\n'
-            '  {\n'
-            '    "problem": "What needs to be fixed or implemented",\n'
-            '    "solution": "High-level approach to solve it",\n'
-            '    "steps": ["Step 1 description", "Step 2 description"],\n'
-            '    "files_to_modify": ["file1.py", "file2.py"],\n'
-            '    "files_to_create": ["new_file.py"]\n'
-            '  }\n'
-            '  ```\n'
-            "- `run_command` is limited to read-only commands: ls, cat, head, tail, wc, grep, rg, find, "
-            "pwd, which, file, stat, tree, ruff check, mypy, pyright, git status/log/diff/show/branch/blame/ls-files, "
-            "pytest --collect-only, python -m pytest --collect-only. No pipes, redirects, or command chains.\n"
-            "- After the user approves the plan, they will switch you into edits mode to execute it.\n"
+            "- For any task that touches files, call `plan_task` first; don't write prose before the plan is approved.\n"
+            "- Skip `plan_task` only for trivial reads (e.g. one file, no edits).\n"
+            "- Aim for `plan_task` within 2-3 turns: recall → 1-2 targeted reads → plan.\n"
+            "- `run_command` accepts read-only tools only (ls, cat, grep, rg, ruff check, mypy, git status/log/diff, pytest --collect-only, …); the dispatcher will list the exact set if you guess wrong.\n"
+            "- After approval the user switches you into edits mode to execute the plan."
         )
     if mode == "bench":
-        recall_line = (
-            "- An index is available. Call `recall(query=...)` to locate files before "
-            "using `search_files` or `list_directory`.\n"
-        ) if index_available else ""
         return (
             "## Mode: bench\n"
-            "- All tools available. No approval prompts.\n"
-            "- Focus on fixing the bug directly. Do NOT call plan_task or update_plan.\n"
-            "- Follow the workflow: understand → locate → fix → verify → finish.\n"
-            f"{recall_line}"
-            "- Use `save_note` to persist key findings (bug location, test command,\n"
-            "  root cause) so you remember them across long conversations.\n"
-            "- Do NOT re-read files you have already read. Use `save_note` to store important\n"
-            "  content rather than reading the same file multiple times.\n"
-            "- Use `show_diff` before finishing to verify all your changes look correct.\n"
-            "- For bug fixes, ALWAYS run the specific test after making changes.\n"
+            "- All tools available. No approval prompts. No `plan_task`/`update_plan`/`finish_plan`.\n"
+            "- Workflow: understand → locate → fix → verify → finish.\n"
+            "- `save_note` for key findings (bug location, test command, root cause) so they survive compaction.\n"
+            "- After editing, run the specific test that exercises the bug. `show_diff` before finishing."
         )
     if mode == "yolo":
         return (
             "## Mode: yolo\n"
-            "- All tools available without approval prompts. Be careful.\n"
-            "- **For non-trivial tasks, call `plan_task` first to structure your approach.**\n"
-            "- **CRITICAL: After creating a plan, you must EXECUTE it.**\n"
-            "  1. Call `update_plan(step_index=1, status=\"in-progress\")` to start step 1\n"
-            "  2. Read necessary files with `read_file`\n"
-            "  3. Make changes with `edit_file` (use `write_file` only for new files)\n"
-            "  4. Run tests/verify with `run_command`\n"
-            "  5. Call `update_plan(step_index=1, status=\"done\")` when complete\n"
-            "  6. Repeat for remaining steps\n"
-            "- Call `get_plan` if you lose track of where you are in the plan.\n"
-            "- For bug fixes, ALWAYS run tests after making changes to verify the fix works.\n"
+            "- All tools available, no approval prompts — be careful with destructive commands.\n"
+            "- For non-trivial work follow the plan-then-execute loop from `## Rules` (plan_task → update_plan per step → finish_plan)."
         )
     return (
         "## Mode: edits\n"
-        "- `run_command` requires user approval on each call.\n"
-        "- **For non-trivial tasks, call `plan_task` first to present a structured plan.**\n"
-        "- If the user approved a plan, follow it: after each step call "
-        "`update_plan(step_index=N, status=\"done\")`.\n"
+        "- `run_command` requires per-call user approval.\n"
+        "- If a plan was approved, follow it (see `## Rules` for the update_plan / finish_plan flow)."
     )
 
 
@@ -308,9 +273,13 @@ def _mcp_block() -> str:
 
 
 def _index_header(cwd: str) -> str:
-    """Return a compact, ~200-token block summarizing the cached repo index.
- 
-    Silently returns empty string when no `.squishy/index.json` exists.
+    """One-line summary of the cached repo index.
+
+    The previous version emitted a 4-line block (header + stats + ext +
+    dirs + age). The same signal fits on one line; recall guidance is
+    in `## Rules` so we don't repeat it here.
+
+    Returns an empty string when no `.squishy/index.json` exists.
     """
     try:
         from squishy.index.store import load_index, load_meta
@@ -323,23 +292,16 @@ def _index_header(cwd: str) -> str:
         return ""
     if meta is None or idx is None:
         return ""
- 
+
     stats = meta.stats or {}
-    by_ext = sorted(
-        ((k.removeprefix("ext"), v) for k, v in stats.items() if k.startswith("ext")),
-        key=lambda kv: -kv[1],
-    )[:6]
-    ext_line = ", ".join(f"{v} {k or '?'}" for k, v in by_ext) if by_ext else "?"
- 
-    # Top-N directories by descendant file count.
     dir_counts: list[tuple[str, int]] = []
     for node in idx.root.walk():
         if node.kind == "dir" and node.path:
             n = sum(1 for c in node.walk() if c.kind == "file")
             dir_counts.append((node.path, n))
     dir_counts.sort(key=lambda kv: -kv[1])
-    top_dirs = ", ".join(f"{p} ({n})" for p, n in dir_counts[:5]) or "(flat)"
- 
+    top_dirs = ", ".join(f"{p}({n})" for p, n in dir_counts[:5]) or "(flat)"
+
     age_s = max(0.0, time.time() - (meta.generated_at or 0.0))
     if age_s < 120:
         age = f"{int(age_s)}s"
@@ -347,13 +309,11 @@ def _index_header(cwd: str) -> str:
         age = f"{int(age_s / 60)}m"
     else:
         age = f"{int(age_s / 3600)}h"
- 
+
     return (
-        "\n## Repo index\n"
-        f"{stats.get('files', 0)} files, {stats.get('symbols', 0)} symbols. "
-        f"By ext: {ext_line}. "
-        f"Top dirs: {top_dirs}. "
-        f"Indexed {age} ago. Use `recall(query=...)` to navigate.\n"
+        f"\n\n## Index\n"
+        f"{stats.get('files', 0)} files, {stats.get('symbols', 0)} symbols, "
+        f"top dirs: {top_dirs} (indexed {age} ago)."
     )
  
  
