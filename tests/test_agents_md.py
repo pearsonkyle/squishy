@@ -77,3 +77,67 @@ def test_output_is_compact_for_a_small_repo(tmp_path):
     (tmp_path / "a.py").write_text("def hello():\n    pass\n")
     out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
     assert len(out) < 2000
+
+
+def test_no_file_type_emojis_in_tree(tmp_path):
+    """File-type emojis (🐍 📄 🦀 …) cost bytes for no signal beyond what
+    the file extension already conveys."""
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "b.txt").write_text("hello\n")
+    (tmp_path / "c.sh").write_text("#!/bin/sh\n")
+    out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
+    for emoji in ("🐍", "📄", "🦀", "🟨", "🔵"):
+        assert emoji not in out
+
+
+def test_symbol_kind_not_repeated_as_word(tmp_path):
+    """Functions/methods should be rendered with `()`, not the literal word
+    'function ' / 'method ' on every line."""
+    (tmp_path / "x.py").write_text(
+        "def thing():\n"
+        "    '''Do thing.'''\n"
+        "    pass\n"
+    )
+    out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
+    if "## Key symbols" in out:
+        block = out.split("## Key symbols", 1)[1]
+        # No "function name" or "method name" patterns — the () suffix is enough.
+        assert "- function " not in block
+        assert "- method " not in block
+
+
+def test_summary_line_collapses_languages(tmp_path):
+    """Files / Symbols / Langs all live on one line so an N-language repo
+    doesn't burn N+2 lines of header."""
+    (tmp_path / "a.py").write_text("def f(): pass\n")
+    (tmp_path / "b.sh").write_text("echo hi\n")
+    out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
+    assert "Files:" in out
+    # No standalone `## Languages` section — merged into the summary line.
+    assert "## Languages" not in out
+    assert "Langs:" in out
+
+
+def test_top_dirs_collapses_to_one_line(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("x = 1\n")
+    (tmp_path / "pkg" / "b.py").write_text("y = 2\n")
+    out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
+    if "Top dirs:" in out:
+        # All entries on one line — no `## Top dirs` heading + bullet list.
+        assert "## Top directories" not in out
+        block = out.split("Top dirs:", 1)[1].split("\n", 1)[0]
+        # The line should contain the directory once and at least one count.
+        assert "pkg/" in block
+
+
+def test_sessions_dir_is_skipped(tmp_path):
+    """squishy's own session-storage directory shouldn't end up in the tree."""
+    (tmp_path / "sessions").mkdir()
+    (tmp_path / "sessions" / "abc123").mkdir()
+    (tmp_path / "sessions" / "abc123" / "meta.json").write_text("{}")
+    (tmp_path / "real.py").write_text("x = 1\n")
+    out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
+    assert "sessions/" not in out
+    assert "abc123" not in out
+    assert "real.py" in out
