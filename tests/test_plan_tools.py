@@ -113,6 +113,45 @@ class TestPlanTask:
         assert not result.success
         assert "steps" in result.error
 
+    async def test_plan_task_refuses_when_plan_already_approved(self, tmp_path) -> None:
+        """Once a plan is approved we're in execution mode — calling
+        plan_task again would clobber progress and restart exploration.
+        The tool must refuse with a pointer toward update_plan / finish_plan."""
+        from squishy.tools.plan import _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        # Seed an approved plan.
+        first = await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["a", "b"]}, ctx,
+        )
+        assert first.success
+        ctx.plan.mark_approved()
+
+        # Second plan_task call must be refused.
+        result = await _plan_task(
+            {"problem": "p2", "solution": "s2", "steps": ["c"]}, ctx,
+        )
+        assert not result.success
+        assert "already active" in result.error
+        assert "update_plan" in result.error
+        # And must NOT have replaced the existing plan.
+        assert ctx.plan.problem == "p"
+        assert [s.description for s in ctx.plan.steps] == ["a", "b"]
+
+    async def test_plan_task_allowed_when_only_proposed(self, tmp_path) -> None:
+        """A plan that's been proposed but not yet approved can still be
+        replaced — the user might be revising before approving."""
+        from squishy.tools.plan import _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
+        await _plan_task({"problem": "p1", "solution": "s", "steps": ["a"]}, ctx)
+        # Not approved — second call replaces.
+        result = await _plan_task(
+            {"problem": "p2", "solution": "s", "steps": ["b"]}, ctx,
+        )
+        assert result.success
+        assert ctx.plan.problem == "p2"
+
     async def test_plan_task_with_all_fields(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
 
@@ -349,3 +388,128 @@ class TestDisplayPlanPanel:
             {"description": "Step 2", "status": "in-progress"},
             {"description": "Step 3", "status": "pending"},
         ])
+
+    def test_turn_header_includes_mode(self, capsys) -> None:
+        """The mode tag should appear in turn headers so the user can see
+        which mode the agent is operating in mid-run."""
+        display = Display()
+        display.set_mode("plan")
+        display.turn_header(1, 30, "read_file", "foo.py")
+        out = capsys.readouterr().out
+        assert "[plan]" in out
+        assert "Turn 1/30" in out
+
+    def test_turn_header_no_mode_when_unset(self, capsys) -> None:
+        display = Display()
+        display.turn_header(1, 30, "read_file", "foo.py")
+        out = capsys.readouterr().out
+        assert "[plan]" not in out
+        assert "Turn 1/30" in out
+
+    def test_mode_changed_updates_state(self) -> None:
+        display = Display()
+        display.set_mode("plan")
+        display.mode_changed("edits")
+        assert display.mode == "edits"
+
+    def test_streaming_text_multi_chunk(self) -> None:
+        """Regression: rich.markdown.Markdown has no .update(); the Live
+        renderable must be swapped via Live.update() instead. Without this
+        the second chunk crashes with AttributeError."""
+        display = Display()
+        display.streaming_text_chunk("Hello ")
+        display.streaming_text_chunk("world")
+        display.streaming_text_chunk("!")
+        display.flush_streaming_text()
+        # Buffer must be reset so the next turn doesn't re-render prior text.
+        assert display._stream_buffer == ""
+        assert display._live is None
+
+    def test_plan_progress_breakdown_shows_each_status(self, capsys) -> None:
+        """The count line should mirror the bar — list each non-zero
+        status bucket so '▓▓░░…' isn't paired with '0/7 resolved'."""
+        display = Display()
+        display.plan_progress([
+            {"description": "Step 1", "status": "done"},
+            {"description": "Step 2", "status": "skipped"},
+            {"description": "Step 3", "status": "skipped"},
+            {"description": "Step 4", "status": "pending"},
+        ])
+        out = capsys.readouterr().out
+        assert "1 done" in out
+        assert "2 skipped" in out
+        assert "1 pending" in out
+        assert "(4 total)" in out
+
+    def test_plan_progress_shows_in_progress(self, capsys) -> None:
+        """The bar paints in-progress steps; the count line must too —
+        otherwise '▓▓░░…  0 done · 7 pending' is contradictory."""
+        display = Display()
+        display.plan_progress([
+            {"description": "Step 1", "status": "in-progress"},
+            {"description": "Step 2", "status": "pending"},
+            {"description": "Step 3", "status": "pending"},
+        ])
+        out = capsys.readouterr().out
+        assert "1 in-progress" in out
+        assert "2 pending" in out
+
+
+@pytest.mark.asyncio
+class TestFinishPlan:
+    async def test_finish_plan_marks_remaining_done(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task, _update_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["a", "b", "c"]},
+            ctx,
+        )
+        await _update_plan({"step_index": 1, "status": "done"}, ctx)
+        result = await _finish_plan({"status": "done", "summary": "all set"}, ctx)
+        assert result.success
+        assert result.data["affected_steps"] == [2, 3]
+        progress = result.data["plan"]["progress"]
+        assert progress["done"] == 3
+        assert progress["pending"] == 0
+
+    async def test_finish_plan_skipped(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task(
+            {"problem": "p", "solution": "s", "steps": ["a", "b"]},
+            ctx,
+        )
+        result = await _finish_plan({"status": "skipped"}, ctx)
+        assert result.success
+        progress = result.data["plan"]["progress"]
+        assert progress["skipped"] == 2
+        assert progress["pending"] == 0
+
+    async def test_finish_plan_idempotent(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        await _finish_plan({}, ctx)
+        result = await _finish_plan({}, ctx)
+        assert result.success
+        assert result.data["affected_steps"] == []
+
+    async def test_finish_plan_no_active_plan(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        result = await _finish_plan({}, ctx)
+        assert not result.success
+        assert "no active plan" in result.error
+
+    async def test_finish_plan_invalid_status(self, tmp_path) -> None:
+        from squishy.tools.plan import _finish_plan, _plan_task
+
+        ctx = ToolContext(working_dir=str(tmp_path), permission_mode="edits", use_sandbox=False)
+        await _plan_task({"problem": "p", "solution": "s", "steps": ["a"]}, ctx)
+        result = await _finish_plan({"status": "blocked"}, ctx)
+        assert not result.success
+        assert "must be" in result.error

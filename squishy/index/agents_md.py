@@ -1,23 +1,50 @@
 """Generate AGENTS.md from repo index.
 
-Creates a human-readable project overview with:
-- Project structure (tree visualization)
-- Language distribution
-- Key classes and functions with summaries
-- Import/dependency hints (Python-specific)
+Creates a compact project overview for AI assistants. Prefers plain
+prose / lists over bold/italics and avoids per-line code fences so
+the file doesn't gratuitously eat context window when re-injected
+as part of the system prompt.
 """
 
 from __future__ import annotations
 
 import os
-from collections import defaultdict
+import re
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from squishy.index.model import Index, Node
 
-# Don't include these in AGENTS.md (too noisy)
-SKIP_DIRS = {".git", ".venv", "__pycache__", "node_modules", "dist", "build"}
+
+
+# Directories that are noise in the project overview: VCS internals,
+# build artifacts, virtualenvs, dependency caches, and squishy's own
+# generated session/index storage.
+SKIP_DIRS = {
+    ".git", ".venv", "venv", "__pycache__", "node_modules",
+    "dist", "build", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".idea", ".vscode", "sessions", ".squishy",
+}
 SKIP_FILES = {".gitignore", ".dockerignore", "Dockerfile"}
+
+# Modules that ship with Python; we use stdlib_module_names when available
+# (Python 3.10+) and fall back to a small hand-rolled set otherwise.
+_STDLIB: frozenset[str] = frozenset(getattr(sys, "stdlib_module_names", ()) or {
+    "abc", "argparse", "ast", "asyncio", "base64", "collections", "contextlib",
+    "copy", "csv", "dataclasses", "datetime", "enum", "errno", "fnmatch",
+    "functools", "glob", "gzip", "hashlib", "hmac", "html", "http", "io",
+    "ipaddress", "itertools", "json", "logging", "math", "mimetypes",
+    "operator", "os", "pathlib", "pickle", "pkgutil", "platform", "queue",
+    "random", "re", "secrets", "shlex", "shutil", "signal", "socket",
+    "sqlite3", "ssl", "string", "subprocess", "sys", "tempfile", "textwrap",
+    "threading", "time", "traceback", "types", "typing", "unicodedata",
+    "unittest", "urllib", "uuid", "warnings", "weakref", "xml", "zipfile",
+})
+
+# Top-level import patterns: "import foo", "from foo import ..." (capture foo's
+# leading component before any dot).
+_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+([a-zA-Z_][\w.]*)")
 
 
 def _is_skip_dir(path: str) -> bool:
@@ -32,26 +59,35 @@ def _is_skip_file(path: str) -> bool:
     return basename in SKIP_FILES or basename.startswith(".")
 
 
+def _should_skip(node: Node) -> bool:
+    """Filter for the AGENTS.md tree only — does not affect indexing."""
+    if node.kind == "dir" and node.name in SKIP_DIRS:
+        return True
+    if node.kind == "file" and _is_skip_file(node.name):
+        return True
+    return False
+
+
 def _format_tree(root: Node, prefix: str = "", is_last: bool = True) -> list[str]:
-    """Format the tree as a visual tree structure."""
+    """Format the tree as a visual tree structure.
+
+    Plain names only — file-type emojis (🐍 📄 🦀 …) were dropped because
+    every emoji costs 4+ bytes in the system prompt for zero signal that
+    the extension wasn't already telling the model.
+    """
     lines: list[str] = []
     connector = "└── " if is_last else "├── "
 
-    # Format current node
     if root.kind == "repo":
         lines.append(f"{prefix}{'└── ' if prefix else ''}{root.name}/")
     elif root.kind == "dir":
         lines.append(f"{prefix}{connector}{root.name}/")
     elif root.kind == "file":
-        ext = os.path.splitext(root.name)[1]
-        icon = {"py": "🐍", "js": "🟨", "ts": "🔵", "go": "(go)", "rs": "🦀"}.get(
-            ext.lstrip("."), "📄"
-        )
-        lines.append(f"{prefix}{connector}{icon} {root.name}")
+        lines.append(f"{prefix}{connector}{root.name}")
 
-    # Process children
-    children = root.children or []
-    for i, child in enumerate(sorted(children, key=lambda n: (n.kind != "dir", n.name))):
+    children = [c for c in (root.children or []) if not _should_skip(c)]
+    children.sort(key=lambda n: (n.kind != "dir", n.name))
+    for i, child in enumerate(children):
         is_child_last = i == len(children) - 1
         if root.kind == "repo":
             new_prefix = ""
@@ -75,10 +111,12 @@ def _get_language_stats(index: Index) -> dict[str, int]:
 
 
 def _get_top_level_dirs(index: Index, limit: int = 5) -> list[tuple[str, int]]:
-    """Get top directories by file count."""
+    """Get top directories by file count, skipping noise dirs."""
     dir_counts: list[tuple[str, int]] = []
     for node in index.root.walk():
         if node.kind == "dir" and node.path:
+            if any(part in SKIP_DIRS for part in node.path.split("/")):
+                continue
             n = sum(1 for c in node.walk() if c.kind == "file")
             dir_counts.append((node.path, n))
     return sorted(dir_counts, key=lambda kv: -kv[1])[:limit]
@@ -126,33 +164,42 @@ def _extract_key_symbols(index: Index, limit_per_file: int = 3) -> list[dict]:
     return result[:50]  # Overall limit
 
 
-def _generate_python_imports(index: Index, cwd: str) -> dict[str, list[str]]:
-    """Extract import relationships for Python files."""
-    imports: dict[str, list[str]] = defaultdict(list)
+def _collect_external_deps(
+    index: Index, cwd: str, *, top_n: int = 20,
+) -> list[tuple[str, int]]:
+    """Return (module, file_count) for non-stdlib, non-self imports.
 
+    Replaces the previous per-file `import` dump, which repeated common
+    lines (`import json`, `import os`, etc.) in dozens of code fences
+    and chewed through the context window for almost no signal.
+    """
+    repo_pkg = (index.root.name or "").strip("/").split("/", 1)[0]
+    counter: Counter[str] = Counter()
     for node in index.root.walk():
         if node.kind != "file" or not node.path.endswith(".py"):
             continue
-
-        # Read file content
         abs_path = os.path.join(cwd, node.path)
         try:
             with open(abs_path, encoding="utf-8", errors="replace") as f:
                 content = f.read()
         except OSError:
             continue
-
-        # Simple import detection (not AST-level accurate, but good enough)
-        for line in content.splitlines():
-            line = line.strip()
-            if line.startswith("import ") or line.startswith("from "):
-                # Extract module name
-                parts = line.split()
-                if len(parts) >= 2:
-                    mod = parts[1].split(".")[0]
-                    imports[node.path].append(line)
-
-    return dict(imports)
+        seen_in_file: set[str] = set()
+        for raw in content.splitlines():
+            m = _IMPORT_RE.match(raw)
+            if not m:
+                continue
+            top = m.group(1).split(".", 1)[0]
+            if not top or top in _STDLIB:
+                continue
+            if top in {repo_pkg, "squishy"}:  # ignore self-imports
+                continue
+            if top.startswith("_"):
+                continue
+            seen_in_file.add(top)
+        for mod in seen_in_file:
+            counter[mod] += 1
+    return counter.most_common(top_n)
 
 
 def _extract_summary(node: Node) -> str:
@@ -163,12 +210,26 @@ def _extract_summary(node: Node) -> str:
     return f"{node.kind} {node.name}"
 
 
+def _format_symbol(kind: str, name: str) -> str:
+    """Render a symbol header without the redundant "function"/"method" word.
+
+    - classes get a leading ``class `` prefix (the kind matters semantically)
+    - functions and methods both get a trailing ``()`` and no prefix
+    - anything else falls back to plain name
+    """
+    if kind == "class":
+        return f"class {name}"
+    if kind in ("function", "method"):
+        return f"{name}()"
+    return name
+
+
 def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str = "") -> str:
     """Generate AGENTS.md content from an index.
 
     Args:
         index: The repo index to document
-        include_imports: Include Python import relationships (default True)
+        include_imports: Emit a deduped external-deps list (default True).
         cwd: Working directory for resolving file paths (defaults to os.getcwd())
 
     Returns:
@@ -178,77 +239,96 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
         cwd = os.getcwd()
     lines: list[str] = []
 
-    # Header
+    # Header — plain prose, no horizontal rules / italics. The file is fed
+    # back into the system prompt via load_agent_instructions, so every
+    # decoration costs context budget.
     lines.append("# AGENTS.md")
     lines.append("")
+    lines.append("Auto-generated by squishy /init. Project structure overview for AI assistants.")
+    lines.append("")
 
-    # Project stats
+    # Project stats — combine file/symbol counts with the language
+    # distribution onto one line so a 6-language repo costs 1 line not 8.
     file_count = sum(1 for n in index.root.walk() if n.kind == "file")
     symbol_count = sum(
         1 for n in index.root.walk() if n.kind in ("class", "function", "method")
     )
     lang_stats = _get_language_stats(index)
-    lang_summary = ", ".join(
-        f"{count} {ext}" for ext, count in sorted(lang_stats.items(), key=lambda kv: -kv[1])[:4]
+    lang_str = ", ".join(
+        f"{ext} {count}" for ext, count in sorted(lang_stats.items(), key=lambda kv: -kv[1])
     )
-    lines.append(f"**{file_count} files, {symbol_count} symbols** ({lang_summary})")
+    summary_line = f"Files: {file_count}  Symbols: {symbol_count}"
+    if lang_str:
+        summary_line += f"  Langs: {lang_str}"
+    lines.append(summary_line)
     lines.append("")
 
-    # Top-level directories (compact)
+    # Directory structure (tree view) — usually the largest section by
+    # far, but it's also where the model gets the most signal per byte.
+    lines.append("## Structure")
+    lines.append("")
+    lines.extend(_format_tree(index.root))
+    lines.append("")
+
+    # Top-level directories — single line, no bullets.
     top_dirs = _get_top_level_dirs(index)
     if top_dirs:
-        lines.append("## Top Directories")
-        lines.append("")
-        for path, count in top_dirs:
-            dir_name = os.path.basename(path) or "."
-            # Include dir summary if available
-            dir_node = next((n for n in index.root.walk() if n.kind == "dir" and n.path == path), None)
-            summary = f" — {dir_node.summary}" if dir_node and dir_node.summary else ""
-            lines.append(f"- **{dir_name}/**: {count} files{summary}")
+        parts = [
+            f"{(os.path.basename(path) or '.')}/ {count}"
+            for path, count in top_dirs
+        ]
+        lines.append("Top dirs: " + ", ".join(parts))
         lines.append("")
 
-    # Key symbols — most valuable section, placed early
+    # Key symbols — drop the per-symbol "function"/"method" keyword
+    # spam (the model already knows from the () suffix or `class `
+    # prefix), drop the `### path` markdown header per file, and drop
+    # the "method " label entirely (methods just look like functions
+    # under their containing file's section).
     key_symbols = _extract_key_symbols(index)
     if key_symbols:
-        lines.append("## Key Symbols")
+        lines.append("## Key symbols")
         lines.append("")
         current_file = ""
         for sym in key_symbols:
             if sym["path"] != current_file:
                 current_file = sym["path"]
-                lines.append(f"### `{current_file}`")
-            kind = sym["kind"]
-            name = sym["name"]
-            summary = sym["summary"]
-            lines.append(f"- **{kind} `{name}`**: {summary}")
+                if lines[-1] != "":
+                    lines.append("")
+                lines.append(f"{current_file}:")
+            label = _format_symbol(sym["kind"], sym["name"])
+            lines.append(f"- {label} — {sym['summary']}")
         lines.append("")
 
-    # File summaries — compact list of files with docstring summaries
-    file_summaries: list[tuple[str, str]] = []
-    for node in index.root.walk():
-        if node.kind == "file" and node.summary:
-            file_summaries.append((node.path, node.summary))
-    if file_summaries:
-        lines.append("## File Summaries")
-        lines.append("")
-        for path, summary in sorted(file_summaries)[:40]:
-            lines.append(f"- `{path}`: {summary}")
-        lines.append("")
+    # Replace the per-file imports dump with one deduped line of the most
+    # common external (non-stdlib, non-self) deps. This used to repeat
+    # `import json`, `import os` across every file in its own code fence.
+    if include_imports:
+        has_py = any(
+            n.kind == "file" and n.path.endswith(".py") for n in index.root.walk()
+        )
+        if has_py:
+            deps = _collect_external_deps(index, cwd)
+            if deps:
+                lines.append("## External deps")
+                lines.append(", ".join(name for name, _ in deps))
+                lines.append("")
 
-    # Directory structure (tree view) — only for small repos
-    if file_count <= 100:
-        lines.append("## Structure")
-        lines.append("")
-        tree_lines = _format_tree(index.root)
-        for line in tree_lines:
-            lines.append(line)
-        lines.append("")
-
-    # Navigation workflow
-    lines.append("## Navigation")
+    # Planning workflow — minimal markup, no nested bold.
+    lines.append("## Planning workflow")
     lines.append("")
-    lines.append("Use `recall(query=...)` to search the index before calling `read_file`.")
+    lines.append("In plan mode:")
     lines.append("")
+    lines.append("1. recall(query=...) first — use the index to find relevant files")
+    lines.append("2. 1-2 targeted reads to understand the problem")
+    lines.append("3. plan_task(problem=..., solution=..., steps=[...])")
+    lines.append("")
+    lines.append(
+        "Do not call read_file, list_directory, or search_files without first "
+        "calling recall. The index lives at .squishy/index.json."
+    )
+    lines.append("")
+
 
     return "\n".join(lines)
 

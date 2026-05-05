@@ -134,18 +134,80 @@ def test_trim_history_keeps_matched_pairs_intact():
             assert ("asst", tc_id) in ids_in_order[:i]
 
 
-def test_system_prompt_includes_recall_first_when_index_exists(tmp_path):
+def test_system_prompt_includes_recall_when_index_exists(tmp_path):
+    """When an index is present the rules block should encourage `recall`
+    use up front and not steer the model toward blind reads."""
     (tmp_path / ".squishy").mkdir()
     (tmp_path / ".squishy" / "index.json").write_text("{}")
     prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)))
-    assert "An index is present" in prompt
-    assert "Do not read files blindly" in prompt
+    assert "`recall(query=...)`" in prompt
+    assert ".squishy/index.json" in prompt
+    # The "no index" hint must not appear when one exists.
+    assert "No repo index yet" not in prompt
 
 
 def test_system_prompt_softer_recall_rule_when_no_index(tmp_path):
+    """When there's no index, suggest /init rather than push `recall`."""
     prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)))
-    assert "prefer `recall" in prompt
-    assert "Do not read files blindly" not in prompt
+    assert "No repo index yet" in prompt
+    assert "/init" in prompt
+
+
+def test_system_prompt_no_duplicated_planning_block(tmp_path):
+    """`## Planning` used to repeat what mode blocks already cover —
+    the planning rule now lives once inside `## Rules`."""
+    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
+    assert "## Planning" not in prompt
+    # The planning rule should appear exactly once (it's in `## Rules`).
+    assert prompt.count("update_plan(step_index=N") <= 1
+
+
+def test_system_prompt_drops_json_shape_example(tmp_path):
+    """The plan_task tool schema documents the JSON shape — repeating it
+    here just bloats the prompt."""
+    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
+    assert '```json' not in prompt
+    assert '"files_to_modify"' not in prompt
+    assert '"files_to_create"' not in prompt
+
+
+def test_system_prompt_drops_shell_allowlist_enumeration(tmp_path):
+    """The runtime error already enumerates the allowlist when the model
+    guesses wrong, so don't burn tokens spelling it all out in prose.
+    A short hint is fine; a full enumeration is not."""
+    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
+    # The block used to list every binary explicitly: ls, cat, head, tail,
+    # wc, grep, rg, find, pwd, which, file, stat, tree, ruff check, mypy,
+    # pyright, git status/log/diff/show/branch/blame/ls-files, …
+    assert "stat" not in prompt or "tree" not in prompt or "blame" not in prompt
+
+
+def test_system_prompt_top_files_dropped_when_index_present(tmp_path):
+    """If we have an index, the index block already lists the structure
+    — repeating top-level files on top of that is pure duplication."""
+    (tmp_path / ".squishy").mkdir()
+    (tmp_path / ".squishy" / "index.json").write_text("{}")
+    (tmp_path / "README.md").write_text("hi")
+    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)))
+    assert "## Top-level files" not in prompt
+
+
+def test_system_prompt_project_block_is_one_line(tmp_path):
+    """Language/framework/build/test used to be 4 separate lines."""
+    from squishy.context import ProjectInfo
+    project = ProjectInfo(
+        language="python",
+        framework="fastapi",
+        build_command="python -m build",
+        test_command="pytest -q",
+    )
+    prompt = build_system_prompt(str(tmp_path), project)
+    assert "## Project" in prompt
+    block = prompt.split("## Project", 1)[1].split("##", 1)[0].strip()
+    # All four pieces collapsed into a single line, joined with " · ".
+    assert block.count("\n") == 0
+    assert "language=python" in block
+    assert "framework=fastapi" in block
 
 
 def test_trim_history_preserves_plan_status_system_message():

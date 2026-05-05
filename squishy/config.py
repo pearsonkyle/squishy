@@ -7,6 +7,10 @@ from dataclasses import dataclass, field
 
 PermissionMode = str  # "plan" | "edits" | "yolo" | "bench"
 MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo", "bench")
+# Modes exposed to the interactive shift-tab cycle. "bench" is for the
+# benchmark runner only — it strips planning tools and enables aggressive
+# automation that's not useful at the REPL — so it's excluded here.
+INTERACTIVE_MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo")
 
 
 @dataclass
@@ -66,6 +70,16 @@ class Config:
     save_sessions: bool = True
 
     def cycle_mode(self) -> PermissionMode:
-        i = (MODES.index(self.permission_mode) + 1) % len(MODES)
-        self.permission_mode = MODES[i]
+        """Advance to the next interactive permission mode (skipping bench).
+
+        If the current mode isn't in the interactive cycle (e.g. ``bench``
+        set programmatically by the benchmark runner), land on the first
+        interactive mode rather than rotating into another non-interactive
+        slot.
+        """
+        if self.permission_mode in INTERACTIVE_MODES:
+            i = (INTERACTIVE_MODES.index(self.permission_mode) + 1) % len(INTERACTIVE_MODES)
+            self.permission_mode = INTERACTIVE_MODES[i]
+        else:
+            self.permission_mode = INTERACTIVE_MODES[0]
         return self.permission_mode

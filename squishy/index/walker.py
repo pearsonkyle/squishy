@@ -1,17 +1,18 @@
 """Walk a repository and yield source files.
- 
-Honors `SKIP_DIRS` from `squishy.tools.fs`, a top-level `.gitignore` (stdlib
-`fnmatch`), and a hard cap to keep runaway monorepos from DoSing `/init`.
+
+Honors ``SKIP_DIRS`` from ``squishy.tools.fs``, every ``.gitignore``
+in the tree (via ``squishy.index.gitignore``), and a hard cap to keep
+runaway monorepos from DoSing ``/init``.
 """
- 
+
 from __future__ import annotations
- 
-import fnmatch
+
 import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
- 
+
+from squishy.index.gitignore import GitignoreFilter, discover_gitignores
 from squishy.tools.fs import SKIP_DIRS
  
 FILE_CAP = 5000
@@ -51,38 +52,13 @@ class FileRecord:
     hash: str  # blake2 of contents
  
  
-def _load_gitignore(root: Path) -> list[str]:
-    gi = root / ".gitignore"
-    if not gi.is_file():
-        return []
-    patterns: list[str] = []
-    for raw in gi.read_text(encoding="utf-8", errors="replace").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        # Strip leading "/" — fnmatch treats patterns as whole-path matches.
-        patterns.append(line.lstrip("/"))
-    return patterns
- 
- 
-def _gitignored(rel_posix: str, patterns: list[str]) -> bool:
-    if not patterns:
-        return False
-    # Match against full relative path and each path segment.
-    parts = rel_posix.split("/")
-    for pat in patterns:
-        # fnmatch doesn't support **; strip leading **/ and match the
-        # remainder against the full path and each segment.
-        stripped = pat
-        while stripped.startswith("**/"):
-            stripped = stripped[3:]
-        candidates = [pat, stripped] if stripped != pat else [pat]
-        for p in candidates:
-            if fnmatch.fnmatch(rel_posix, p):
-                return True
-            if any(fnmatch.fnmatch(seg, p) for seg in parts):
-                return True
-    return False
+def load_gitignore(root: Path) -> GitignoreFilter:
+    """Load every ``.gitignore`` under ``root`` into one matcher.
+
+    Public so AGENTS.md generation and other tree consumers can apply
+    the same filter without duplicating logic.
+    """
+    return discover_gitignores(root, skip_dirs=SKIP_DIRS)
  
  
 def _blake2(abs_path: str) -> str:
@@ -103,15 +79,31 @@ def walk_repo(cwd: str | os.PathLike[str]) -> tuple[list[FileRecord], bool]:
     warn the user that the index is partial.
     """
     root = Path(cwd).resolve()
-    patterns = _load_gitignore(root)
+    ignore = load_gitignore(root)
     records: list[FileRecord] = []
     hit_cap = False
- 
+
     for dirpath, dirs, files in os.walk(root):
-        dirs[:] = sorted(
-            d for d in dirs
-            if d not in SKIP_DIRS and not d.startswith(".")
-        )
+        # Filter directories: SKIP_DIRS, dotfiles, and gitignored dirs.
+        # Pruning here means we never recurse into them, which keeps the
+        # walk fast on large repos.
+        try:
+            cur_rel = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        except ValueError:
+            cur_rel = ""
+        if cur_rel == ".":
+            cur_rel = ""
+
+        kept: list[str] = []
+        for d in sorted(dirs):
+            if d in SKIP_DIRS or d.startswith("."):
+                continue
+            sub_rel = f"{cur_rel}/{d}" if cur_rel else d
+            if ignore.is_ignored(sub_rel, is_dir=True):
+                continue
+            kept.append(d)
+        dirs[:] = kept
+
         for name in sorted(files):
             if name.startswith("."):
                 continue
@@ -121,7 +113,7 @@ def walk_repo(cwd: str | os.PathLike[str]) -> tuple[list[FileRecord], bool]:
             except ValueError:
                 continue
             rel_posix = rel.replace(os.sep, "/")
-            if _gitignored(rel_posix, patterns):
+            if ignore.is_ignored(rel_posix):
                 continue
             ext = os.path.splitext(name)[1].lower()
             if ext and ext not in TEXT_EXTS:

@@ -10,6 +10,7 @@ Delegates to:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -96,6 +97,8 @@ class Agent:
 
         self._persist_new_messages()
         self._check_index_staleness()
+        if self.display is not None:
+            self.display.set_mode(self.config.permission_mode)
         if self.display is not None and self.tool_ctx.plan is not None:
             self.display.info(f"[plan] restored {self.tool_ctx.plan.id}")
         if self.display is not None and self.config.permission_mode == "plan" and not self.has_index:
@@ -128,6 +131,14 @@ class Agent:
             raise AgentTimeout(f"task exceeded {timeout}s") from e
         except asyncio.CancelledError:
             raise AgentCancelled("task cancelled by caller") from None
+        except KeyboardInterrupt:
+            # Ctrl+C anywhere inside the run — including inside an approval
+            # prompt — should abort the whole turn, not just decline the
+            # current tool. Translate into our usual cancelled signal so
+            # the CLI's outer handler resets cleanly.
+            if self.display:
+                self.display.flush_streaming_text()
+            raise AgentCancelled("interrupted by user") from None
 
     # ------------------------------------------------------------------
     # Result building and session persistence
@@ -264,20 +275,34 @@ class Agent:
                     self.display.error(msg)
                 return self._build_result(st, success=False, error=msg, turn=turn)
             st.plan_nudges += 1
-            self.messages.append({
-                "role": "user",
-                "content": (
+            # If the model wrote a plan as a JSON literal in prose, call
+            # that out specifically — the generic "call plan_task" nudge
+            # is easy for weak models to misread as "describe a plan".
+            looks_like_json_plan = _looks_like_json_plan(completion.text or "")
+            if looks_like_json_plan:
+                content = (
+                    "[system] You wrote a JSON plan inside your message, but "
+                    "that does NOT count as planning. The user can only see "
+                    "and approve plans submitted via the `plan_task` tool. "
+                    "Take the same fields you just printed and pass them as "
+                    "tool arguments to `plan_task`. Do not paste JSON in prose "
+                    "again; call the tool now."
+                )
+            else:
+                content = (
                     "[system] You are in plan mode. Stop explaining and call "
                     "`plan_task` now with problem, solution, and steps. "
                     "Use your best current understanding instead of waiting "
                     "for exhaustive research. `files_to_modify` and "
                     "`files_to_create` may be partial or empty if uncertain. "
                     "Do not respond with prose until the plan is approved."
-                ),
-            })
+                )
+            self.messages.append({"role": "user", "content": content})
             return "continue"
 
-        # Approved plan with unresolved steps.
+        # Approved plan with unresolved steps — nudge to continue, but cap the
+        # number of nudges so the agent doesn't loop forever after producing a
+        # final answer (e.g., for an audit where steps are research-only).
         if (
             not is_bench
             and plan is not None
@@ -291,19 +316,33 @@ class Agent:
                 self.messages.append(prose_msg(completion.text, completion.reasoning))
                 if self.display:
                     self.display.flush_streaming_text()
-            remaining = "; ".join(
-                f"{i + 1}. {step.description}"
-                for i, step in enumerate(plan.unresolved_steps()[:4])
+            if st.plan_nudges < self.config.max_plan_nudges:
+                st.plan_nudges += 1
+                remaining = "; ".join(
+                    f"{i + 1}. {step.description}"
+                    for i, step in enumerate(plan.unresolved_steps()[:4])
+                )
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "[system] You have an approved plan with unresolved steps. "
+                            "Either call `update_plan` to mark each remaining step "
+                            "(`done`/`skipped`/`blocked`) and continue, or call "
+                            "`finish_plan` to resolve all remaining steps at once "
+                            "and end the task. Do not just repeat the same prose. "
+                            f"Remaining: {remaining}"
+                        ),
+                    }
+                )
+                return "continue"
+            # Nudges exhausted — accept the prose answer and finish so we don't
+            # loop indefinitely on research/audit tasks.
+            st.prose_completions += 1
+            self._sync_display_stats(st, turn)
+            return self._build_result(
+                st, success=True, final_text=completion.text, turn=turn,
             )
-            self.messages.append({
-                "role": "user",
-                "content": (
-                    "[system] You have an approved plan with unresolved steps. "
-                    "Continue working, then call `update_plan` before finishing. "
-                    f"Remaining steps: {remaining}"
-                ),
-            })
-            return "continue"
 
         # Empty response.
         if not (completion.text or "").strip():
@@ -363,8 +402,15 @@ class Agent:
                     break
             cache_problem_text(self, st)
 
+        def _plan_active() -> bool:
+            p = self.tool_ctx.plan
+            return p is not None and p.approved
+
         _cached_perm_mode = self.config.permission_mode
-        _cached_schemas = openai_schemas(_cached_perm_mode)
+        _cached_plan_active = _plan_active()
+        _cached_schemas = openai_schemas(
+            _cached_perm_mode, plan_active=_cached_plan_active,
+        )
 
         for turn in range(1, self.config.max_turns + 1):
             # Finish countdown.
@@ -380,9 +426,18 @@ class Agent:
                 st.finish_countdown -= 1
 
             self.tool_ctx.permission_mode = self.config.permission_mode
-            if self.config.permission_mode != _cached_perm_mode:
+            now_plan_active = _plan_active()
+            if (
+                self.config.permission_mode != _cached_perm_mode
+                or now_plan_active != _cached_plan_active
+            ):
                 _cached_perm_mode = self.config.permission_mode
-                _cached_schemas = openai_schemas(_cached_perm_mode)
+                _cached_plan_active = now_plan_active
+                _cached_schemas = openai_schemas(
+                    _cached_perm_mode, plan_active=_cached_plan_active,
+                )
+                if self.display is not None:
+                    self.display.set_mode(self.config.permission_mode)
             schemas = _cached_schemas
 
             self._refresh_system_injections()
@@ -431,11 +486,17 @@ class Agent:
                 )
             except LLMError as e:
                 if self.display:
+                    self.display.flush_streaming_text()
                     self.display.error(f"LLM error: {e}")
                 return self._build_result(st, success=False, error=str(e), turn=turn - 1)
 
-            if completion.text and self.display:
-                self.display.console.print()
+            # Always finalize the streaming display before any further console
+            # output (tool headers, panels, prompts). Without this, subsequent
+            # turns concatenate into the same Live buffer and the prior
+            # narration is re-rendered on every refresh, producing repeated
+            # text and muddying the approval prompt area.
+            if self.display:
+                self.display.flush_streaming_text()
 
             st.total_prompt_tokens += completion.prompt_tokens
             st.completion_tokens += completion.completion_tokens
@@ -449,17 +510,21 @@ class Agent:
 
             self.messages.append(assistant_msg(completion.text, completion.tool_calls, completion.reasoning))
 
-            # --- Compaction-resilient loop detection ---
+            # --- Compaction-resilient loop detection (all modes) ---
+            # Build a key from all tool calls this turn and compare to previous.
+            # In bench/yolo, threshold 7 so nudges (at 2) get a chance to work.
+            # In plan/edits, threshold 5 so the user isn't kept waiting for
+            # an obviously-stuck model.
             explore_blocked = False
-            if _is_constrained:
-                ck = call_key(completion.tool_calls)
-                if ck == st.last_call_key:
-                    st.consecutive_identical += 1
-                else:
-                    st.consecutive_identical = 0
-                    st.last_call_key = ck
+            call_key = _call_key(completion.tool_calls)
+            if call_key == st.last_call_key:
+                st.consecutive_identical += 1
+            else:
+                st.consecutive_identical = 0
+                st.last_call_key = call_key
 
-            if _is_constrained and st.consecutive_identical >= 7:
+            loop_threshold = 7 if _is_constrained else 5
+            if st.consecutive_identical >= loop_threshold:
                 msg = (f"loop detected: same tool call repeated "
                        f"{st.consecutive_identical + 1} times consecutively")
                 if self.display:
@@ -470,6 +535,19 @@ class Agent:
                     final_text="Fix applied." if st.files_edited else "",
                     turn=turn,
                 )
+            # Mid-loop nudge — gentler in interactive modes.
+            if not _is_constrained and st.consecutive_identical >= 2:
+                self.messages.append({
+                    "role": "user",
+                    "content": (
+                        f"[system] You repeated the same tool call "
+                        f"{st.consecutive_identical + 1} times in a row with no "
+                        "new information. Either try a different action, call "
+                        "`finish_plan` if the work is done, or respond with a "
+                        "plain-text summary to end the turn. Do not repeat "
+                        "this call again."
+                    ),
+                })
             if _is_constrained and st.consecutive_identical >= 2:
                 inject_consecutive_identical_nudge(self, st, turn=turn)
 
@@ -691,6 +769,302 @@ class Agent:
             self._sync_display_stats(st, self.config.max_turns)
         return self._build_result(st, success=False, error=msg, turn=self.config.max_turns)
 
+    async def _handle_plan_approval(
+        self, tc: ToolCall, outcome: ToolResult,
+    ) -> tuple[ToolResult, bool]:
+        """Handle plan_task approval flow. Returns (outcome, plan_approved).
+
+        ``prompt_fn`` may return:
+          - True / False: approve or decline.
+          - ``("feedback", "<text>")``: declined, but pass the user's feedback
+            back to the model so it can revise the plan.
+        """
+        if self.display:
+            self.display.plan_panel(outcome.data)
+        reply: Any = True
+        feedback: str = ""
+        if self.prompt_fn is not None:
+            from squishy.tools.base import Tool
+            try:
+                reply = await self.prompt_fn(
+                    Tool(name="plan_task", description="", parameters={},
+                         run=lambda *_: None),  # type: ignore[arg-type]
+                    tc.args,
+                )
+            except EOFError:
+                reply = False
+            except KeyboardInterrupt:
+                # User wants to abort the whole turn, not just decline
+                # this plan. Drop the persisted plan so a future run
+                # starts clean, then propagate so Agent.run translates
+                # this into AgentCancelled.
+                self.tool_ctx.plan = None
+                self.tool_ctx.pending_plan_evidence.clear()
+                self.tool_ctx.plan_switch_prompted = False
+                clear_plan(self.tool_ctx.working_dir)
+                raise
+
+        if isinstance(reply, tuple) and len(reply) == 2 and reply[0] == "feedback":
+            approved = False
+            feedback = str(reply[1] or "").strip()
+        else:
+            approved = bool(reply)
+
+        if approved:
+            if self.tool_ctx.plan is not None:
+                self.tool_ctx.plan.mark_approved()
+                self.tool_ctx.plan_switch_prompted = False
+                save_plan(self.tool_ctx.working_dir, self.tool_ctx.plan)
+            outcome = ToolResult(
+                True,
+                data={
+                    **outcome.data,
+                    "approved": True,
+                    "plan": self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else {},
+                },
+                display=outcome.display,
+            )
+            return outcome, True
+
+        self.tool_ctx.plan = None
+        self.tool_ctx.pending_plan_evidence.clear()
+        self.tool_ctx.plan_switch_prompted = False
+        clear_plan(self.tool_ctx.working_dir)
+        if feedback:
+            err = f"Plan declined. User feedback: {feedback}"
+            if self.display:
+                self.display.info(f"[plan] feedback: {feedback}")
+        else:
+            err = "Plan declined by user. Ask for changes or a new approach."
+        return ToolResult(False, error=err), False
+
+    def _record_plan_evidence(self, tc: ToolCall, outcome: ToolResult) -> None:
+        """Record tool outcome as plan evidence when an approved plan is active."""
+        exit_code = outcome.data.get("exit_code")
+        ran_command = tc.name == "run_command" and exit_code is not None
+        if not (outcome.success or ran_command):
+            return
+        if self.tool_ctx.plan is None or not self.tool_ctx.plan.approved:
+            return
+        if tc.name in ("write_file", "edit_file"):
+            self.tool_ctx.pending_plan_evidence.append({
+                "kind": tc.name,
+                "path": str(tc.args.get("path", "")),
+                "detail": "created or rewrote file" if tc.name == "write_file" else "edited existing file",
+            })
+        elif tc.name == "run_command":
+            data = outcome.data
+            self.tool_ctx.pending_plan_evidence.append({
+                "kind": "run_command",
+                "command": str(tc.args.get("command", "")),
+                "exit_code": int(exit_code) if isinstance(exit_code, int) else None,
+                "detail": str(data.get("stderr") or data.get("stdout") or "").strip()[:300],
+            })
+
+    async def _run_tool(self, turn: int, tc: ToolCall) -> dict[str, Any]:
+        brief = _brief(tc)
+        if self.display:
+            self.display.turn_header(
+                turn, self.config.max_turns, tc.name, brief,
+                mode=self.config.permission_mode,
+            )
+
+        if tc.name == "run_command" and self.display:
+            self.display.command_line(str(tc.args.get("command", "")))
+
+        if tc.name == "edit_file" and self.display:
+            old_str = str(tc.args.get("old_str", ""))
+            new_str = str(tc.args.get("new_str", ""))
+            if old_str and new_str:
+                self.display.edit_diff(str(tc.args.get("path", "")), old_str, new_str)
+
+        t0 = time.monotonic()
+        outcome = await dispatch(tc.name, tc.args, self.tool_ctx, prompt_fn=self.prompt_fn)
+        dt_ms = (time.monotonic() - t0) * 1000
+
+        plan_approved = False
+        if outcome.success and tc.name == "plan_task":
+            outcome, plan_approved = await self._handle_plan_approval(tc, outcome)
+
+        self._record_plan_evidence(tc, outcome)
+
+        if self.display:
+            if tc.name == "plan_task":
+                pass  # Panel already rendered in _handle_plan_approval.
+            elif outcome.success and tc.name in ("update_plan", "finish_plan"):
+                plan = self.tool_ctx.plan
+                if plan:
+                    self.display.plan_progress([step.to_dict() for step in plan.steps])
+            else:
+                self.display.tool_result(
+                    outcome.success, outcome.display or outcome.error, dt_ms
+                )
+
+            if outcome.success and tc.name == "write_file":
+                self.display.write_preview(
+                    str(tc.args.get("path", "?")), str(tc.args.get("content", ""))
+                )
+            if tc.name == "run_command" and outcome.data.get("exit_code") is not None:
+                self.display.command_output(outcome.data)
+            if outcome.success:
+                if tc.name == "write_file":
+                    self.display.stats.files_created.add(str(tc.args.get("path", "?")))
+                elif tc.name == "edit_file":
+                    self.display.stats.files_edited.add(str(tc.args.get("path", "?")))
+                elif tc.name == "run_command":
+                    self.display.stats.commands_run += 1
+
+        self._append_tool_result(tc, message=outcome.to_message())
+
+        # Semantic anchoring: tag important tool results so they survive
+        # history trimming.
+        if self.messages and self.messages[-1].get("role") == "tool":
+            should_anchor = (
+                (tc.name == "run_command" and not outcome.success)
+                or (tc.name == "edit_file" and outcome.success)
+                or (tc.name == "search_files" and outcome.success and outcome.data.get("count", 0) > 0)
+                or (tc.name == "read_file" and outcome.success
+                    and self.tool_ctx.files_read_count.get(str(tc.args.get("path", "")), 0) <= 1)
+            )
+            if should_anchor:
+                self.messages[-1]["_squishy_anchor"] = True
+
+        return {
+            "success": outcome.success,
+            "plan_approved": plan_approved,
+            "data": outcome.data if isinstance(outcome.data, dict) else {},
+        }
+
+    def _append_tool_result(self, tc: ToolCall, message: str) -> None:
+        self.messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "name": tc.name,
+                "content": message,
+            }
+        )
+
     async def _on_text(self, chunk: str) -> None:
         if self.display:
             self.display.streaming_text_chunk(chunk)
+
+
+def _prose_msg(text: str, reasoning: str = "") -> dict[str, Any]:
+    """Build a prose-only assistant message, preserving reasoning if present."""
+    msg: dict[str, Any] = {"role": "assistant", "content": text}
+    if reasoning:
+        msg["think"] = reasoning
+    return msg
+
+
+def _assistant_msg(
+    text: str, tool_calls: list[ToolCall], reasoning: str = "",
+) -> dict[str, Any]:
+    msg: dict[str, Any] = {
+        "role": "assistant",
+        "content": text or None,
+        "tool_calls": [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.name, "arguments": json.dumps(tc.args, ensure_ascii=False)},
+            }
+            for tc in tool_calls
+        ],
+    }
+    # Preserve reasoning/thinking for session persistence and training data.
+    # This key is ignored by the OpenAI API but survives in self.messages.
+    if reasoning:
+        msg["think"] = reasoning
+    return msg
+
+
+def _brief(tc: ToolCall) -> str:
+    a = tc.args
+    if tc.name in ("read_file", "write_file", "edit_file", "list_directory"):
+        return str(a.get("path", ""))
+    if tc.name == "search_files":
+        return f'"{a.get("pattern", "")}"'
+    if tc.name == "glob_files":
+        return str(a.get("pattern", ""))
+    if tc.name == "recall":
+        return str(a.get("query", ""))
+    # run_command brief is empty; the full command is shown via display.command_line()
+    return ""
+
+
+_EXPLORE_TOOLS = frozenset({"read_file", "list_directory", "search_files", "glob_files"})
+_TEST_CMD_KEYWORDS = ("pytest", "unittest", "python -m test", "python -m pytest", "test_")
+
+
+def _looks_like_json_plan(text: str) -> bool:
+    """Heuristic: did the model write a plan_task JSON literal in prose?
+
+    The signature we care about is the simultaneous presence of the three
+    plan_task field names quoted as JSON keys. We don't try to parse —
+    just to detect the failure mode and route to a sharper nudge.
+    """
+    if not text or "{" not in text:
+        return False
+    needles = ('"problem"', '"solution"', '"steps"')
+    return all(n in text for n in needles)
+
+
+def _is_test_command(cmd: str) -> bool:
+    """Return True if ``cmd`` looks like a test invocation (not ls/pwd/grep)."""
+    return any(kw in cmd for kw in _TEST_CMD_KEYWORDS)
+
+
+def _is_exploration_command(cmd: str) -> bool:
+    """Return True if ``cmd`` is a read-only exploration command (grep/sed/cat/find)."""
+    first = cmd.strip().split()[0] if cmd.strip() else ""
+    return first in ("grep", "rg", "sed", "cat", "head", "tail", "find", "awk", "wc", "od")
+
+
+# Regex for Python file paths like  foo/bar/baz.py  or  foo/bar.py
+_PY_PATH_RE = re.compile(r"(?:^|[\s\"'`(,])([a-zA-Z_][\w/]*\.py)\b")
+# Regex for dotted module paths like  sympy.core.power  or  django.core.checks
+_MODULE_RE = re.compile(r"(?:^|[\s\"'`(,])([a-zA-Z_][\w]*(?:\.[a-zA-Z_][\w]*){2,})\b")
+
+
+def _extract_problem_files(text: str) -> set[str]:
+    """Extract likely file paths and module references from a problem statement.
+
+    Returns a set of lowercased partial paths (e.g., ``{'sympy/core/power.py',
+    'astropy/modeling/separable.py'}``).  Used for goal-drift heuristics — does
+    not need to be perfectly accurate.
+    """
+    paths: set[str] = set()
+    for m in _PY_PATH_RE.finditer(text):
+        paths.add(m.group(1).lower())
+    for m in _MODULE_RE.finditer(text):
+        parts = m.group(1).split(".")
+        # module.submodule.name -> module/submodule/name.py + module/submodule.py
+        paths.add("/".join(parts).lower() + ".py")
+        if len(parts) > 2:
+            paths.add("/".join(parts[:-1]).lower() + ".py")
+    return paths
+
+
+def _call_key(tool_calls: list[ToolCall]) -> str:
+    """Build a stable key from a list of tool calls for loop detection."""
+    parts = []
+    for tc in tool_calls:
+        try:
+            args_str = json.dumps(tc.args, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args_str = str(tc.args)
+        parts.append(f"{tc.name}:{args_str}")
+    return "|".join(parts)
+
+
+def _path_matches_problem(path: str, problem_files: set[str]) -> bool:
+    """Check if an edited file path plausibly relates to the problem statement."""
+    path_lower = path.lower().replace("\\", "/")
+    for pf in problem_files:
+        if pf in path_lower or path_lower.endswith(pf):
+            return True
+    # Also check base name overlap.
+    base = os.path.basename(path_lower).replace(".py", "")
+    return any(base in pf for pf in problem_files)

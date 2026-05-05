@@ -50,6 +50,11 @@ ICONS = {
     "run_command": "[magenta]🔧[/]",
     "plan_task": "[cyan]📋[/]",
     "update_plan": "[cyan]📊[/]",
+    "finish_plan": "[green]🏁[/]",
+    "get_plan": "[cyan]📋[/]",
+    "save_note": "[cyan]📝[/]",
+    "recall": "[cyan]🔎[/]",
+    "glob_files": "[cyan]🔍[/]",
 }
 
 
@@ -72,11 +77,25 @@ class Display:
         self.console = Console()
         self.stats = Stats()
         self.model: str = ""
+        self.mode: str = ""
         # Streaming markdown state
         self._stream_buffer: str = ""
         self._live_render: Markdown | None = None
         self._live: Live | None = None
         self._use_live: bool = False
+
+    def set_mode(self, mode: str) -> None:
+        """Record the current permission mode so it can be shown alongside
+        live output (turn headers, mode change notifications, etc.)."""
+        self.mode = mode
+
+    def mode_tag(self, mode: str | None = None) -> str:
+        """Render a colorized [mode] tag suitable for inline output."""
+        m = mode or self.mode
+        if not m:
+            return ""
+        color = MODE_COLORS.get(m, "ansigray")
+        return f"[{color}]\\[{m}][/]"
 
     def banner(self, base_url: str, model: str) -> None:
         self.model = model
@@ -89,10 +108,22 @@ class Display:
             )
         )
 
-    def turn_header(self, turn: int, max_turns: int, tool_name: str, brief: str) -> None:
+    def turn_header(
+        self, turn: int, max_turns: int, tool_name: str, brief: str,
+        mode: str | None = None,
+    ) -> None:
         icon = ICONS.get(tool_name, "•")
-        esc = "\\"  # Rich escape for literal bracket
-        self.console.print(f"[dim]{esc}[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]")
+        tag = self.mode_tag(mode)
+        prefix = f"{tag} " if tag else ""
+        self.console.print(
+            f"{prefix}[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]"
+        )
+
+    def mode_changed(self, mode: str) -> None:
+        """Inline notification that the user cycled the permission mode."""
+        self.set_mode(mode)
+        color = MODE_COLORS.get(mode, "ansigray")
+        self.console.print(f"  [{color}]◆ mode → {mode}[/]")
 
     def command_line(self, command: str) -> None:
         """Show the full shell command on its own line (markup-safe)."""
@@ -142,52 +173,48 @@ class Display:
         for line in snippet:
             self.console.print(f"  [dim]│[/] {line}")
  
-    def text(self, s: str) -> None:
-        if s.strip():
-            self.console.print(Text(s))
- 
-    # Streaming markdown state (initialized in __init__)
-
     def streaming_text_chunk(self, s: str) -> None:
         """Accumulate text chunks and render as streaming markdown.
-        
+
         Uses Rich Live for smooth incremental rendering that updates
         in place rather than printing each chunk below previous output.
         """
+        if not s:
+            return
         self._stream_buffer += s
-        
+
+        new_render = Markdown(self._stream_buffer)
+        self._live_render = new_render
         if not self._use_live:
-            # First chunk: start Live rendering
             self._use_live = True
-            self._last_parse_len = 0
-            self._live_render = Markdown(self._stream_buffer)
             self._live = Live(
-                self._live_render,
+                new_render,
                 console=self.console,
-                refresh_per_second=8,
+                refresh_per_second=12,
+                transient=True,
             )
             self._live.start()
-        else:
-            # Throttle re-parsing: only rebuild Markdown every 50+ chars
-            # or on structural markdown characters
-            delta = len(self._stream_buffer) - getattr(self, "_last_parse_len", 0)
-            if delta >= 50 or any(c in s for c in "\n#*`-"):
-                self._live_render = Markdown(self._stream_buffer)
-                if self._live is not None:
-                    self._live.update(self._live_render)
-                self._last_parse_len = len(self._stream_buffer)
+        elif self._live is not None:
+            # rich.markdown.Markdown has no .update(); swap the renderable
+            # on the Live object instead.
+            self._live.update(new_render, refresh=True)
 
     def flush_streaming_text(self) -> None:
-        """Finalize streaming text output. Call when a prose response completes.
+        """Finalize streaming text output.
 
-        Stops the Live display and prints the final rendered markdown
-        as a permanent output (once).
+        Stops the transient Live display and prints the final rendered markdown
+        once as a permanent output. Always clears the buffer so successive
+        turns don't re-render previously streamed text.
         """
+        final_render = self._live_render
         if self._live is not None:
-            # Stop Live first (this renders the final frame automatically)
             self._live.stop()
-            self._live = None
-            self._live_render = None
+        # transient=True clears the live area on stop, so print the final
+        # frame once for permanent display.
+        if final_render is not None and self._stream_buffer.strip():
+            self.console.print(final_render)
+        self._live = None
+        self._live_render = None
         self._stream_buffer = ""
         self._use_live = False
  
@@ -235,15 +262,47 @@ class Display:
         self.console.print(Panel("\n".join(lines), title="📋 Plan", border_style="cyan"))
 
     def plan_progress(self, steps: list[dict]) -> None:
-        """Show a compact progress line for the active plan."""
+        """Show a compact progress line for the active plan.
+
+        The count breakdown matches the bar so a user looking at
+        ``▓▓░░…`` doesn't see ``0/7 resolved`` alongside it. We list
+        whichever non-zero buckets exist (done / in-progress / blocked
+        / skipped) plus the unresolved-pending tail.
+        """
         total = len(steps)
         done = sum(1 for s in steps if s.get("status") == "done")
+        skipped = sum(1 for s in steps if s.get("status") == "skipped")
         in_prog = sum(1 for s in steps if s.get("status") == "in-progress")
-        bar_filled = int(20 * done / total) if total else 0
-        bar_active = int(20 * in_prog / total) if total else 0
-        bar_empty = 20 - bar_filled - bar_active
-        bar = "[green]█[/]" * bar_filled + "[cyan]▓[/]" * bar_active + "[dim]░[/]" * bar_empty
-        self.console.print(f"  plan: {bar} {done}/{total} steps done")
+        blocked = sum(1 for s in steps if s.get("status") == "blocked")
+        pending = max(0, total - done - skipped - in_prog - blocked)
+        if total:
+            bar_done = int(20 * done / total)
+            bar_skip = int(20 * skipped / total)
+            bar_active = int(20 * in_prog / total)
+            bar_block = int(20 * blocked / total)
+        else:
+            bar_done = bar_skip = bar_active = bar_block = 0
+        bar_empty = max(0, 20 - bar_done - bar_skip - bar_active - bar_block)
+        bar = (
+            "[green]█[/]" * bar_done
+            + "[cyan]▓[/]" * bar_active
+            + "[red]▓[/]" * bar_block
+            + "[dim]▒[/]" * bar_skip
+            + "[dim]░[/]" * bar_empty
+        )
+        bits: list[str] = []
+        if done:
+            bits.append(f"[green]{done} done[/]")
+        if in_prog:
+            bits.append(f"[cyan]{in_prog} in-progress[/]")
+        if blocked:
+            bits.append(f"[red]{blocked} blocked[/]")
+        if skipped:
+            bits.append(f"[dim]{skipped} skipped[/]")
+        if pending:
+            bits.append(f"[dim]{pending} pending[/]")
+        breakdown = " · ".join(bits) if bits else f"{total} pending"
+        self.console.print(f"  plan: {bar}  {breakdown}  ({total} total)")
  
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats
@@ -286,5 +345,3 @@ class Display:
             lines.append("tools:    all (unrestricted)")
         
         self.console.print("\n".join(lines))
-
-

@@ -29,6 +29,25 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 
 
 async def _plan_task(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    # Refuse to overwrite an already-approved plan. Once the user has
+    # approved a plan and the agent has been switched into edits/yolo
+    # mode, calling plan_task again restarts exploration from scratch
+    # — which is exactly the loop we want to prevent. The agent should
+    # use update_plan / finish_plan to track progress instead.
+    existing = ctx.plan
+    if existing is not None and existing.approved:
+        return ToolResult(
+            False,
+            error=(
+                f"An approved plan ({existing.id}) is already active. "
+                "Do not re-plan — execute the plan: "
+                "use `update_plan(step_index=N, status=\"in-progress\"/\"done\")` "
+                "as you work, and `finish_plan` once the work is complete. "
+                "If the original plan needs to change, mark the obsolete "
+                "steps `skipped` and use `update_plan(add_steps=[...])`."
+            ),
+        )
+
     plan = args.get("plan")
     problem = args.get("problem")
     solution = args.get("solution")
@@ -274,10 +293,19 @@ async def _get_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if plan is None:
         return ToolResult(True, data={"plan": None}, display="No active plan.")
     data = plan.to_dict()
+    progress = plan.progress()
     lines = [f"Plan {plan.id} ({'approved' if plan.approved else 'proposed'}):"]
     for i, step in enumerate(plan.steps, 1):
         mark = STATUS_ICONS.get(step.status, "?")
-        lines.append(f"  {mark} {i}. {step.description}")
+        # Include the status word so 'skipped' (—) isn't mistaken for done (✓).
+        lines.append(f"  {mark} {i}. [{step.status}] {step.description}")
+    lines.append(
+        f"progress: {progress['done']}/{progress['total']} done, "
+        f"{progress['skipped']} skipped, "
+        f"{progress['in_progress']} in-progress, "
+        f"{progress['blocked']} blocked, "
+        f"{progress['pending']} pending"
+    )
     return ToolResult(True, data={"plan": data}, display="\n".join(lines))
 
 
@@ -293,6 +321,78 @@ get_plan = Tool(
 )
 
 
-PLAN_TOOLS: list[Tool] = [plan_task, update_plan, get_plan]
+async def _finish_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Resolve every still-unresolved step in one call and end the task.
 
-__all__ = ["plan_task", "update_plan", "get_plan", "PLAN_TOOLS"]
+    Useful for research / audit tasks where the agent has produced its final
+    answer but several plan steps remain ``pending``. Without this, the
+    agent loop nudges "you have unresolved steps" in a tight loop until the
+    turn budget runs out.
+    """
+    status = args.get("status", "done")
+    summary = args.get("summary", "")
+
+    if status not in ("done", "skipped"):
+        return ToolResult(False, error="`status` must be 'done' or 'skipped'")
+    if not isinstance(summary, str):
+        return ToolResult(False, error="`summary` must be a string")
+
+    plan = ctx.plan
+    if plan is None:
+        return ToolResult(False, error="no active plan — call plan_task first")
+
+    affected: list[int] = []
+    for i, step in enumerate(plan.steps, 1):
+        if step.status not in ("done", "skipped"):
+            plan.update_step(step_index=i - 1, status=status, note=summary.strip())
+            affected.append(i)
+    ctx.pending_plan_evidence.clear()
+    save_plan(ctx.working_dir, plan)
+
+    progress = plan.progress()
+    if affected:
+        body = (
+            f"Resolved {len(affected)} remaining step(s) → {status}. "
+            f"Progress: {progress['done']}/{progress['total']} done, "
+            f"{progress['skipped']} skipped."
+        )
+    else:
+        body = "Plan was already fully resolved; no changes."
+    return ToolResult(
+        True,
+        data={"plan": plan.to_dict(), "affected_steps": affected, "status": status},
+        display=body,
+    )
+
+
+finish_plan = Tool(
+    name="finish_plan",
+    description=(
+        "Mark every remaining (pending / in-progress / blocked) step in the "
+        "active plan as done or skipped, in a single call. Use this when you "
+        "have produced your final answer for an audit/research-style task and "
+        "the leftover steps would otherwise keep the agent in a nudge loop. "
+        "Pair this with a final text summary to end the turn cleanly."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "status": {
+                "type": "string",
+                "enum": ["done", "skipped"],
+                "description": "Status to apply to all unresolved steps. Default: 'done'.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "Optional note attached to each resolved step.",
+            },
+        },
+        "required": [],
+    },
+    run=_finish_plan,
+)
+
+
+PLAN_TOOLS: list[Tool] = [plan_task, update_plan, get_plan, finish_plan]
+
+__all__ = ["plan_task", "update_plan", "get_plan", "finish_plan", "PLAN_TOOLS"]

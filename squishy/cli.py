@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -17,11 +18,13 @@ from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
 
 from squishy.agent import Agent
+from squishy.async_input import ModeCycler
 from squishy.client import Client
 from squishy.config import Config
 from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
+from squishy.plan_state import clear_plan
 from squishy.session import (
     create_session,
     export_training_to_file,
@@ -65,6 +68,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return p.parse_args(argv)
  
  
+def _user_configured_model(args: argparse.Namespace) -> bool:
+    """Return True if the user explicitly chose a model (via --model or env).
+
+    When False we let endpoint discovery fill in cfg.model so the banner
+    matches whatever requests are actually routed to. When True we keep the
+    user's choice (e.g. SQUISHY_MODEL from a .env) so a multi-model endpoint
+    doesn't make the banner contradict the requests being sent.
+    """
+    if args.model:
+        return True
+    return bool(os.environ.get("SQUISHY_MODEL"))
+
+
 def _build_config(args: argparse.Namespace) -> Config:
     cfg = Config()
     if args.base_url:
@@ -140,6 +156,7 @@ async def _amain() -> None:
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
     display = Display()
+    display.set_mode(cfg.permission_mode)
     client = Client(
         base_url=cfg.base_url,
         api_key=cfg.api_key,
@@ -152,9 +169,16 @@ async def _amain() -> None:
     )
 
     try:
-        # Discover the actual model name from endpoint (also discovers context_window)
+        # Discover the endpoint's model list (also picks up context_window).
+        # Only adopt the discovered name when the user hasn't explicitly
+        # configured a model — otherwise the banner would show a different
+        # model than the one requests are routed to (e.g. when a .env file
+        # sets SQUISHY_MODEL but the endpoint has multiple models loaded).
         discovered_model = await client.discover_model_name()
-        display.banner(cfg.base_url, discovered_model)
+        if not _user_configured_model(args):
+            cfg.model = discovered_model
+            client.model = discovered_model
+        display.banner(cfg.base_url, cfg.model)
         # Use the discovered context window so the % usage display is meaningful.
         # Falls back to 0 (no % shown) for endpoints that don't expose it.
         display.stats.context_window = client.context_window
@@ -174,32 +198,70 @@ async def _amain() -> None:
         except Exception as e:
             display.warn(f"[mcp] init failed: {e}")
 
-        async def prompt_fn(tool: Tool, args_: dict) -> bool | str:
-            try:
-                reply = await asyncio.to_thread(
-                    input, "  approve? [y/N] or type feedback: ",
-                )
-            except (EOFError, KeyboardInterrupt):
-                return False
-            text = reply.strip()
-            if text.lower() in ("y", "yes"):
+        # Single mode cycler shared across this whole interactive session.
+        # It's started around each agent.run() call so shift-tab works while
+        # the model is busy. paused() temporarily releases stdin so the
+        # approval prompt's reader can take over cleanly.
+        mode_cycler = ModeCycler(
+            on_cycle=lambda: display.mode_changed(cfg.cycle_mode())
+        )
+        # Dedicated PromptSession for approval prompts. Using
+        # prompt_toolkit instead of asyncio.to_thread(input) so Ctrl+C
+        # raises cleanly and stdin/terminal state is restored properly —
+        # the previous to_thread(input) path left the input thread
+        # blocked on stdin while the mode cycler resumed cbreak mode,
+        # which deadlocked the terminal.
+        approval_session: PromptSession[str] = PromptSession()
+
+        async def prompt_fn(tool: Tool, args_: dict):
+            label = (
+                "  approve? [y / N=decline / feedback / ^C cancels] "
+                if tool.name == "plan_task"
+                else "  approve? [y/N, ^C cancels] "
+            )
+            # Make sure any in-flight streaming markdown is finalised before
+            # we hand the terminal to prompt_toolkit, otherwise the live
+            # region and the prompt fight for the same screen rows.
+            display.flush_streaming_text()
+            with mode_cycler.paused():
+                try:
+                    reply = await approval_session.prompt_async(label)
+                except EOFError:
+                    # Ctrl+D — same as a polite decline.
+                    display.info("declined.")
+                    return False
+                # Ctrl+C is intentionally *not* caught here. We want it to
+                # propagate up through _handle_plan_approval and the agent
+                # loop so the entire turn is cancelled and the user lands
+                # back at the REPL prompt — instead of the agent silently
+                # treating it as "n" and continuing to chug.
+            stripped = (reply or "").strip()
+            lowered = stripped.lower()
+            if lowered in ("y", "yes"):
                 return True
-            if text.lower() in ("n", "no", ""):
+            if lowered in ("", "n", "no"):
                 return False
-            # Any other text is treated as feedback for the agent.
-            return text
+            # Anything else is treated as a decline with free-text feedback
+            # the agent can use to revise its plan.
+            if tool.name == "plan_task":
+                return ("feedback", stripped)
+            return False
+
  
         if args.message:
-            await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout)
+            await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout, mode_cycler)
             return
- 
+
         if not sys.stdin.isatty():
             msg = sys.stdin.read().strip()
             if msg:
-                await _run_one(cfg, client, display, None, msg, args.timeout)
+                await _run_one(cfg, client, display, None, msg, args.timeout, None)
             return
- 
-        await _interactive(cfg, client, display, prompt_fn, args.timeout, resume_id=args.resume)
+
+        await _interactive(
+            cfg, client, display, prompt_fn, args.timeout,
+            resume_id=args.resume, mode_cycler=mode_cycler,
+        )
     finally:
         await client.aclose()
  
@@ -252,13 +314,18 @@ async def _prompt_switch_to_edits(
     prompt_text: str,
     success_text: str,
 ) -> None:
+    # Use prompt_toolkit instead of asyncio.to_thread(input) so Ctrl+C
+    # raises cleanly without leaving an orphan input thread blocked on
+    # stdin (which freezes the terminal).
+    session: PromptSession[str] = PromptSession()
     try:
-        reply = await asyncio.to_thread(input, prompt_text)
+        reply = await session.prompt_async(prompt_text)
     except (EOFError, KeyboardInterrupt):
         display.info("Cancelled.")
         return
-    if reply.strip().lower() in ("", "y", "yes"):
+    if (reply or "").strip().lower() in ("", "y", "yes"):
         cfg.permission_mode = "edits"
+        display.set_mode("edits")
         display.info(success_text)
     else:
         display.info("Staying in plan mode.")
@@ -276,6 +343,7 @@ async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeou
         return
     agent.tool_ctx.plan_switch_prompted = True
     cfg.permission_mode = "edits"
+    display.set_mode("edits")
     display.info("[bold green]✓ Switched to edits mode[/]")
     try:
         await agent.run(EXECUTE_APPROVED_PLAN_PROMPT, timeout=timeout)
@@ -306,34 +374,58 @@ def _create_session_for_agent(cfg: Config, model_name: str) -> str | None:
         return None
 
 
-async def _run_one(cfg, client, display, prompt_fn, message, timeout):  # type: ignore[no-untyped-def]
+async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycler=None):  # type: ignore[no-untyped-def]
+    # One-shot invocations should not pick up a leftover plan from a previous
+    # interactive run.
+    clear_plan(cfg.working_dir)
     session_id = _create_session_for_agent(cfg, cfg.model)
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
+    cycler = mode_cycler or _NullModeCycler()
     try:
         # Inject file references before running
         message_with_files, references = inject_references(message, cfg.working_dir)
         if references:
             display.info(format_reference_list(references))
-        await agent.run(message_with_files, timeout=timeout)
+        async with cycler:
+            await agent.run(message_with_files, timeout=timeout)
     except AgentTimeout as e:
         display.error(str(e))
         return
-    except AgentCancelled:
+    except (AgentCancelled, KeyboardInterrupt):
+        display.flush_streaming_text()
         display.warn("cancelled")
         return
     except LLMError as e:
         display.error(f"LLM error: {e}")
         return
 
-    await _auto_execute_plan(agent, cfg, display, timeout)
+    try:
+        async with cycler:
+            await _auto_execute_plan(agent, cfg, display, timeout)
+    except (AgentCancelled, KeyboardInterrupt):
+        display.flush_streaming_text()
+        display.warn("cancelled")
+
+
+class _NullModeCycler:
+    """No-op stand-in used when the mode cycler isn't available
+    (non-TTY, headless message piped via stdin, etc.)."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return None
  
 
-async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: str | None = None):  # type: ignore[no-untyped-def]
+async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: str | None = None, mode_cycler=None):  # type: ignore[no-untyped-def]
     kb = KeyBindings()
+    cycler = mode_cycler or _NullModeCycler()
 
     @kb.add("s-tab")
     def _cycle(event):  # type: ignore[no-untyped-def]
-        cfg.cycle_mode()
+        new_mode = cfg.cycle_mode()
+        display.set_mode(new_mode)
         event.app.invalidate()
 
     session: PromptSession[str] = PromptSession(
@@ -354,6 +446,8 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             display.error(f"failed to resume session {resume_id}: {e}")
             return
     else:
+        # Fresh interactive session — never inherit a plan from a previous run.
+        clear_plan(cfg.working_dir)
         session_id = _create_session_for_agent(cfg, display.model or cfg.model)
         current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
         if session_id:
@@ -405,6 +499,10 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
+            # Drop any persisted plan so the next agent starts fresh —
+            # otherwise __post_init__ will silently reload the prior plan
+            # and the user sees "[plan] restored …" right after /clear.
+            clear_plan(cfg.working_dir)
             # Rebuild agent with fresh conversation history and new session.
             session_id = _create_session_for_agent(cfg, display.model or cfg.model)
             current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
@@ -439,6 +537,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             rest = rest.strip()
             if rest in ("plan", "edits", "yolo"):
                 cfg.permission_mode = rest
+                display.set_mode(rest)
                 display.info(f"mode → {rest}")
             else:
                 display.warn("usage: /mode plan|edits|yolo")
@@ -505,16 +604,30 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             message_with_files, references = inject_references(line, cfg.working_dir)
             if references:
                 display.info(format_reference_list(references))
-            await current_agent.run(message_with_files, timeout=timeout)
+            # Activate the mode cycler so shift-tab works while the model
+            # is busy. The cycler is a no-op on non-TTY platforms.
+            async with cycler:
+                await current_agent.run(message_with_files, timeout=timeout)
         except AgentTimeout as e:
             display.error(str(e))
-        except AgentCancelled:
+        except (AgentCancelled, KeyboardInterrupt):
+            # Ctrl+C inside agent.run lands here once asyncio cancels the
+            # task. Always make sure the streamed display is closed so the
+            # next REPL prompt doesn't draw on top of a half-rendered
+            # markdown live region.
+            display.flush_streaming_text()
             display.warn("cancelled")
+            continue
         except LLMError as e:
             display.error(f"LLM error: {e}")
             continue
 
-        await _auto_execute_plan(current_agent, cfg, display, timeout)
+        try:
+            async with cycler:
+                await _auto_execute_plan(current_agent, cfg, display, timeout)
+        except (AgentCancelled, KeyboardInterrupt):
+            display.flush_streaming_text()
+            display.warn("cancelled")
 
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:

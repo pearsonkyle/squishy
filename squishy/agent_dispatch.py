@@ -102,8 +102,16 @@ async def handle_plan_approval(
                      run=lambda *_: None),  # type: ignore[arg-type]
                 tc.args,
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             result = False
+        except KeyboardInterrupt:
+            # User wants to abort the whole run. Clean up the pending plan
+            # and re-raise so Agent.run() translates it into AgentCancelled.
+            agent.tool_ctx.plan = None
+            agent.tool_ctx.pending_plan_evidence.clear()
+            agent.tool_ctx.plan_switch_prompted = False
+            clear_plan(agent.tool_ctx.working_dir)
+            raise
     if result is True:
         if agent.tool_ctx.plan is not None:
             agent.tool_ctx.plan.mark_approved()

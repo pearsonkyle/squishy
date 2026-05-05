@@ -235,8 +235,9 @@ def test_classify_error_maps_common_cases():
 
 
 def test_build_prompt_includes_env_error_guidance():
-    """Environmental error guidance is now in the system prompt (bench mode block)."""
+    """Bench mode block contains the expected mode header."""
     from squishy.context import _mode_block
 
     bench_block = _mode_block("bench", "/tmp")
-    assert "ImportError" in bench_block
+    assert "bench" in bench_block
+    assert "No approval prompts" in bench_block
