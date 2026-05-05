@@ -20,13 +20,8 @@ def _tc(name: str, args: dict, call_id: str = "c1"):
 
 from squishy.client import CompletionResult
 
-
-@pytest.mark.asyncio
-
 class TestPlanEdgeCases:
     """Test edge cases in plan operations."""
-
-    @pytest.mark.asyncio
     async def test_plan_with_no_steps(self, tmp_path):
         """Empty steps array should fail validation."""
         from squishy.tools.plan import _plan_task
@@ -176,9 +171,6 @@ class TestPlanEdgeCases:
             assert ctx.plan.files_to_create == ["new.py"]
             assert ctx.plan.files_to_modify == ["old.py"]
 
-
-@pytest.mark.asyncio
-
 class TestReadCacheEdgeCases:
     """Test edge cases in file read caching."""
 
@@ -244,9 +236,6 @@ class TestReadCacheEdgeCases:
         assert not result.success
         assert "file not found" in result.error.lower()
 
-
-@pytest.mark.asyncio
-
 class TestEditEdgeCases:
     """Test edge cases in file editing."""
 
@@ -302,9 +291,6 @@ class TestEditEdgeCases:
         )
         # Empty old_str is problematic - either fail or replace everything
         assert not result.success
-
-
-@pytest.mark.asyncio
 
 class TestWriteEdgeCases:
     """Test edge cases in file writing."""
@@ -465,9 +451,6 @@ class TestLoadPlanEdgeCases:
         # Should have defaults for missing fields
         assert hasattr(result, "solution")
         assert hasattr(result, "steps")
-
-
-@pytest.mark.asyncio
 
 class TestConsecutiveReadsTracking:
     """Test MAX_RECALL_SKIP_TURNS enforcement."""

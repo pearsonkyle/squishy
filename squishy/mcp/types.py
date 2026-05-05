@@ -3,8 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
-
+from typing import Any
 
 # ── Server config ─────────────────────────────────────────────────────────────
 
@@ -12,10 +11,9 @@ class MCPTransport(str, Enum):
     STDIO = "stdio"
     SSE   = "sse"
     HTTP  = "http"
-    WS    = "ws"
 
 
-_TRANSPORT_ALIASES: Dict[str, str] = {
+_TRANSPORT_ALIASES: dict[str, str] = {
     "remote": "http",
     "streamable-http": "http",
 }
@@ -36,17 +34,17 @@ class MCPServerConfig:
     transport: MCPTransport = MCPTransport.STDIO
     # stdio fields
     command: str = ""
-    args: List[str] = field(default_factory=list)
-    env: Dict[str, str] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
     # sse / http / ws fields
     url: str = ""
-    headers: Dict[str, str] = field(default_factory=dict)
+    headers: dict[str, str] = field(default_factory=dict)
     # optional
     timeout: int = 30
     disabled: bool = False
 
     @classmethod
-    def from_dict(cls, name: str, d: dict) -> "MCPServerConfig":
+    def from_dict(cls, name: str, d: dict) -> MCPServerConfig:
         transport_str = d.get("type", "stdio").lower()
         transport_str = _TRANSPORT_ALIASES.get(transport_str, transport_str)
         try:
@@ -84,28 +82,21 @@ class MCPTool:
     tool_name: str
     qualified_name: str             # mcp__<server>__<tool>
     description: str
-    input_schema: Dict[str, Any]
+    input_schema: dict[str, Any]
     read_only: bool = False
 
-    def to_tool_schema(self) -> dict:
-        """Convert to the schema format for the OpenAI API."""
-        return {
-            "name": self.qualified_name,
-            "description": f"[MCP:{self.server_name}] {self.description}",
-            "input_schema": self.input_schema or {"type": "object", "properties": {}},
-        }
 
 
 # ── JSON-RPC helpers ──────────────────────────────────────────────────────────
 
-def make_request(method: str, params: Optional[dict], req_id: int) -> dict:
+def make_request(method: str, params: dict | None, req_id: int) -> dict:
     msg: dict = {"jsonrpc": "2.0", "id": req_id, "method": method}
     if params is not None:
         msg["params"] = params
     return msg
 
 
-def make_notification(method: str, params: Optional[dict] = None) -> dict:
+def make_notification(method: str, params: dict | None = None) -> dict:
     msg: dict = {"jsonrpc": "2.0", "method": method}
     if params is not None:
         msg["params"] = params

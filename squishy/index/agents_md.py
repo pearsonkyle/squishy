@@ -17,6 +17,7 @@ from pathlib import Path
 from squishy.index.model import Index, Node
 
 
+
 # Directories that are noise in the project overview: VCS internals,
 # build artifacts, virtualenvs, dependency caches, and squishy's own
 # generated session/index storage.
@@ -160,7 +161,7 @@ def _extract_key_symbols(index: Index, limit_per_file: int = 3) -> list[dict]:
         file_syms = by_file[path][:limit_per_file]
         result.extend(file_syms)
 
-    return result[:30]  # Overall limit
+    return result[:50]  # Overall limit
 
 
 def _collect_external_deps(
@@ -327,6 +328,7 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
         "calling recall. The index lives at .squishy/index.json."
     )
     lines.append("")
+
 
     return "\n".join(lines)
 

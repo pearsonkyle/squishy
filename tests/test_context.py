@@ -230,15 +230,17 @@ def test_trim_history_preserves_plan_status_system_message():
     assert trimmed[-1]["content"] == "a19"
 
 
-def test_trim_history_noop_orders_plan_status_after_primary_system():
+def test_trim_history_noop_preserves_system_order():
+    """Plan-status is now merged into messages[0] by _refresh_system_injections,
+    not stored as a separate system message. Multiple system messages are
+    preserved in order."""
     msgs = [
-        {"role": "system", "content": "<plan-status>\nx\n</plan-status>"},
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "u"},
     ]
     trimmed = trim_history(msgs)
     assert trimmed[0]["content"] == "sys"
-    assert trimmed[1]["content"].startswith("<plan-status>")
+    assert trimmed[1]["content"] == "u"
 
 
 # --- snip_old_tool_results tests ---

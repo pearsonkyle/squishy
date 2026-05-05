@@ -29,11 +29,11 @@ MUTATING_TOOLS = frozenset({
     "edit_file",
 })
 
-SHELL_TOOLS = frozenset({
+SHELL_TOOL_NAMES = frozenset({
     "run_command",
 })
 
-ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOLS
+ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOL_NAMES
 
 # Plan tools excluded from bench mode to reduce schema size and prevent
 # the model from wasting turns on planning instead of fixing.
@@ -45,7 +45,7 @@ BENCH_TOOLS = ALL_TOOLS - _PLAN_TOOLS
 # first token; two-word entries (e.g. "git log") match on the first two.
 READONLY_SHELL_BINARIES = frozenset({
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find",
-    "pwd", "which", "file", "stat", "tree", "env", "echo",
+    "pwd", "which", "file", "stat", "tree", "printenv", "echo",
     "ruff", "mypy", "pyright",
 })
 
@@ -157,9 +157,9 @@ def get_allowed_tools(mode: str) -> frozenset[str]:
     if mode == "bench":
         return BENCH_TOOLS
     if mode == "edits":
-        return READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOLS
+        return READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOL_NAMES
     if mode == "plan":
-        return READ_ONLY_TOOLS | SHELL_TOOLS
+        return READ_ONLY_TOOLS | SHELL_TOOL_NAMES
     return frozenset()
 
 
@@ -174,8 +174,12 @@ def check_permission(
     In plan mode, `run_command` is permitted only when its `command` is on the
     read-only allowlist.
     """
-    # MCP tools are always allowed (external capabilities).
+    # MCP tools: apply mode-based filtering.
     if tool_name.startswith("mcp__"):
+        if mode == "plan":
+            return False, "refused: MCP tools are blocked in plan mode (switch to edits or yolo)"
+        if mode == "edits":
+            return False, "prompt"
         return True, ""
 
     allowed = get_allowed_tools(mode)
@@ -203,7 +207,7 @@ def check_permission(
 
     # Edits-mode shell prompt (only reached when tool IS in allowed set; for
     # run_command we also want the approval prompt to still fire).
-    if mode == "edits" and tool_name in SHELL_TOOLS:
+    if mode == "edits" and tool_name in SHELL_TOOL_NAMES:
         return False, "prompt"
 
     return True, ""

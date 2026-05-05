@@ -6,8 +6,8 @@ from squishy.index.agents_md import generate_agents_md, save_agents_md
 from squishy.index.build import _build_index_async, build_index
 from squishy.index.model import Index, IndexMeta, Node
 from squishy.index.optimize import (
-    MIN_DIR_FILES,
     DEFAULT_RETENTION_DAYS,
+    MIN_DIR_FILES,
     compact_dir_summaries,
     get_index_size,
     needs_pruning,

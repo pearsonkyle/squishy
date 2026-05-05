@@ -7,6 +7,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import pytest
 from dotenv import load_dotenv
 
 # Load .env so tests pick up the user's configured base_url/model
@@ -14,6 +15,8 @@ load_dotenv()
 
 from squishy.api import Squishy
 from squishy.plan_state import load_plan
+
+pytestmark = pytest.mark.smoke
 
 
 def _env(key: str, default: str) -> str:

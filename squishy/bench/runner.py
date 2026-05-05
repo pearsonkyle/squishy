@@ -96,7 +96,13 @@ async def run_batch(
         nonlocal completed
         async with sem:
             t0 = time.monotonic()
-            task_id = getattr(task, "id", None) or str(getattr(task, "get", lambda _k: None)("id") or "?")
+            _get = getattr(task, "get", lambda _k: None)
+            task_id = (
+                getattr(task, "id", None)
+                or _get("instance_id")
+                or _get("id")
+                or "?"
+            )
             try:
                 if per_task_timeout is not None:
                     async with asyncio.timeout(per_task_timeout):
@@ -121,6 +127,9 @@ async def run_batch(
  
             if writer is not None:
                 record = {"task_id": result.task_id, **result.prediction}
+                # Ensure instance_id is always present for resume filtering
+                if "instance_id" not in record:
+                    record["instance_id"] = result.task_id
                 if result.artifacts:
                     record["artifacts"] = result.artifacts
                 if not result.success:

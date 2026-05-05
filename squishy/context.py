@@ -14,8 +14,6 @@ from typing import Any
 from squishy.index.store import has_index
 from squishy.tools.fs import SKIP_DIRS
 
-MAX_HISTORY = 10  # system + first user + last 8 = 10
- 
  
 @dataclass
 class ProjectInfo:
@@ -173,6 +171,7 @@ def _project_line(project: ProjectInfo) -> str:
     if project.test_command:
         bits.append(f"test=`{project.test_command}`")
     return " · ".join(bits)
+
 
 
 def _top_level_files_block(cwd: str) -> str:
@@ -356,7 +355,7 @@ def snip_old_tool_results(
     return messages
 
 
-def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY) -> list[dict[str, Any]]:
+def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list[dict[str, Any]]:
     """Keep system + first user + last (max_messages - 2) messages.
 
     Ported from atlas-proxy/agent.go:41-50. Preserves initial intent while
@@ -372,37 +371,22 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
     result it has no record of requesting, and re-requests the same read).
     Leading tool messages are dropped until we hit an assistant or user turn.
 
-    Plan-status system messages (wrapped in ``<plan-status>…</plan-status>``)
-    are preserved alongside the primary system prompt so the model keeps its
-    current plan snapshot regardless of how many tool turns have passed.
     """
     # Layer 1: snip old tool results before trimming
     snip_old_tool_results(messages)
 
-    from squishy.plan_state import is_plan_status_message
-    from squishy.tools.scratchpad import is_notes_message
-
-    def _is_injected_system(m: dict[str, Any]) -> bool:
-        return is_plan_status_message(m) or is_notes_message(m)
-
-    system = [m for m in messages if m.get("role") == "system" and not _is_injected_system(m)]
-    injected_msgs = [m for m in messages if _is_injected_system(m)]
-    non_system = [
-        m for m in messages
-        if m.get("role") != "system" and not _is_injected_system(m)
-    ]
+    system = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
 
     if len(messages) <= max_messages:
-        # Still ensure injected system messages are ordered after the
-        # primary system prompt (they may have been appended later).
-        return system + injected_msgs + non_system
+        return system + non_system
 
     if not non_system:
-        return system + injected_msgs
+        return system
 
     first_user_idx = next((i for i, m in enumerate(non_system) if m.get("role") == "user"), 0)
     first_user = [non_system[first_user_idx]]
-    remaining_budget = max(1, max_messages - len(system) - len(injected_msgs) - len(first_user))
+    remaining_budget = max(1, max_messages - len(system) - len(first_user))
     tail = non_system[-remaining_budget:]
     if tail and tail[0] is first_user[0]:
         tail = tail[1:]
@@ -420,10 +404,22 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = MAX_HISTORY
         dropped_end = len(non_system) - (len(tail) if tail else 0)
         dropped = non_system[dropped_start:dropped_end]
         anchored = [m for m in dropped if m.get("_squishy_anchor")]
+        # Only re-inject anchored messages that won't be orphans.
+        # A tool message is an orphan if its matching assistant tool_calls
+        # message is not in the retained set.
+        retained_call_ids: set[str] = set()
+        for m in first_user + tail:
+            for tc in m.get("tool_calls", []):
+                if isinstance(tc, dict):
+                    retained_call_ids.add(tc.get("id", ""))
         for m in anchored[:3]:
+            if m.get("role") == "tool":
+                tcid = m.get("tool_call_id", "")
+                if tcid and tcid not in retained_call_ids:
+                    continue  # skip orphan tool result
             tail.insert(0, m)
 
-    return system + injected_msgs + first_user + tail
+    return system + first_user + tail
 
 
 # ── Layer 2: LLM-based context compaction ────────────────────────────────
@@ -483,9 +479,6 @@ async def compact_messages(
     Anchored messages (``_squishy_anchor``) in the old portion are pulled
     into the recent section to preserve high-value context.
     """
-    from squishy.plan_state import is_plan_status_message
-    from squishy.tools.scratchpad import is_notes_message
-
     est = _estimate_message_tokens(messages)
     if est <= int(context_limit * threshold):
         return messages
@@ -500,12 +493,27 @@ async def compact_messages(
     if len(non_system) < 4:
         return messages
 
-    split = find_compaction_split(non_system)
+    # Protect the first user message (contains problem statement / task
+    # instructions) from being summarized away.
+    first_user_idx = next(
+        (i for i, m in enumerate(non_system) if m.get("role") == "user"), None,
+    )
+    if first_user_idx is not None:
+        protected = non_system[first_user_idx]
+        compactable = non_system[:first_user_idx] + non_system[first_user_idx + 1:]
+    else:
+        protected = None
+        compactable = non_system
+
+    if len(compactable) < 4:
+        return messages
+
+    split = find_compaction_split(compactable)
     if split <= 0:
         return messages
 
-    old = non_system[:split]
-    recent = non_system[split:]
+    old = compactable[:split]
+    recent = compactable[split:]
 
     # Pull anchored messages from old section into recent
     anchored = [m for m in old if m.get("_squishy_anchor")]
@@ -524,7 +532,24 @@ async def compact_messages(
         elif m.get("tool_calls"):
             for tc in m["tool_calls"]:
                 func = tc.get("function", {})
-                summary_parts.append(f"[{role}]: called {func.get('name', '?')}")
+                name = func.get("name", "?")
+                # Include key args (file paths, commands) for context
+                args_preview = ""
+                try:
+                    import json as _json
+                    args = _json.loads(func.get("arguments", "{}"))
+                    if "path" in args:
+                        args_preview = f"path={args['path']}"
+                    elif "command" in args:
+                        args_preview = f"cmd={str(args['command'])[:80]}"
+                    elif "query" in args:
+                        args_preview = f"query={args['query']}"
+                    elif "pattern" in args:
+                        args_preview = f"pattern={args['pattern']}"
+                except Exception:  # noqa: BLE001
+                    pass
+                detail = f"({args_preview})" if args_preview else ""
+                summary_parts.append(f"[{role}]: called {name}{detail}")
 
     old_text = "\n".join(summary_parts)
     # Cap the text sent for summarization to avoid blowing up the compaction prompt.
@@ -533,7 +558,6 @@ async def compact_messages(
 
     # Summarize via LLM
     try:
-        from squishy.errors import LLMError
         summary_prompt = (
             "Summarize this conversation history concisely. Preserve: "
             "file paths, function/class names, error messages, test commands, "
@@ -563,4 +587,7 @@ async def compact_messages(
         "content": "Understood. I have the context from earlier. Continuing.",
     }
 
-    return system + [summary_msg, ack_msg] + recent
+    # Re-inject the protected first user message right after system messages
+    # so it survives compaction and remains visible to the model.
+    protected_msgs = [protected] if protected is not None else []
+    return system + protected_msgs + [summary_msg, ack_msg] + recent

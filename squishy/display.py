@@ -12,7 +12,10 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.text import Text
 
-MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta"}
+from squishy.plan_state import STATUS_ICONS
+from squishy.tool_restrictions import get_allowed_tools
+
+MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta", "bench": "ansiyellow"}
 
 
 def estimate_tokens(text: str) -> int:
@@ -236,7 +239,6 @@ class Display:
         lines.append(f"[bold green]Solution:[/] {data.get('solution', '')}")
         lines.append("")
         lines.append("[bold yellow]Steps:[/]")
-        from squishy.plan_state import STATUS_ICONS
         for i, step in enumerate(data.get("steps", []), 1):
             desc = step if isinstance(step, str) else step.get("description", "")
             status = "" if isinstance(step, str) else step.get("status", "pending")
@@ -320,8 +322,6 @@ class Display:
 
     def status(self, mode: str) -> None:
         """Display current configuration and tool availability."""
-        from squishy.tool_restrictions import get_allowed_tools
-
         allowed = get_allowed_tools(mode)
         
         self.console.rule(f"[bold]{mode.upper()} MODE[/]", style=MODE_COLORS.get(mode, "dim"))
@@ -345,4 +345,3 @@ class Display:
             lines.append("tools:    all (unrestricted)")
         
         self.console.print("\n".join(lines))
-

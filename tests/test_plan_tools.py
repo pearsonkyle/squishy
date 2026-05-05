@@ -11,7 +11,6 @@ from squishy.plan_state import (
     PLAN_STATUS_CLOSE_TAG,
     PLAN_STATUS_OPEN_TAG,
     PlanState,
-    is_plan_status_message,
     load_plan,
     plan_path,
     render_plan_status,
@@ -63,9 +62,6 @@ class TestStatsContextWindow:
         s = Stats()
         s.context_window = 8192
         assert s.context_window == 8192
-
-
-@pytest.mark.asyncio
 class TestPlanTask:
     async def test_plan_task_basic(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task
@@ -181,9 +177,6 @@ class TestPlanTask:
         assert persisted.problem == "Tests are failing"
         assert persisted.solution == "Fix the broken assertions"
         assert [step.description for step in persisted.steps] == ["Read file", "Fix it"]
-
-
-@pytest.mark.asyncio
 class TestUpdatePlan:
     async def test_update_plan_marks_done(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task, _update_plan
@@ -284,9 +277,6 @@ class TestPlanToolRestrictions:
             assert "update_plan" in allowed
             assert "get_plan" in allowed
             # log_blocker was removed — its purpose is served by update_plan
-
-
-@pytest.mark.asyncio
 class TestGetPlanTool:
     async def test_get_plan_no_active_plan(self, tmp_path) -> None:
         from squishy.tools.plan import _get_plan
@@ -307,9 +297,6 @@ class TestGetPlanTool:
         assert result.success
         assert result.data["plan"]["problem"] == "p"
         assert len(result.data["plan"]["steps"]) == 2
-
-
-@pytest.mark.asyncio
 class TestUpdatePlanAddSteps:
     async def test_add_steps_appends(self, tmp_path) -> None:
         from squishy.tools.plan import _plan_task, _update_plan
@@ -376,14 +363,6 @@ class TestRenderPlanStatus:
         step_line = [ln for ln in text.splitlines() if ln.strip().startswith("[")][0]
         assert "…" in step_line
         assert len(step_line) < 80
-
-    def test_is_plan_status_message(self) -> None:
-        plan = self._plan()
-        msg = {"role": "system", "content": render_plan_status(plan)}
-        assert is_plan_status_message(msg)
-        assert not is_plan_status_message({"role": "system", "content": "something else"})
-        assert not is_plan_status_message({"role": "user", "content": render_plan_status(plan)})
-
 
 class TestDisplayPlanPanel:
     def test_plan_panel_renders(self) -> None:

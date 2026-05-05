@@ -17,12 +17,10 @@ from __future__ import annotations
 
 import json
 import os
-import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-
 
 _DEFAULT_DIR = os.path.expanduser("~/.squishy/sessions")
 
@@ -48,7 +46,7 @@ class Session:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _session_path(session_id: str, root: str | None = None) -> Path:

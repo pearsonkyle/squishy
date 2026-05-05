@@ -52,11 +52,12 @@ class Config:
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
     max_tool_output_chars: int = 32_000
-    max_quality_retries: int = 2
+    max_quality_retries: int = 3
     compaction_threshold: float = 0.7
     max_stuck_turns: int = 3
+    max_system_nudges: int = 12  # cap total nudges to avoid flooding context
     # Phase-budget thresholds (bench/yolo modes only).
-    max_explore_turns: int = 8
+    max_explore_turns: int = 3
     max_fix_verify_cycles: int = 6
     max_post_edit_read_turns: int = 4
     # Session persistence.

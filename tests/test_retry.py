@@ -12,7 +12,6 @@ import squishy.client as client_mod
 from squishy.client import Client
 from squishy.errors import LLMError
  
-pytestmark = pytest.mark.asyncio
  
  
 class _FlakyCompletions:

@@ -59,7 +59,7 @@ class TestMCPServerConfig:
 
 
 class TestMCPTool:
-    def test_to_tool_schema(self):
+    def test_fields(self):
         tool = MCPTool(
             server_name="ctx7",
             tool_name="resolve_library_id",
@@ -67,10 +67,9 @@ class TestMCPTool:
             description="Resolves a library ID",
             input_schema={"type": "object", "properties": {"name": {"type": "string"}}},
         )
-        schema = tool.to_tool_schema()
-        assert schema["name"] == "mcp__ctx7__resolve_library_id"
-        assert "[MCP:ctx7]" in schema["description"]
-        assert schema["input_schema"]["properties"]["name"]["type"] == "string"
+        assert tool.qualified_name == "mcp__ctx7__resolve_library_id"
+        assert tool.server_name == "ctx7"
+        assert tool.input_schema["properties"]["name"]["type"] == "string"
 
 
 # ── tools.py ──────────────────────────────────────────────────────────────────
@@ -89,8 +88,6 @@ class TestBuildTool:
         assert tool.name == "mcp__test__my_tool"
         assert "[MCP:test]" in tool.description
         assert callable(tool.run)
-
-    @pytest.mark.asyncio
     async def test_async_runner(self):
         """The MCP runner wraps call_tool in asyncio.to_thread."""
         runner = _make_mcp_runner("mcp__srv__fn")
@@ -105,8 +102,6 @@ class TestBuildTool:
         assert result.success is True
         assert result.data["content"] == "hello from mcp"
         mock_mgr.call_tool.assert_called_once_with("mcp__srv__fn", {"arg": 1})
-
-    @pytest.mark.asyncio
     async def test_async_runner_error(self):
         runner = _make_mcp_runner("mcp__srv__fn")
 
@@ -152,10 +147,21 @@ class TestDynamicRegistration:
 # ── tool_restrictions.py ─────────────────────────────────────────────────────
 
 class TestMCPPermissions:
-    def test_mcp_tools_allowed_in_all_modes(self):
+    def test_mcp_tools_mode_gated(self):
         from squishy.tool_restrictions import check_permission
 
-        for mode in ("plan", "edits", "yolo", "bench"):
+        # MCP tools blocked in plan mode
+        allowed, reason = check_permission("mcp__ctx7__resolve", "plan")
+        assert allowed is False, "MCP tool should be blocked in plan mode"
+        assert "plan mode" in reason
+
+        # MCP tools require prompt in edits mode
+        allowed, reason = check_permission("mcp__ctx7__resolve", "edits")
+        assert allowed is False
+        assert reason == "prompt"
+
+        # MCP tools allowed in yolo and bench
+        for mode in ("yolo", "bench"):
             allowed, reason = check_permission("mcp__ctx7__resolve", mode)
             assert allowed is True, f"MCP tool rejected in {mode} mode"
             assert reason == ""
@@ -178,7 +184,13 @@ class TestSchemaInclusion:
         _register_tools_into_squishy([tool])
 
         try:
-            for mode in ("plan", "edits", "yolo", "bench"):
+            # MCP tools excluded from plan mode schemas
+            plan_schemas = openai_schemas("plan")
+            plan_names = [s["function"]["name"] for s in plan_schemas]
+            assert "mcp__test__schema_test" not in plan_names, "MCP tool should not be in plan schemas"
+
+            # MCP tools included in other modes
+            for mode in ("edits", "yolo", "bench"):
                 schemas = openai_schemas(mode)
                 names = [s["function"]["name"] for s in schemas]
                 assert "mcp__test__schema_test" in names, f"MCP tool missing from {mode} schemas"
@@ -226,7 +238,6 @@ class TestConfig:
 # ── dispatch integration ─────────────────────────────────────────────────────
 
 class TestDispatch:
-    @pytest.mark.asyncio
     async def test_dispatch_mcp_tool(self):
         from squishy.tools import dispatch
 

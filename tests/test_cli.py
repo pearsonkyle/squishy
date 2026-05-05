@@ -8,7 +8,6 @@ import squishy.cli as cli
 from squishy.config import Config
 from squishy.plan_state import PlanState, has_plan_file, plan_path, save_plan
 
-pytestmark = pytest.mark.asyncio
 
 
 async def test_run_one_continues_after_plan_approval(monkeypatch):

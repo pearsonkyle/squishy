@@ -13,7 +13,6 @@ import os
 import sys
 
 from dotenv import load_dotenv
-
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.key_binding import KeyBindings
@@ -22,7 +21,7 @@ from squishy.agent import Agent
 from squishy.async_input import ModeCycler
 from squishy.client import Client
 from squishy.config import Config
-from squishy.display import Display, MODE_COLORS, Stats
+from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references
 from squishy.plan_state import clear_plan
@@ -31,7 +30,6 @@ from squishy.session import (
     export_training_to_file,
     list_sessions,
     load_messages,
-    load_session,
 )
 from squishy.tools.base import Tool
 
@@ -248,6 +246,7 @@ async def _amain() -> None:
             if tool.name == "plan_task":
                 return ("feedback", stripped)
             return False
+
  
         if args.message:
             await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout, mode_cycler)
@@ -496,7 +495,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             continue
         if line in ("/clear", "/new"):
             # Clear terminal screen
-            os.system("clear" if os.name != "nt" else "cls")
+            print("\033[H\033[2J", end="", flush=True)
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
@@ -633,9 +632,9 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:
     """Handle /mcp slash command."""
-    from squishy.mcp.tools import reload_mcp, get_connect_errors
     from squishy.mcp.client import get_mcp_manager
     from squishy.mcp.config import add_server_to_user_config, remove_server_from_user_config
+    from squishy.mcp.tools import reload_mcp
 
     parts = rest.split() if rest else []
     subcmd = parts[0].lower() if parts else "list"

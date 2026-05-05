@@ -1,10 +1,10 @@
 """Agent loop tests using a scripted fake Client."""
- 
+
 from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -14,33 +14,8 @@ from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.display import Display
 from squishy.plan_state import plan_path
- 
-pytestmark = pytest.mark.asyncio
- 
- 
-@dataclass
-class FakeClient:
-    script: list[CompletionResult]
-    calls_seen: list[list[dict[str, Any]]] = field(default_factory=list)
-    _i: int = 0
- 
-    async def health(self) -> bool:
-        return True
- 
-    async def complete(
-        self,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        *,
-        stream: bool = True,
-        on_text: Any = None,
-    ) -> CompletionResult:
-        self.calls_seen.append(list(messages))
-        if self._i >= len(self.script):
-            return CompletionResult(text="done.", tool_calls=[])
-        result = self.script[self._i]
-        self._i += 1
-        return result
+
+from conftest import FakeClient
  
  
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
@@ -363,13 +338,14 @@ async def test_agent_plan_mode_nudges_after_tool_turns(tmp_path):
     cfg.max_turns = 30
     max_tool_turns = cfg.max_plan_investigation_turns
 
-    # Create a file so read_file succeeds
-    (tmp_path / "foo.py").write_text("# code")
+    # Create files so read_file succeeds (different files to avoid quality gate)
+    for i in range(max_tool_turns):
+        (tmp_path / f"file{i}.py").write_text(f"# code {i}")
 
     # max_plan_investigation_turns turns of read-only tool calls, then plan_task
     script = [
         CompletionResult(
-            tool_calls=[_tc("read_file", {"path": "foo.py"}, call_id=f"c{i}")]
+            tool_calls=[_tc("read_file", {"path": f"file{i}.py"}, call_id=f"c{i}")]
         )
         for i in range(max_tool_turns)
     ] + [
@@ -668,7 +644,8 @@ async def test_agent_caps_fix_verify_cycles(tmp_path):
     agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
     result = await agent.run("fix it")
 
-    assert result.success
+    # Tests never passed in this scenario, so exhausted cycles = not successful.
+    assert not result.success
     assert "cycle budget" in result.final_text
 
 
@@ -727,14 +704,19 @@ async def test_post_edit_read_blocking(tmp_path):
         (tmp_path / f"r{i}.py").write_text(f"content {i}")
 
     script = [
-        # Turn 1: edit (enters fix phase)
+        # Turn 1: read a file first
+        CompletionResult(tool_calls=[
+            _tc("read_file", {"path": "r0.py"}, call_id="pre0")
+        ]),
+        # Turn 2: edit (enters fix phase)
         CompletionResult(tool_calls=[
             _tc("edit_file", {"path": "foo.py", "old_str": "old", "new_str": "new"})
         ]),
-        # Turns 2-7: read-only (post_edit_read_turns goes 1,2,3,4,5,6)
+        # Turns 3-10: read-only exploration using list_directory (always blocked by
+        # explore blocker, no new-file exception like read_file has).
     ] + [
         CompletionResult(tool_calls=[
-            _tc("read_file", {"path": f"r{i}.py"}, call_id=f"r{i}")
+            _tc("list_directory", {"path": f"r{i + 1}.py"}, call_id=f"r{i}")
         ])
         for i in range(8)
     ] + [CompletionResult(text="done.", tool_calls=[])]
@@ -811,13 +793,15 @@ async def test_goal_drift_detection(tmp_path):
         ]
     )
 
-    # Patch run_command to return ImportError in stderr
-    original_run_tool = Agent._run_tool
+    # Patch run_tool as seen by agent.py (imported by name into its namespace).
+    from unittest.mock import patch
+    from squishy.agent_dispatch import run_tool as _original_run_tool, append_tool_result
 
-    async def _mock_run_tool(self, turn, tc):
+    async def _mock_run_tool(agent_obj, turn, tc):
         if tc.name == "run_command":
-            self._append_tool_result(
-                tc, message='{"success": false, "error": "ImportError: cannot import name Mapping"}'
+            append_tool_result(
+                agent_obj, tc,
+                message='{"success": false, "error": "ImportError: cannot import name Mapping"}',
             )
             return {
                 "success": False,
@@ -828,14 +812,11 @@ async def test_goal_drift_detection(tmp_path):
                     "stdout": "",
                 },
             }
-        return await original_run_tool(self, turn, tc)
+        return await _original_run_tool(agent_obj, turn, tc)
 
-    Agent._run_tool = _mock_run_tool  # type: ignore[assignment]
-    try:
+    with patch("squishy.agent.run_tool", _mock_run_tool):
         agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
         result = await agent.run(problem_prompt)
-    finally:
-        Agent._run_tool = original_run_tool  # type: ignore[assignment]
 
     drift_msgs = [
         m for m in result.messages
@@ -950,7 +931,7 @@ async def test_consecutive_identical_loop_detection(tmp_path):
 
 
 async def test_no_edit_force_finish_at_50_turns(tmp_path):
-    """Agent force-finishes after 50 turns with no edits in bench mode."""
+    """Agent force-finishes early when stuck in a read-only spiral (no edits, no commands)."""
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
@@ -974,8 +955,11 @@ async def test_no_edit_force_finish_at_50_turns(tmp_path):
     result = await agent.run("fix the bug")
 
     assert not result.success
-    assert "no edits after" in result.error
-    assert result.turns_used == 50
+    # Quality gate, read-only spiral, or no-edit cap can fire — all are valid.
+    assert any(msg in result.error for msg in (
+        "read-only spiral", "no edits after", "quality loop",
+    ))
+    assert result.turns_used <= 50
 
 
 async def test_turn_log_populated_in_bench(tmp_path):
@@ -1034,3 +1018,228 @@ async def test_task_result_has_phase_diagnostics(tmp_path):
     assert result.success
     assert result.explore_turns >= 1
     assert result.final_phase in ("fix", "verify")
+
+
+# ---------------------------------------------------------------------------
+# Plan rejection with feedback
+# ---------------------------------------------------------------------------
+
+
+async def test_plan_rejection_without_feedback(tmp_path):
+    """Rejecting a plan with no feedback gives a generic decline message."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    fake = FakeClient(
+        script=[
+            # Turn 1: propose a plan — will be rejected
+            CompletionResult(tool_calls=[
+                _tc("plan_task", {
+                    "plan": "Bad plan",
+                    "problem": "Bug in foo",
+                    "solution": "Delete everything",
+                    "steps": ["step 1"],
+                })
+            ]),
+            # Turn 2: agent gives up after rejection
+            CompletionResult(text="Understood, what would you like changed?"),
+        ],
+    )
+
+    async def reject(_tool, _args):
+        return False
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=reject)  # type: ignore[arg-type]
+    result = await agent.run("plan something")
+
+    # Plan was cleared
+    assert agent.tool_ctx.plan is None
+    # Agent saw the generic decline message and continued
+    assert fake._i == 2
+    # Check the tool result message contains the generic decline
+    tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
+    decline_msg = tool_msgs[0]["content"]
+    assert "declined" in decline_msg.lower()
+    assert "feedback" not in decline_msg.lower()
+
+
+async def test_plan_rejection_with_feedback(tmp_path):
+    """Rejecting a plan with feedback passes the user's comments to the agent."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    feedback_text = "Use a safer approach, don't delete the database"
+
+    fake = FakeClient(
+        script=[
+            # Turn 1: propose a plan — will be rejected with feedback
+            CompletionResult(tool_calls=[
+                _tc("plan_task", {
+                    "plan": "Dangerous plan",
+                    "problem": "Slow queries",
+                    "solution": "Drop and recreate tables",
+                    "steps": ["drop tables", "recreate"],
+                })
+            ]),
+            # Turn 2: agent responds after seeing feedback
+            CompletionResult(text="I'll revise the plan."),
+        ],
+    )
+
+    async def reject_with_feedback(_tool, _args):
+        return feedback_text
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=reject_with_feedback)  # type: ignore[arg-type]
+    result = await agent.run("plan something")
+
+    # Plan was cleared
+    assert agent.tool_ctx.plan is None
+    # Agent continued after rejection
+    assert fake._i == 2
+    # Check the tool result contains the user's feedback
+    tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
+    decline_msg = tool_msgs[0]["content"]
+    assert feedback_text in decline_msg
+    assert "Revise the plan" in decline_msg
+
+
+async def test_plan_rejection_then_revised_plan_approved(tmp_path):
+    """Agent revises plan after rejection feedback, second plan is approved."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    call_count = 0
+
+    async def reject_then_approve(_tool, _args):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return "Add a backup step before modifying anything"
+        return True
+
+    fake = FakeClient(
+        script=[
+            # Turn 1: first plan — rejected with feedback
+            CompletionResult(tool_calls=[
+                _tc("plan_task", {
+                    "plan": "Risky plan",
+                    "problem": "Data migration",
+                    "solution": "Migrate in-place",
+                    "steps": ["modify schema"],
+                })
+            ]),
+            # Turn 2: revised plan — approved
+            CompletionResult(tool_calls=[
+                _tc("plan_task", {
+                    "plan": "Safe plan",
+                    "problem": "Data migration",
+                    "solution": "Backup then migrate",
+                    "steps": ["backup database", "modify schema"],
+                }, call_id="c2")
+            ]),
+        ],
+    )
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=reject_then_approve)  # type: ignore[arg-type]
+    result = await agent.run("plan a migration")
+
+    assert result.success
+    assert "Plan approved" in result.final_text
+    assert agent.tool_ctx.plan is not None
+    assert agent.tool_ctx.plan.approved is True
+    # Both completions were consumed
+    assert fake._i == 2
+    assert call_count == 2
+
+
+async def test_plan_approval_still_works(tmp_path):
+    """Approval on first try still works with the updated prompt_fn signature."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 5
+
+    fake = FakeClient(
+        script=[
+            CompletionResult(tool_calls=[
+                _tc("plan_task", {
+                    "plan": "Good plan",
+                    "problem": "Add feature X",
+                    "solution": "Implement it",
+                    "steps": ["write code", "test"],
+                })
+            ]),
+            CompletionResult(text="should not run"),
+        ],
+    )
+
+    async def approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=approve)  # type: ignore[arg-type]
+    result = await agent.run("plan feature X")
+
+    assert result.success
+    assert "Plan approved" in result.final_text
+    assert agent.tool_ctx.plan is not None
+    assert agent.tool_ctx.plan.approved is True
+    assert fake._i == 1
+
+
+async def test_consecutive_identical_resets_after_edit(tmp_path):
+    """A successful edit_file should reset the consecutive-identical counter so
+    that subsequent identical calls start a fresh streak rather than continuing
+    the old one.
+
+    Scenario:
+      - 4 identical read_file calls (streak = 3, below the 7-call hard limit but
+        above the 2-call nudge threshold).
+      - 1 successful edit_file call  → counter resets to 0.
+      - 4 more identical read_file calls → streak reaches 3 again, not 7, so the
+        agent does NOT force-finish with "loop detected".
+    """
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.max_turns = 30
+    cfg.max_stuck_turns = 20  # disable stuck detection
+
+    (tmp_path / "foo.py").write_text("old line\n")
+    # Provide multiple files so the quality gate (excessive_reread) doesn't fire.
+    for i in range(10):
+        (tmp_path / f"r{i}.py").write_text(f"content {i}")
+
+    script = [
+        # 4 identical read_file calls — streak hits 3 (nudge fires) but NOT >=7
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r0.py"}, call_id="a0")]),
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r0.py"}, call_id="a1")]),
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r0.py"}, call_id="a2")]),
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r0.py"}, call_id="a3")]),
+        # Successful edit — resets consecutive_identical to 0
+        CompletionResult(tool_calls=[
+            _tc("edit_file", {"path": "foo.py", "old_str": "old line", "new_str": "new line"})
+        ]),
+        # 4 more identical read_file calls — fresh streak from 0, should NOT trigger loop
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r1.py"}, call_id="b0")]),
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r1.py"}, call_id="b1")]),
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r1.py"}, call_id="b2")]),
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "r1.py"}, call_id="b3")]),
+        CompletionResult(text="done.", tool_calls=[]),
+    ]
+
+    fake = FakeClient(script=script)
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    result = await agent.run("fix foo.py")
+
+    # The agent should finish successfully (edit was made) — "loop detected" should NOT appear.
+    assert "loop detected" not in (result.error or ""), (
+        f"consecutive_identical counter was not reset after edit: {result.error}"
+    )
+    # The edit should have been applied.
+    assert (tmp_path / "foo.py").read_text() == "new line\n"

@@ -98,7 +98,7 @@ def openai_schemas(
     return [
         t.openai_schema()
         for t in ALL_TOOLS
-        if (t.name in allowed or t.name.startswith("mcp__"))
+        if (t.name in allowed or (t.name.startswith("mcp__") and mode != "plan"))
         and not (plan_active and t.name == "plan_task")
     ]
 
