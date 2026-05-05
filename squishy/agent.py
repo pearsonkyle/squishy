@@ -893,8 +893,15 @@ class Agent:
                     st.problem_files = _extract_problem_files(str(msg.get("content", "")))
                     break
 
+        def _plan_active() -> bool:
+            p = self.tool_ctx.plan
+            return p is not None and p.approved
+
         _cached_perm_mode = self.config.permission_mode
-        _cached_schemas = openai_schemas(_cached_perm_mode)
+        _cached_plan_active = _plan_active()
+        _cached_schemas = openai_schemas(
+            _cached_perm_mode, plan_active=_cached_plan_active,
+        )
 
         for turn in range(1, self.config.max_turns + 1):
             # Finish countdown: force-finish if the model keeps calling tools
@@ -911,9 +918,16 @@ class Agent:
                 st.finish_countdown -= 1
 
             self.tool_ctx.permission_mode = self.config.permission_mode
-            if self.config.permission_mode != _cached_perm_mode:
+            now_plan_active = _plan_active()
+            if (
+                self.config.permission_mode != _cached_perm_mode
+                or now_plan_active != _cached_plan_active
+            ):
                 _cached_perm_mode = self.config.permission_mode
-                _cached_schemas = openai_schemas(_cached_perm_mode)
+                _cached_plan_active = now_plan_active
+                _cached_schemas = openai_schemas(
+                    _cached_perm_mode, plan_active=_cached_plan_active,
+                )
                 if self.display is not None:
                     self.display.set_mode(self.config.permission_mode)
             schemas = _cached_schemas

@@ -75,17 +75,32 @@ async def dispatch(
         return ToolResult(False, error=f"{type(e).__name__}: {e}")
 
 
-def openai_schemas(mode: str | None = None) -> list[dict[str, object]]:
+def openai_schemas(
+    mode: str | None = None,
+    *,
+    plan_active: bool = False,
+) -> list[dict[str, object]]:
     """Return OpenAI-format tool schemas, optionally filtered by mode.
 
-    When `mode` is None, all tools are returned (backwards compatibility).
-    When `mode` is set, only tools permitted in that mode are exposed — so the
-    model never sees `write_file`/`edit_file` in plan mode, etc.
+    When ``mode`` is None, all tools are returned (backwards compatibility).
+    When ``mode`` is set, only tools permitted in that mode are exposed — so
+    the model never sees ``write_file``/``edit_file`` in plan mode, etc.
+
+    ``plan_active`` should be True once a plan_task has been approved.
+    The schema then hides ``plan_task`` so the model can't restart
+    planning instead of executing — it must use ``update_plan`` /
+    ``finish_plan`` instead. ``update_plan`` itself supports
+    ``add_steps`` for genuine scope changes.
     """
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
     allowed = _get_allowed_tools(mode)
-    return [t.openai_schema() for t in ALL_TOOLS if t.name in allowed or t.name.startswith("mcp__")]
+    return [
+        t.openai_schema()
+        for t in ALL_TOOLS
+        if (t.name in allowed or t.name.startswith("mcp__"))
+        and not (plan_active and t.name == "plan_task")
+    ]
 
 
 __all__ = [

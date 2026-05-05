@@ -150,3 +150,25 @@ def test_schemas_are_mode_scoped():
 
     all_names = {s["function"]["name"] for s in openai_schemas()}
     assert "write_file" in all_names  # backwards-compatible (no mode → all)
+
+
+def test_schemas_hide_plan_task_when_plan_active():
+    """Once a plan is approved the model should be executing, not
+    replanning — `plan_task` is removed from the schema, but the
+    progress-tracking tools stay."""
+    for mode in ("edits", "yolo", "plan"):
+        names = {s["function"]["name"] for s in openai_schemas(mode, plan_active=True)}
+        assert "plan_task" not in names, f"{mode} mode still exposed plan_task"
+        # update_plan and finish_plan must still be available so the
+        # model can mark progress and end the work.
+        assert "update_plan" in names, f"{mode} dropped update_plan"
+        assert "finish_plan" in names, f"{mode} dropped finish_plan"
+
+
+def test_schemas_keep_plan_task_when_no_plan_yet():
+    """Without an approved plan, the agent still needs to be able to
+    propose one — so `plan_task` stays visible."""
+    plan_names = {s["function"]["name"] for s in openai_schemas("plan", plan_active=False)}
+    assert "plan_task" in plan_names
+    edits_names = {s["function"]["name"] for s in openai_schemas("edits", plan_active=False)}
+    assert "plan_task" in edits_names

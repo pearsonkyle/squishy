@@ -29,6 +29,25 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 
 
 async def _plan_task(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    # Refuse to overwrite an already-approved plan. Once the user has
+    # approved a plan and the agent has been switched into edits/yolo
+    # mode, calling plan_task again restarts exploration from scratch
+    # — which is exactly the loop we want to prevent. The agent should
+    # use update_plan / finish_plan to track progress instead.
+    existing = ctx.plan
+    if existing is not None and existing.approved:
+        return ToolResult(
+            False,
+            error=(
+                f"An approved plan ({existing.id}) is already active. "
+                "Do not re-plan — execute the plan: "
+                "use `update_plan(step_index=N, status=\"in-progress\"/\"done\")` "
+                "as you work, and `finish_plan` once the work is complete. "
+                "If the original plan needs to change, mark the obsolete "
+                "steps `skipped` and use `update_plan(add_steps=[...])`."
+            ),
+        )
+
     plan = args.get("plan")
     problem = args.get("problem")
     solution = args.get("solution")
