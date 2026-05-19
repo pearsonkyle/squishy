@@ -99,6 +99,29 @@ uses an action-biased prompt that pushes the agent to attempt fixes early.
 
 Set the starting mode with `--plan`, `--edits`, or `--yolo`.
 
+## Editor integration (ACP)
+
+Squishy speaks the [Agent Client Protocol](https://github.com/agentclientprotocol/agent-client-protocol) — an LSP-style standard for editors to drive AI coding agents. Any ACP-aware editor (Zed, Neovim plugins, …) can launch squishy as an agent backend:
+
+```bash
+squishy-acp --base-url http://localhost:1234/v1 --model qwen2.5-coder
+```
+
+The binary speaks JSON-RPC over stdio. Editors get streaming text, tool-call cards, diff previews, plan progress, permission prompts, and mode switching — all wired to squishy's existing async loop. When the editor advertises `fs.readTextFile`/`fs.writeTextFile`, file IO routes through the editor so unsaved buffers stay consistent with disk; when it advertises `terminal`, `run_command` runs in the editor's terminal pane.
+
+Zed example (`~/.config/zed/settings.json`):
+
+```json
+"agent_servers": {
+  "Squishy": {
+    "command": "squishy-acp",
+    "args": ["--base-url", "http://localhost:1234/v1"]
+  }
+}
+```
+
+The legacy CLI is unchanged; `--acp` on `squishy` is also accepted for the same handoff.
+
 ## Python API
 
 `Squishy` is the programmatic surface — use it from scripts, tests, or benchmark harnesses:

@@ -9,8 +9,8 @@ from typing import Any
 from squishy.plan_state import PlanState
 
 ToolRun = Callable[[dict[str, Any], "ToolContext"], Awaitable["ToolResult"]]
- 
- 
+
+
 @dataclass
 class ToolContext:
     working_dir: str
@@ -28,6 +28,13 @@ class ToolContext:
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
     undo_stack: list[tuple[str, str]] = field(default_factory=list)  # (abs_path, original_content)
+    # Optional editor-mediated IO. When set (by the ACP bridge), read/write/edit
+    # tools route through the editor's filesystem hooks so the diff view stays
+    # in sync; run_command streams through the editor's terminal pane.
+    # When None (the default CLI path), tools fall back to local IO. Typed as
+    # ``Any`` to avoid an import cycle with squishy.acp.
+    fs_client: Any = field(default=None, repr=False)
+    terminal_client: Any = field(default=None, repr=False)
  
  
 @dataclass

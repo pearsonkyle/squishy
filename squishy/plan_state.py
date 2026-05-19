@@ -251,6 +251,39 @@ def render_plan_status(plan: PlanState, *, step_desc_chars: int = 100) -> str:
     return "\n".join(lines)
 
 
+# Map squishy's richer step statuses onto ACP's three-state model.
+# (in-progress and blocked both render as "in_progress" since ACP has no
+# blocked state; the squishy step.note carries the reason if needed.)
+_ACP_STATUS_MAP: dict[str, str] = {
+    "pending": "pending",
+    "in-progress": "in_progress",
+    "blocked": "in_progress",
+    "done": "completed",
+    "skipped": "completed",
+}
+
+
+def to_acp_plan_entries(plan: PlanState) -> list[dict[str, str]]:
+    """Render a PlanState as a list of ACP ``PlanEntry`` dicts.
+
+    Returned dicts use snake_case field names that match the ACP schema.
+    Used by the ACP bridge to forward ``plan_task`` / ``update_plan``
+    outcomes as ``session/update {sessionUpdate: "plan"}`` notifications,
+    so editors with native plan UIs render squishy's plan natively.
+    """
+    entries: list[dict[str, str]] = []
+    for step in plan.steps:
+        content = step.description or ""
+        if step.status == "blocked" and step.note:
+            content = f"{content} (blocked: {step.note})"
+        entries.append({
+            "content": content,
+            "priority": "medium",
+            "status": _ACP_STATUS_MAP.get(step.status, "pending"),
+        })
+    return entries
+
+
 def plan_dir(cwd: str | os.PathLike[str]) -> Path:
     return Path(cwd) / PLAN_DIR
 
@@ -307,4 +340,5 @@ __all__ = [
     "plan_path",
     "render_plan_status",
     "save_plan",
+    "to_acp_plan_entries",
 ]
