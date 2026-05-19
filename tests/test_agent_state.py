@@ -1,11 +1,8 @@
 """Tests for agent_state helpers: command classification, problem extraction, test coverage."""
 from __future__ import annotations
 
-import pytest
-
 from squishy.agent_state import (
     extract_problem_files,
-    is_exploration_command,
     is_test_command,
     path_matches_problem,
     test_covers_fail_to_pass as _test_covers_fail_to_pass,
@@ -69,40 +66,6 @@ class TestIsTestCommand:
 
     def test_non_test_command(self):
         assert is_test_command("pip install requests") is False
-
-
-# -- is_exploration_command ----------------------------------------------------
-
-class TestIsExplorationCommand:
-    def test_grep(self):
-        assert is_exploration_command("grep -rn pattern src/") is True
-
-    def test_cat(self):
-        assert is_exploration_command("cat foo.py") is True
-
-    def test_find(self):
-        assert is_exploration_command("find . -name '*.py'") is True
-
-    def test_ls(self):
-        assert is_exploration_command("ls -la") is True
-
-    def test_cd_then_grep(self):
-        assert is_exploration_command("cd src && grep pattern file.py") is True
-
-    def test_python_c_open(self):
-        assert is_exploration_command("python -c \"print(open('x.py').read())\"") is True
-
-    def test_pip_install_not_explore(self):
-        assert is_exploration_command("pip install foo") is False
-
-    def test_pytest_not_explore(self):
-        assert is_exploration_command("pytest tests/") is False
-
-    def test_empty_string(self):
-        assert is_exploration_command("") is False
-
-    def test_cd_only(self):
-        assert is_exploration_command("cd src") is False
 
 
 # -- extract_problem_files -----------------------------------------------------

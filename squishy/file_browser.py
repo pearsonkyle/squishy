@@ -31,11 +31,33 @@ class FileReference:
 
 
 def parse_references(text: str, working_dir: str) -> list[FileReference]:
-    """Find all @filename references in text and return their contents."""
-    references = []
-    matches = FILE_PATTERN.findall(text)
+    """Find all @filename references in text and return their contents.
 
-    for path in matches:
+    Files that can't be read are silently skipped — use
+    ``parse_references_with_missing`` when the caller wants to warn
+    the user about typos like ``@nonexistant.py``.
+    """
+    found, _ = parse_references_with_missing(text, working_dir)
+    return found
+
+
+def parse_references_with_missing(
+    text: str, working_dir: str,
+) -> tuple[list[FileReference], list[str]]:
+    """Like ``parse_references`` but also returns the @paths that
+    could not be read, so the caller can warn the user.
+
+    A @reference that fails to resolve is otherwise silently ignored —
+    the literal ``@typo.py`` ends up in the prompt sent to the model
+    with no feedback to the user that their reference was a no-op.
+    """
+    references: list[FileReference] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for path in FILE_PATTERN.findall(text):
+        if path in seen:
+            continue
+        seen.add(path)
         abs_path = _resolve(path, working_dir)
         content = _read_file(abs_path)
         if content is not None:
@@ -44,8 +66,9 @@ def parse_references(text: str, working_dir: str) -> list[FileReference]:
                 absolute_path=abs_path,
                 content=content,
             ))
-
-    return references
+        else:
+            missing.append(path)
+    return references, missing
 
 
 def _read_file(abs_path: str) -> str | None:
@@ -65,23 +88,44 @@ def inject_references(text: str, working_dir: str) -> tuple[str, list[FileRefere
         working_dir: Working directory for resolving relative paths
 
     Returns:
-        Tuple of (modified text with wrapped contents, list of references)
+        Tuple of (modified text with wrapped contents, list of references).
+        Missing references are not surfaced here for backwards
+        compatibility — callers wanting to warn on typos should use
+        ``inject_references_with_missing``.
     """
-    references = parse_references(text, working_dir)
+    result, references, _ = inject_references_with_missing(text, working_dir)
+    return result, references
 
-    # Replace each @filename with its wrapped content
+
+def inject_references_with_missing(
+    text: str, working_dir: str,
+) -> tuple[str, list[FileReference], list[str]]:
+    """Like ``inject_references`` but also returns the @paths that could
+    not be read.
+
+    Missing entries are stripped from the outgoing message text — leaving
+    a literal ``@typo.py`` confuses weak models — and replaced with an
+    inline marker so the model knows the user *meant* to attach a file.
+    """
+    references, missing = parse_references_with_missing(text, working_dir)
+
     result = text
     for ref in references:
-        # Wrap the content with file metadata
         wrapped = FILE_WRAPPER.format(
             path=ref.path,
             total_lines=len(ref.content.splitlines()),
             content=ref.content,
         )
-        # Replace @filename with wrapped content
         result = result.replace(f"@{ref.path}", wrapped, 1)
 
-    return result, references
+    for missing_path in missing:
+        result = result.replace(
+            f"@{missing_path}",
+            f"[file not found: {missing_path}]",
+            1,
+        )
+
+    return result, references, missing
 
 
 def format_reference_list(references: list[FileReference]) -> str:

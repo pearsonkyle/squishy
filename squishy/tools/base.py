@@ -27,6 +27,7 @@ class ToolContext:
     files_read_count: dict[str, int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
+    undo_stack: list[tuple[str, str]] = field(default_factory=list)  # (abs_path, original_content)
  
  
 @dataclass

@@ -37,6 +37,7 @@ class FakeClient:
         *,
         stream: bool = True,
         on_text: Any = None,
+        on_retry: Any = None,
     ) -> CompletionResult:
         self.calls_seen.append(list(messages))
         if self._i >= len(self.script):

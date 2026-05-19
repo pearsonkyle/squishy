@@ -80,7 +80,16 @@ class ModeCycler:
             self._old_attrs = None
             self._fd = None
             return
-        self._loop = asyncio.get_event_loop()
+        # Python 3.12 deprecated ``asyncio.get_event_loop()`` outside a
+        # running loop.  ``ModeCycler.start()`` is always called from
+        # within an ``async with`` block, so a running loop is
+        # guaranteed; fall back to the deprecated path only on older
+        # Pythons that don't have ``get_running_loop``.
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._restore_terminal()
+            return
         try:
             self._loop.add_reader(self._fd, self._on_read)
         except (NotImplementedError, ValueError):

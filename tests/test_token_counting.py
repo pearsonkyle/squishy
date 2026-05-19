@@ -6,28 +6,34 @@ from squishy.display import estimate_tokens
 
 
 class TestEstimateTokens:
+    """Tests for estimate_tokens: ceil(len/3.5) + 4 overhead."""
+
     def test_empty_string(self) -> None:
         assert estimate_tokens("") == 0
 
     def test_single_character(self) -> None:
-        # 1 char / 4 = 0, but we return max(1, 0) = 1
-        assert estimate_tokens("a") == 1
+        # ceil(1/3.5) + 4 = 1 + 4 = 5
+        assert estimate_tokens("a") == 5
 
-    def test_exact_multiple_of_4(self) -> None:
-        # 4 chars = 1 token
-        assert estimate_tokens("abcd") == 1
-
-    def test_rounds_up(self) -> None:
-        # 5 chars = 1.25, rounds up to 2
-        assert estimate_tokens("abcde") == 2
+    def test_short_text(self) -> None:
+        # ceil(7/3.5) + 4 = 2 + 4 = 6
+        assert estimate_tokens("abcdefg") == 6
 
     def test_longer_text(self) -> None:
-        # 20 chars = 5 tokens
-        assert estimate_tokens("abcdefghijklmnopqrst") == 5
+        # ceil(20/3.5) + 4 = 6 + 4 = 10
+        assert estimate_tokens("abcdefghijklmnopqrst") == 10
 
     def test_unicode_handling(self) -> None:
-        # Unicode chars count toward length
-        assert estimate_tokens("こんにちは") == 2  # 5 chars / 4 = 1.25 -> 2
+        # ceil(5/3.5) + 4 = 2 + 4 = 6
+        assert estimate_tokens("こんにちは") == 6
+
+    def test_overhead_is_per_message(self) -> None:
+        # Two separate calls should each include 4-token overhead
+        t1 = estimate_tokens("hello")
+        t2 = estimate_tokens("world")
+        combined = estimate_tokens("helloworld")
+        # combined has only one 4-token overhead, two separate have 8 total
+        assert t1 + t2 > combined
 
 
 class TestAgentTokenCounting:
@@ -49,6 +55,7 @@ class TestAgentTokenCounting:
                 *,
                 stream: bool = True,
                 on_text=None,
+                on_retry=None,
             ) -> CompletionResult:
                 return CompletionResult(
                     text="done",
@@ -83,6 +90,7 @@ class TestAgentTokenCounting:
                 *,
                 stream: bool = True,
                 on_text=None,
+                on_retry=None,
             ) -> CompletionResult:
                 return CompletionResult(
                     text="done",

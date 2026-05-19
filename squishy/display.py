@@ -9,7 +9,9 @@ from dataclasses import dataclass, field
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.markup import escape as rich_escape
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.text import Text
 
 from squishy.plan_state import STATUS_ICONS
@@ -19,10 +21,15 @@ MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta", 
 
 
 def estimate_tokens(text: str) -> int:
-    """Estimate token count using ~4 chars per token heuristic."""
+    """Estimate token count from text.
+
+    Uses ~3.5 chars/token (better for code-heavy content than the
+    common 4 chars/token) plus a small per-message overhead to
+    account for role/formatting tokens the API adds.
+    """
     if not text:
         return 0
-    return math.ceil(len(text) / 4)
+    return math.ceil(len(text) / 3.5) + 4
 
 
 def fmt_tokens(count: int, context_window: int = 0) -> str:
@@ -83,6 +90,10 @@ class Display:
         self._live_render: Markdown | None = None
         self._live: Live | None = None
         self._use_live: bool = False
+        # Thinking spinner — owns the same Live channel as streaming text,
+        # so it MUST be stopped before streaming_text_chunk starts a new
+        # Live or the two will fight for the same screen rows.
+        self._spinner: Live | None = None
 
     def set_mode(self, mode: str) -> None:
         """Record the current permission mode so it can be shown alongside
@@ -115,15 +126,33 @@ class Display:
         icon = ICONS.get(tool_name, "•")
         tag = self.mode_tag(mode)
         prefix = f"{tag} " if tag else ""
+        # ``brief`` is built from tool args (paths, queries) and may
+        # carry ``[`` characters — escape so it can't break the dim tag.
         self.console.print(
-            f"{prefix}[dim]\\[Turn {turn}/{max_turns}][/] {icon} {tool_name} [dim]{brief}[/]"
+            f"{prefix}[dim]\\[Turn {turn}/{max_turns}][/] {icon} {rich_escape(tool_name)} "
+            f"[dim]{rich_escape(brief)}[/]"
         )
 
     def mode_changed(self, mode: str) -> None:
-        """Inline notification that the user cycled the permission mode."""
+        """Inline notification that the user cycled the permission mode.
+
+        Escalations into ``edits`` or ``yolo`` get an extra warning line so
+        the user notices when shift-tab silently grants write permissions
+        — the most common source of "the agent edited a file I didn't
+        expect" complaints.
+        """
+        prev = self.mode
         self.set_mode(mode)
         color = MODE_COLORS.get(mode, "ansigray")
         self.console.print(f"  [{color}]◆ mode → {mode}[/]")
+        if prev == "plan" and mode in ("edits", "yolo"):
+            self.console.print(
+                f"  [yellow]⚠ write tools now allowed — agent can modify files in this mode[/]"
+            )
+        elif mode == "yolo":
+            self.console.print(
+                f"  [yellow]⚠ yolo mode: shell commands run without per-call approval[/]"
+            )
 
     def command_line(self, command: str) -> None:
         """Show the full shell command on its own line (markup-safe)."""
@@ -133,7 +162,13 @@ class Display:
  
     def tool_result(self, success: bool, display: str, duration_ms: float) -> None:
         mark = "[green]✓[/]" if success else "[red]✗[/]"
-        self.console.print(f"  {mark} {display} [dim]({duration_ms:.1f}ms)[/]")
+        # ``display`` is built from tool output (filenames, error
+        # messages, command summaries) which routinely contain ``[``
+        # characters Rich would interpret as markup.  Escape so a path
+        # like ``[abc].py`` doesn't crash or render as a broken style.
+        self.console.print(
+            f"  {mark} {rich_escape(display)} [dim]({duration_ms:.1f}ms)[/]"
+        )
 
     def command_output(self, data: dict[str, object]) -> None:
         """Show a compact preview of command stdout/stderr."""
@@ -160,18 +195,23 @@ class Display:
             )
         )
         for line in diff[:12]:
+            # Diff lines come from arbitrary file content — escape Rich
+            # markup so e.g. ``+ list[int]`` doesn't blow up the parser.
+            safe = rich_escape(line)
             if line.startswith("+") and not line.startswith("+++"):
-                self.console.print(f"  [green]{line}[/]")
+                self.console.print(f"  [green]{safe}[/]")
             elif line.startswith("-") and not line.startswith("---"):
-                self.console.print(f"  [red]{line}[/]")
+                self.console.print(f"  [red]{safe}[/]")
             elif line.startswith("@@"):
-                self.console.print(f"  [dim]{line}[/]")
- 
+                self.console.print(f"  [dim]{safe}[/]")
+
     def write_preview(self, path: str, content: str) -> None:
         lines = content.splitlines()
         snippet = lines if len(lines) <= 6 else lines[:3] + ["  ..."] + lines[-3:]
         for line in snippet:
-            self.console.print(f"  [dim]│[/] {line}")
+            # Preview shows arbitrary file content — escape Rich markup
+            # so brackets in code don't crash the renderer.
+            self.console.print(f"  [dim]│[/] {rich_escape(line)}")
  
     def streaming_text_chunk(self, s: str) -> None:
         """Accumulate text chunks and render as streaming markdown.
@@ -181,6 +221,10 @@ class Display:
         """
         if not s:
             return
+        # First chunk supersedes the thinking spinner (if any) — both
+        # share the Live channel and only one can own the screen rows.
+        if self._spinner is not None:
+            self.stop_thinking()
         self._stream_buffer += s
 
         new_render = Markdown(self._stream_buffer)
@@ -206,17 +250,112 @@ class Display:
         once as a permanent output. Always clears the buffer so successive
         turns don't re-render previously streamed text.
         """
+        # A spinner shares the Live channel with streaming text — drop it
+        # first so a flush in the middle of a wait doesn't leave the
+        # spinner thread refreshing into a stopped console.
+        self.stop_thinking()
         final_render = self._live_render
         if self._live is not None:
             self._live.stop()
         # transient=True clears the live area on stop, so print the final
-        # frame once for permanent display.
-        if final_render is not None and self._stream_buffer.strip():
+        # frame once for permanent display.  Use ``self._stream_buffer``
+        # (not ``.strip()``) so streams that ended on whitespace — which
+        # the user *did* see flicker on screen — still get a permanent
+        # frame instead of vanishing when Live wipes the area.
+        if final_render is not None and self._stream_buffer:
             self.console.print(final_render)
         self._live = None
         self._live_render = None
         self._stream_buffer = ""
         self._use_live = False
+
+    def reset_streaming(self) -> None:
+        """Drop any in-flight streaming state WITHOUT printing.
+
+        Used by the client retry path: when a stream drops mid-flight and
+        tenacity restarts ``complete()``, the second attempt's chunks
+        would otherwise be appended to the partial first attempt's
+        buffer, producing garbled output. Call this before the retry
+        runs so the screen and buffer are both clean.
+        """
+        self.stop_thinking()
+        if self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self._live = None
+        self._live_render = None
+        self._stream_buffer = ""
+        self._use_live = False
+
+    def start_thinking(self, label: str = "thinking") -> None:
+        """Start a spinner while waiting for the first stream chunk.
+
+        Idempotent — calling twice is a no-op. Automatically stopped by
+        the first ``streaming_text_chunk`` (so a model that streams text
+        immediately doesn't fight with the spinner) and by
+        ``flush_streaming_text`` / ``reset_streaming``.
+        """
+        if self._spinner is not None or self._live is not None:
+            return
+        spinner = Spinner("dots", text=Text(f" {label}…", style="dim"))
+        self._spinner = Live(
+            spinner,
+            console=self.console,
+            refresh_per_second=12,
+            transient=True,
+        )
+        try:
+            self._spinner.start()
+        except Exception:  # noqa: BLE001
+            # Headless console / no TTY — silently downgrade.
+            self._spinner = None
+
+    def stop_thinking(self) -> None:
+        """Stop the thinking spinner if one is running. Safe to call twice."""
+        if self._spinner is None:
+            return
+        try:
+            self._spinner.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._spinner = None
+
+    def nudge(self, content: str) -> None:
+        """Display a system nudge so the user can see what the harness is
+        telling the model.
+
+        Nudges are normally injected as ``{"role": "user", "content":
+        "[system] ..."}`` messages — invisible to the user, even though
+        the agent's behavior changes in response. Showing them inline
+        closes the opacity gap: the user can correlate "agent suddenly
+        switched approach" with the specific instruction it received.
+        """
+        if not content:
+            return
+        # Strip leading "[system] " marker since we render with our own.
+        stripped = content
+        if stripped.startswith("[system] "):
+            stripped = stripped[len("[system] "):]
+        # Cap each nudge so a long correction doesn't dominate the screen.
+        # Most nudges are 1–4 short lines; 600 chars covers them and
+        # truncates the rare wall-of-text.
+        if len(stripped) > 600:
+            stripped = stripped[:600].rstrip() + " …"
+        # Drop any in-flight live region so the nudge isn't overwritten
+        # when the spinner / streaming live refreshes.
+        self.stop_thinking()
+        # Single bordered line per nudge so the user can scan them quickly.
+        self.console.print(
+            Panel(
+                rich_escape(stripped),
+                title="◆ system nudge",
+                title_align="left",
+                border_style="dim yellow",
+                padding=(0, 1),
+            )
+        )
  
     def info(self, s: str) -> None:
         self.console.print(f"[dim]{s}[/]")
@@ -228,15 +367,22 @@ class Display:
         self.console.print(f"[red]✗ {s}[/]")
 
     def plan_panel(self, data: dict) -> None:
-        """Render a structured plan in a Rich panel."""
+        """Render a structured plan in a Rich panel.
+
+        All free-text fields here (plan/problem/solution/step
+        descriptions, file paths) come from the LLM or user input and
+        may contain ``[`` characters that Rich would otherwise treat as
+        broken markup.  Escape every interpolation that isn't a literal
+        style tag.
+        """
         lines: list[str] = []
 
         if data.get("plan"):
-            lines.append(f"[bold]{data['plan']}[/]")
+            lines.append(f"[bold]{rich_escape(str(data['plan']))}[/]")
             lines.append("")
 
-        lines.append(f"[bold red]Problem:[/]  {data.get('problem', '')}")
-        lines.append(f"[bold green]Solution:[/] {data.get('solution', '')}")
+        lines.append(f"[bold red]Problem:[/]  {rich_escape(str(data.get('problem', '')))}")
+        lines.append(f"[bold green]Solution:[/] {rich_escape(str(data.get('solution', '')))}")
         lines.append("")
         lines.append("[bold yellow]Steps:[/]")
         for i, step in enumerate(data.get("steps", []), 1):
@@ -245,19 +391,19 @@ class Display:
             raw_icon = STATUS_ICONS.get(status, "○")
             color = {"done": "green", "in-progress": "cyan", "skipped": "dim", "blocked": "red"}.get(status, "dim")
             status_icon = f"[{color}]{raw_icon}[/{color}]"
-            lines.append(f"  {status_icon} {i}. {desc}")
+            lines.append(f"  {status_icon} {i}. {rich_escape(str(desc))}")
 
         if data.get("files_to_create"):
             lines.append("")
             lines.append("[bold blue]Create:[/]")
             for f in data["files_to_create"]:
-                lines.append(f"  [green]+[/] {f}")
+                lines.append(f"  [green]+[/] {rich_escape(str(f))}")
 
         if data.get("files_to_modify"):
             lines.append("")
             lines.append("[bold blue]Modify:[/]")
             for f in data["files_to_modify"]:
-                lines.append(f"  [yellow]~[/] {f}")
+                lines.append(f"  [yellow]~[/] {rich_escape(str(f))}")
 
         self.console.print(Panel("\n".join(lines), title="📋 Plan", border_style="cyan"))
 

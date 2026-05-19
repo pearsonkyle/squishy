@@ -23,7 +23,7 @@ from squishy.client import Client
 from squishy.config import Config
 from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
-from squishy.file_browser import format_reference_list, inject_references
+from squishy.file_browser import format_reference_list, inject_references_with_missing
 from squishy.plan_state import clear_plan
 from squishy.session import (
     create_session,
@@ -34,6 +34,31 @@ from squishy.session import (
 from squishy.tools.base import Tool
 
 EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
+
+# Slash commands that take no arguments — typing extra text is almost
+# always a typo (e.g. ``/clear all``) that we silently swallowed before.
+_NO_ARG_SLASH_CMDS: frozenset[str] = frozenset({
+    "/quit", "/exit", "/q",
+    "/help",
+    "/clear", "/new",
+    "/status",
+    "/plan",
+    "/exit-plan",
+    "/session",
+    "/sessions",
+})
+
+
+def _slash_extra_args(line: str) -> tuple[str, str]:
+    """Split ``"/cmd extra args"`` into ``("/cmd", "extra args")``.
+
+    Returns ``("", "")`` when ``line`` is not a slash command. The
+    second element is empty when no args were supplied.
+    """
+    if not line.startswith("/"):
+        return ("", "")
+    head, _, rest = line.partition(" ")
+    return (head, rest.strip())
  
  
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -174,7 +199,17 @@ async def _amain() -> None:
         # configured a model — otherwise the banner would show a different
         # model than the one requests are routed to (e.g. when a .env file
         # sets SQUISHY_MODEL but the endpoint has multiple models loaded).
+        # Bounded at 10s so a dead endpoint can't strand the user on a
+        # 120s blank-screen wait — the banner shows up either way.
         discovered_model = await client.discover_model_name()
+        if discovered_model == cfg.model and cfg.model and not _user_configured_model(args):
+            # Discovery returned the fallback (configured model). Tell the
+            # user the endpoint isn't responding so they can ^C instead of
+            # waiting on a dead URL.
+            display.warn(
+                f"endpoint {cfg.base_url} did not respond to model discovery "
+                "— it may be unreachable. Check the URL or hit ^C to exit."
+            )
         if not _user_configured_model(args):
             cfg.model = discovered_model
             client.model = discovered_model
@@ -214,8 +249,11 @@ async def _amain() -> None:
         approval_session: PromptSession[str] = PromptSession()
 
         async def prompt_fn(tool: Tool, args_: dict):
+            # For plan_task, free-text input is sent back to the model as
+            # decline-with-feedback so it can revise the plan. Spell that
+            # out — "feedback" alone reads like a separate menu option.
             label = (
-                "  approve? [y / N=decline / feedback / ^C cancels] "
+                "  approve? [y=yes / N=no / type feedback to revise / ^C=cancel] "
                 if tool.name == "plan_task"
                 else "  approve? [y/N, ^C cancels] "
             )
@@ -256,6 +294,11 @@ async def _amain() -> None:
             msg = sys.stdin.read().strip()
             if msg:
                 await _run_one(cfg, client, display, None, msg, args.timeout, None)
+            else:
+                # Silent exit was confusing — explain why nothing happened.
+                display.warn(
+                    "no input on stdin and no -m message; nothing to do"
+                )
             return
 
         await _interactive(
@@ -266,10 +309,13 @@ async def _amain() -> None:
         await client.aclose()
  
  
-async def _run_direct_command(cmd: str) -> int:
+async def _run_direct_command(cmd: str, timeout: float = 120.0) -> int:
     """Execute a shell command directly (not via LLM tool).
 
-    Returns the exit code.
+    Returns the exit code. Raises ``KeyboardInterrupt`` if the user
+    cancels with Ctrl-C; the child process is killed in that case.
+    Long-running commands are killed after ``timeout`` seconds to
+    keep the REPL responsive.
     """
     proc = await asyncio.create_subprocess_exec(
         "sh", "-c", cmd,
@@ -277,7 +323,30 @@ async def _run_direct_command(cmd: str) -> int:
         stderr=asyncio.subprocess.PIPE,
     )
 
-    stdout, stderr = await proc.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        sys.stderr.write(
+            f"[shell] command exceeded {timeout:.0f}s timeout; killed\n"
+        )
+        sys.stderr.flush()
+        return 124  # GNU timeout(1) convention.
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        # Re-raise CancelledError (not KeyboardInterrupt) so pytest and
+        # other framework-level Ctrl-C handlers behave normally; the
+        # REPL caller catches both shapes via the (AgentCancelled,
+        # KeyboardInterrupt) tuple.
+        raise asyncio.CancelledError
 
     if stdout:
         sys.stdout.write(stdout.decode("utf-8", errors="replace"))
@@ -286,7 +355,7 @@ async def _run_direct_command(cmd: str) -> int:
         sys.stderr.write(stderr.decode("utf-8", errors="replace"))
         sys.stderr.flush()
 
-    return proc.returncode
+    return proc.returncode if proc.returncode is not None else 1
 
 
 async def _show_exit_plan(cfg: Config, display: Display, plan: dict | None) -> None:
@@ -355,8 +424,15 @@ async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeou
         display.error(f"LLM error: {e}")
 
 
-def _create_session_for_agent(cfg: Config, model_name: str) -> str | None:
-    """Create a session and return its ID, or None if disabled."""
+def _create_session_for_agent(
+    cfg: Config, model_name: str, display: Display | None = None,
+) -> str | None:
+    """Create a session and return its ID, or None if disabled.
+
+    Surfaces failures to the display (when provided) instead of swallowing
+    them silently — a broken session_dir is a real configuration issue
+    the user should hear about.
+    """
     if not cfg.save_sessions:
         return None
     try:
@@ -370,7 +446,9 @@ def _create_session_for_agent(cfg: Config, model_name: str) -> str | None:
             root=cfg.session_dir,
         )
         return sess.id
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        if display is not None:
+            display.warn(f"[session] failed to create session: {e}")
         return None
 
 
@@ -378,14 +456,18 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycle
     # One-shot invocations should not pick up a leftover plan from a previous
     # interactive run.
     clear_plan(cfg.working_dir)
-    session_id = _create_session_for_agent(cfg, cfg.model)
+    session_id = _create_session_for_agent(cfg, cfg.model, display)
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
     cycler = mode_cycler or _NullModeCycler()
     try:
         # Inject file references before running
-        message_with_files, references = inject_references(message, cfg.working_dir)
+        message_with_files, references, missing = inject_references_with_missing(
+            message, cfg.working_dir,
+        )
         if references:
             display.info(format_reference_list(references))
+        for missing_path in missing:
+            display.warn(f"@{missing_path}: file not found (skipped)")
         async with cycler:
             await agent.run(message_with_files, timeout=timeout)
     except AgentTimeout as e:
@@ -425,7 +507,11 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     @kb.add("s-tab")
     def _cycle(event):  # type: ignore[no-untyped-def]
         new_mode = cfg.cycle_mode()
-        display.set_mode(new_mode)
+        # Print the change so the user sees it inline — silently swapping
+        # plan→edits while a tool is queued is the easiest way to give
+        # the agent unintended write permissions. ``mode_changed`` calls
+        # ``set_mode`` internally so we don't double-set.
+        display.mode_changed(new_mode)
         event.app.invalidate()
 
     session: PromptSession[str] = PromptSession(
@@ -434,6 +520,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     )
 
     # Resume or create initial agent.
+    current_agent = None
     if resume_id:
         try:
             prev_messages = load_messages(resume_id, root=cfg.session_dir)
@@ -444,11 +531,12 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             display.info(f"[session] resumed {resume_id[:12]}… ({len(prev_messages)} messages)")
         except Exception as e:  # noqa: BLE001
             display.error(f"failed to resume session {resume_id}: {e}")
-            return
-    else:
+            display.info("starting a fresh session instead.")
+            resume_id = None
+    if current_agent is None:
         # Fresh interactive session — never inherit a plan from a previous run.
         clear_plan(cfg.working_dir)
-        session_id = _create_session_for_agent(cfg, display.model or cfg.model)
+        session_id = _create_session_for_agent(cfg, display.model or cfg.model, display)
         current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
         if session_id:
             display.info(f"[session] {session_id[:12]}…")
@@ -466,12 +554,25 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         if line.startswith("!"):
             # Direct shell command execution (like IPython/Jupyter)
             cmd = line[1:].strip()
-            if cmd:
-                display.info(f"[shell] {cmd}")
+            if not cmd:
+                display.warn("usage: !<command>  (e.g. !ls -la)")
+                continue
+            display.info(f"[shell] {cmd}")
+            try:
                 exit_code = await _run_direct_command(cmd)
-                if exit_code != 0:
-                    display.warn(f"[shell] exited with code {exit_code}")
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                display.warn("[shell] interrupted")
+                continue
+            if exit_code != 0:
+                display.warn(f"[shell] exited with code {exit_code}")
             continue
+        # Warn about unexpected args on no-arg slash commands so a typo
+        # like ``/clear cache`` doesn't silently fall through to "unknown
+        # command" or get treated as an LLM prompt.
+        head, extra = _slash_extra_args(line)
+        if head in _NO_ARG_SLASH_CMDS and extra:
+            display.warn(f"{head} takes no arguments (got: {extra!r}); ignoring")
+            line = head
         if line in ("/quit", "/exit", "/q"):
             return
         if line == "/help":
@@ -504,7 +605,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             # and the user sees "[plan] restored …" right after /clear.
             clear_plan(cfg.working_dir)
             # Rebuild agent with fresh conversation history and new session.
-            session_id = _create_session_for_agent(cfg, display.model or cfg.model)
+            session_id = _create_session_for_agent(cfg, display.model or cfg.model, display)
             current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
             # Show intro banner with discovered model name
             display.banner(cfg.base_url, display.model or cfg.model)
@@ -569,6 +670,12 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
                 display.info("\n".join(lines))
             continue
         if line.startswith("/export"):
+            if not cfg.save_sessions:
+                display.warn(
+                    "session saving is disabled (--no-sessions); "
+                    "nothing to export"
+                )
+                continue
             _, _, rest = line.partition(" ")
             export_id = rest.strip() or (current_agent.session_id or "")
             if not export_id:
@@ -594,16 +701,27 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             except Exception as e:  # noqa: BLE001
                 display.error(f"export failed: {e}")
             continue
+        if line == "/":
+            display.warn("empty slash command — type /help for the list")
+            continue
         if line.startswith("/"):
-            display.warn(f"unknown command: {line}")
+            # Strip args so the suggestion focuses on the command itself.
+            cmd_only = line.split(maxsplit=1)[0]
+            display.warn(
+                f"unknown command: {cmd_only} — type /help for the list"
+            )
             continue
 
         # Run task using current agent instance
         try:
             # Inject file references before running
-            message_with_files, references = inject_references(line, cfg.working_dir)
+            message_with_files, references, missing = inject_references_with_missing(
+                line, cfg.working_dir,
+            )
             if references:
                 display.info(format_reference_list(references))
+            for missing_path in missing:
+                display.warn(f"@{missing_path}: file not found (skipped)")
             # Activate the mode cycler so shift-tab works while the model
             # is busy. The cycler is a no-op on non-TTY platforms.
             async with cycler:

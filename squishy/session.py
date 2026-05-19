@@ -219,6 +219,40 @@ def list_sessions(
     return sessions[:limit]
 
 
+def cleanup_sessions(
+    *,
+    max_age_days: int = 30,
+    root: str | None = None,
+) -> int:
+    """Remove session directories older than ``max_age_days``.
+
+    Uses the ``updated_at`` field in ``meta.json`` (falling back to directory
+    mtime).  Returns the number of sessions removed.
+    """
+    import shutil
+
+    sd = session_dir(root)
+    cutoff = datetime.now(UTC).timestamp() - max_age_days * 86400
+    removed = 0
+    for entry in sd.iterdir():
+        if not entry.is_dir():
+            continue
+        meta_path = entry / "meta.json"
+        try:
+            if meta_path.exists():
+                meta = json.loads(meta_path.read_text())
+                updated = meta.get("updated_at", "")
+                ts = datetime.fromisoformat(updated).timestamp() if updated else 0.0
+            else:
+                ts = entry.stat().st_mtime
+        except (json.JSONDecodeError, ValueError, OSError):
+            ts = 0.0
+        if ts and ts < cutoff:
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 def export_training(
     session_id: str,
     *,

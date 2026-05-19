@@ -201,19 +201,20 @@ class PlanState:
         return step
 
 
-def render_plan_status(plan: PlanState, *, step_desc_chars: int = 160) -> str:
+def render_plan_status(plan: PlanState, *, step_desc_chars: int = 100) -> str:
     """Render the plan as a compact, re-injectable status block.
 
-    The block is wrapped in ``<plan-status>``/``</plan-status>`` so the agent
-    loop can strip any prior copy before injecting the fresh one each turn.
-    Kept small (~200-400 tokens for typical plans) so re-injection is cheap.
+    Slimmed to one line per step (icon + index + description). Solution,
+    file lists, and per-step notes are kept ONLY when load-bearing
+    (blocked note, missing solution); everything else is available via
+    ``get_plan`` and would just add tokens to every turn's tail message.
+    Step description cap dropped from 160 → 100 chars — long
+    descriptions belong in the plan body, not the per-turn status echo.
     """
     lines: list[str] = [PLAN_STATUS_OPEN_TAG]
     title = plan.plan or plan.problem
     approved_marker = " [approved]" if plan.approved else " [proposed]"
     lines.append(f"plan: {title} ({plan.id}){approved_marker}")
-    if plan.problem and plan.problem != title:
-        lines.append(f"problem: {plan.problem}")
     if plan.solution:
         lines.append(f"solution: {plan.solution}")
     if plan.files_to_modify:
@@ -226,20 +227,26 @@ def render_plan_status(plan: PlanState, *, step_desc_chars: int = 160) -> str:
         desc = step.description or ""
         if len(desc) > step_desc_chars:
             desc = desc[: step_desc_chars - 1] + "…"
+        # Only blocked notes survive — they tell the model *why* it's
+        # stuck and are actionable.  in-progress notes are scratchpad
+        # and can be re-fetched with get_plan if needed.
         suffix = ""
         if step.status == "blocked" and step.note:
             suffix = f" (blocked: {step.note[:80]})"
-        elif step.note and step.status == "in-progress":
-            suffix = f" (note: {step.note[:80]})"
         lines.append(f"  [{icon}] {i}. {desc}{suffix}")
     progress = plan.progress()
-    lines.append(
-        f"progress: {progress['done']}/{progress['total']} done, "
-        f"{progress['in_progress']} in-progress, "
-        f"{progress['blocked']} blocked, "
-        f"{progress['pending']} pending, "
-        f"{progress['skipped']} skipped"
-    )
+    # Compact progress line: only mention non-zero counters.  "3/5 done"
+    # is enough on its own when nothing is in-progress/blocked/skipped.
+    parts = [f"{progress['done']}/{progress['total']} done"]
+    for key, label in (
+        ("in_progress", "in-progress"),
+        ("blocked", "blocked"),
+        ("pending", "pending"),
+        ("skipped", "skipped"),
+    ):
+        if progress[key]:
+            parts.append(f"{progress[key]} {label}")
+    lines.append("progress: " + ", ".join(parts))
     lines.append(PLAN_STATUS_CLOSE_TAG)
     return "\n".join(lines)
 

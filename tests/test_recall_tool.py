@@ -33,8 +33,11 @@ def test_tokens_extraction() -> None:
     assert _tokens("hello world") == {"hello", "world"}
     # Single char words are filtered out
     assert _tokens("a b c") == set()
-    # Underscore-separated words are captured as single tokens
-    assert _tokens("check_permission") == {"check_permission"}
+    # Underscore-separated words are captured with sub-tokens
+    assert _tokens("check_permission") == {"check_permission", "check", "permission"}
+    # CamelCase is split into sub-tokens
+    assert _tokens("JSONQuery") == {"jsonquery", "json", "query"}
+    assert _tokens("ParseError") == {"parseerror", "parse", "error"}
     # Empty strings give empty set
     assert _tokens("") == set()
 

@@ -50,6 +50,7 @@ class FileRecord:
     size: int
     ext: str
     hash: str  # blake2 of contents
+    mtime: float = 0.0  # last modification time (os.stat st_mtime)
  
  
 def load_gitignore(root: Path) -> GitignoreFilter:
@@ -72,16 +73,26 @@ def _blake2(abs_path: str) -> str:
     return h.hexdigest()
  
  
-def walk_repo(cwd: str | os.PathLike[str]) -> tuple[list[FileRecord], bool]:
+def walk_repo(
+    cwd: str | os.PathLike[str],
+    *,
+    prior_file_data: dict[str, tuple[str, float]] | None = None,
+) -> tuple[list[FileRecord], bool]:
     """Walk `cwd` and return `(records, hit_cap)`.
- 
+
     `hit_cap` is True when we stopped collecting at `FILE_CAP` — callers can
     warn the user that the index is partial.
+
+    ``prior_file_data`` maps ``rel_path → (hash, mtime)`` from the previous
+    index.  When a file's mtime is unchanged we reuse the prior hash and skip
+    the BLAKE2 computation — a significant speed-up for large repos where most
+    files don't change between re-indexes.
     """
     root = Path(cwd).resolve()
     ignore = load_gitignore(root)
     records: list[FileRecord] = []
     hit_cap = False
+    prior = prior_file_data or {}
 
     for dirpath, dirs, files in os.walk(root):
         # Filter directories: SKIP_DIRS, dotfiles, and gitignored dirs.
@@ -119,18 +130,26 @@ def walk_repo(cwd: str | os.PathLike[str]) -> tuple[list[FileRecord], bool]:
             if ext and ext not in TEXT_EXTS:
                 continue
             try:
-                size = os.path.getsize(abs_path)
+                st = os.stat(abs_path)
+                size = st.st_size
+                mtime = st.st_mtime
             except OSError:
                 continue
             if size > MAX_BYTES:
                 continue
-            h = _blake2(abs_path)
+            # Fast path: reuse prior hash when mtime is unchanged.
+            cached = prior.get(rel_posix)
+            if cached is not None and cached[1] == mtime:
+                h = cached[0]
+            else:
+                h = _blake2(abs_path)
             records.append(FileRecord(
                 path=rel_posix,
                 abs_path=abs_path,
                 size=size,
                 ext=ext,
                 hash=h,
+                mtime=mtime,
             ))
             if len(records) >= FILE_CAP:
                 hit_cap = True

@@ -7,7 +7,7 @@ from __future__ import annotations
  
 import json
 import os
-import time
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -215,7 +215,7 @@ def load_agent_instructions(cwd: str) -> str:
     return "".join(parts)
 
 
-def _mode_block(mode: str, cwd: str) -> str:
+def _mode_block(mode: str, cwd: str = "") -> str:
     """Per-mode rules.
 
     Each block is the *delta* on top of `## Rules` — anything already
@@ -235,10 +235,23 @@ def _mode_block(mode: str, cwd: str) -> str:
         )
     if mode == "bench":
         return (
-            "## Mode: bench\n"
-            "- All tools available. No approval prompts. No `plan_task`/`update_plan`/`finish_plan`.\n"
-            "- Workflow: understand → locate → fix → verify → finish.\n"
-            "- `save_note` for key findings (bug location, test command, root cause) so they survive compaction.\n"
+            "## Mode: bench (phase-gated)\n"
+            "- Tools are managed by phase. You progress through phases automatically:\n"
+            "  1. **explore** — read-only tools + run_command. Use `recall` to search the index, "
+            "read relevant files, run the failing tests to see the error.\n"
+            "  2. **plan** — only `plan_task`, `save_note`, `recall`. Call `plan_task` with your fix strategy.\n"
+            "  3. **execute** — editing tools available. Read the target file, apply your fix with `edit_file`, "
+            "then run tests. Call `update_plan` after completing each step.\n"
+            "  4. **verify** — check test results. If tests pass, call `finish_plan`. "
+            "If tests fail, you return to execute.\n"
+            "  5. **done** — the agent finishes automatically.\n"
+            "- Phase transitions happen automatically based on your actions.\n"
+            "- Do NOT create reproduction scripts or new test files. Run the LISTED failing tests.\n"
+            "- Do NOT fix import/environment errors — they are NOT the bug.\n"
+            "- Fix the SOURCE code, not the tests.\n"
+            "- If the listed failing tests are not found, study the problem statement for expected behavior.\n"
+            "- Pay close attention to function signatures, argument order, and types.\n"
+            "- Use `save_note` for key findings so they survive context compaction.\n"
             "- After editing, run the specific test that exercises the bug. `show_diff` before finishing."
         )
     if mode == "yolo":
@@ -302,18 +315,14 @@ def _index_header(cwd: str) -> str:
     dir_counts.sort(key=lambda kv: -kv[1])
     top_dirs = ", ".join(f"{p}({n})" for p, n in dir_counts[:5]) or "(flat)"
 
-    age_s = max(0.0, time.time() - (meta.generated_at or 0.0))
-    if age_s < 120:
-        age = f"{int(age_s)}s"
-    elif age_s < 7200:
-        age = f"{int(age_s / 60)}m"
-    else:
-        age = f"{int(age_s / 3600)}h"
-
+    # Index age intentionally omitted: it's a wall-clock value that would
+    # bust vLLM's prefix cache if ``build_system_prompt`` is ever called
+    # mid-task (currently it's only called at init, but the dependency was
+    # latent). The age provides no actionable signal to the model.
     return (
         f"\n\n## Index\n"
         f"{stats.get('files', 0)} files, {stats.get('symbols', 0)} symbols, "
-        f"top dirs: {top_dirs} (indexed {age} ago)."
+        f"top dirs: {top_dirs}."
     )
  
  
@@ -334,20 +343,61 @@ def snip_old_tool_results(
     messages: list[dict[str, Any]],
     max_chars: int = 2000,
     preserve_last_n: int = 6,
+    *,
+    aggressive_read_file_n: int = 4,
 ) -> list[dict[str, Any]]:
     """Truncate old tool-role messages that exceed *max_chars*.
 
     For tool messages older than *preserve_last_n* from the end, keep the
     first half and last quarter of their content, inserting a snip marker.
     Mutates in place and returns the same list.
+
+    For ``read_file`` results older than *aggressive_read_file_n* from the
+    end, replace the content entirely with a one-line stub.  read_file
+    results dominate context bloat (15KB+ per source file × many files),
+    and the agent can always re-read.
     """
-    cutoff = max(0, len(messages) - preserve_last_n)
-    for i in range(cutoff):
-        m = messages[i]
+    n = len(messages)
+    read_cutoff = max(0, n - aggressive_read_file_n)
+    cutoff = max(0, n - preserve_last_n)
+    for i, m in enumerate(messages):
         if m.get("role") != "tool":
             continue
         content = m.get("content", "")
-        if not isinstance(content, str) or len(content) <= max_chars:
+        if not isinstance(content, str):
+            continue
+
+        # Aggressive read_file stubbing: any read_file result older than
+        # aggressive_read_file_n turns and longer than 200 chars gets
+        # replaced with a terse marker.  The wording deliberately does
+        # NOT invite re-reads (v27 regressed because the prior stub said
+        # "call read_file again if needed" and the model treated that as
+        # a directive).  Prefer a path stamped on the message at dispatch
+        # time over regex-scraping the (possibly truncated) JSON body.
+        if (
+            i < read_cutoff
+            and m.get("name") == "read_file"
+            and len(content) > 200
+        ):
+            path_hint = m.get("_squishy_read_path") or ""
+            if not path_hint:
+                try:
+                    pm = re.search(r'"path"\s*:\s*"([^"]+)"', content[:500])
+                    if pm:
+                        path_hint = pm.group(1)
+                except Exception:  # noqa: BLE001
+                    pass
+            path_str = f"path={path_hint}" if path_hint else "path=?"
+            stub = (
+                f"[read_file({path_str}) result elided to save context "
+                "— content unchanged on disk]"
+            )
+            m["content"] = stub
+            continue
+
+        if i >= cutoff:
+            continue
+        if len(content) <= max_chars:
             continue
         first_half = content[: max_chars // 2]
         last_quarter = content[-(max_chars // 4) :]
@@ -380,7 +430,9 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list
     non_system = [m for m in messages if m.get("role") != "system"]
 
     if len(messages) <= max_messages:
-        return system + non_system
+        # Even when no trimming happens, strict endpoints (Azure) reject any
+        # orphan assistant tool_calls — strip them defensively.
+        return system + _strip_orphan_assistant_tool_calls(non_system)
 
     if not non_system:
         return system
@@ -397,6 +449,13 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list
     # with a prior action.
     while tail and tail[0].get("role") == "tool":
         tail = tail[1:]
+
+    # Strip orphan tool_calls from assistant messages whose matching tool
+    # responses were trimmed away. Azure-strict endpoints reject the request
+    # otherwise ("tool_call_ids did not have response messages").  Leniently
+    # converts the assistant message to prose-only: keeps any text content,
+    # drops the dangling tool_calls field.
+    tail = _strip_orphan_assistant_tool_calls(tail)
 
     # Semantic anchoring: pull up to 3 anchored messages from the dropped
     # middle section into the retained set.
@@ -420,24 +479,92 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list
                     continue  # skip orphan tool result
             tail.insert(0, m)
 
+    # Re-apply: anchored insertion may have introduced new assistant tool_calls
+    # without their paired tool responses (the responses were not anchored).
+    tail = _strip_orphan_assistant_tool_calls(tail)
+
     return system + first_user + tail
+
+
+def _strip_orphan_assistant_tool_calls(
+    msgs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Strip ``tool_calls`` from assistant messages whose paired tool messages
+    are not present later in ``msgs``.
+
+    Azure-strict chat completions reject any assistant message with
+    ``tool_calls`` that isn't followed by a ``role="tool"`` message for every
+    ``tool_call.id``.  When trimming/anchoring drops some tool responses while
+    keeping their assistant message, the result is an orphan.
+
+    This converts the orphan to a prose-only assistant message (preserving
+    ``content`` and ``think``).  If the message has neither content nor
+    reasoning, drops the message entirely so we don't leave an empty turn.
+    """
+    out: list[dict[str, Any]] = []
+    n = len(msgs)
+    for i, m in enumerate(msgs):
+        if m.get("role") != "assistant":
+            out.append(m)
+            continue
+        tcs = m.get("tool_calls") or []
+        if not tcs:
+            out.append(m)
+            continue
+        # Collect tool_call_ids that appear as tool messages later in tail.
+        following_tool_ids: set[str] = set()
+        for j in range(i + 1, n):
+            mj = msgs[j]
+            if mj.get("role") == "tool":
+                tcid = mj.get("tool_call_id", "")
+                if tcid:
+                    following_tool_ids.add(tcid)
+            elif mj.get("role") == "assistant":
+                # Stop scan at the next assistant turn — tool responses for
+                # *this* assistant message must come before any other assistant.
+                break
+        required_ids = {
+            tc.get("id", "")
+            for tc in tcs
+            if isinstance(tc, dict) and tc.get("id")
+        }
+        if required_ids.issubset(following_tool_ids):
+            out.append(m)
+            continue
+        # Orphan: at least one tool_call.id has no following tool message.
+        # Convert to prose-only assistant message.
+        text = m.get("content") or ""
+        think = m.get("think") or ""
+        if not text and not think:
+            # Nothing salvageable — drop the assistant turn entirely.
+            continue
+        cleaned = {k: v for k, v in m.items() if k != "tool_calls"}
+        cleaned["content"] = text or ""
+        out.append(cleaned)
+    return out
 
 
 # ── Layer 2: LLM-based context compaction ────────────────────────────────
 
 
 def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
-    """Estimate token count from message contents (chars / 4)."""
+    """Estimate token count from message contents.
+
+    Uses ~3.5 chars/token (better for code-heavy content) plus 4-token
+    overhead per message for role/formatting added by the API.
+    """
     total = 0
     for m in messages:
+        chars = 0
         content = m.get("content", "")
         if isinstance(content, str):
-            total += len(content)
+            chars += len(content)
         for tc in m.get("tool_calls", []):
             if isinstance(tc, dict):
                 func = tc.get("function", {})
-                total += len(func.get("name", "")) + len(func.get("arguments", ""))
-    return total // 4
+                chars += len(func.get("name", "")) + len(func.get("arguments", ""))
+        total += int(chars / 3.5) + 4  # per-message overhead
+    return total
 
 
 def find_compaction_split(
@@ -459,7 +586,7 @@ def find_compaction_split(
             if isinstance(tc, dict):
                 func = tc.get("function", {})
                 chars += len(func.get("name", "")) + len(func.get("arguments", ""))
-        running += chars // 4
+        running += int(chars / 3.5) + 4
         if running >= target:
             return i
     return 0
@@ -516,15 +643,35 @@ async def compact_messages(
     old = compactable[:split]
     recent = compactable[split:]
 
-    # Pull anchored messages from old section into recent
+    # Pull anchored messages from old section into recent, together with
+    # their paired tool-result messages so we don't create dangling
+    # tool_calls that confuse the LLM.
     anchored = [m for m in old if m.get("_squishy_anchor")]
+    pulled: list[dict[str, Any]] = []
     for m in anchored[:3]:
+        pulled.append(m)
+        # If this is an assistant message with tool_calls, also pull the
+        # matching tool-result messages from old.
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            call_ids = {
+                tc.get("id", "") for tc in m["tool_calls"]
+                if isinstance(tc, dict)
+            }
+            for om in old:
+                if (
+                    om.get("role") == "tool"
+                    and om.get("tool_call_id", "") in call_ids
+                    and om not in pulled
+                ):
+                    pulled.append(om)
+    for m in reversed(pulled):
         recent.insert(0, m)
 
     # Build summary text from old messages
+    pulled_set = set(id(m) for m in pulled)
     summary_parts: list[str] = []
     for m in old:
-        if m in anchored:
+        if id(m) in pulled_set:
             continue  # already pulled into recent
         role = m.get("role", "?")
         content = m.get("content", "")
@@ -537,8 +684,7 @@ async def compact_messages(
                 # Include key args (file paths, commands) for context
                 args_preview = ""
                 try:
-                    import json as _json
-                    args = _json.loads(func.get("arguments", "{}"))
+                    args = json.loads(func.get("arguments", "{}"))
                     if "path" in args:
                         args_preview = f"path={args['path']}"
                     elif "command" in args:
@@ -557,13 +703,22 @@ async def compact_messages(
     if len(old_text) > 30_000:
         old_text = old_text[:30_000] + "\n[... truncated for summarization ...]"
 
-    # Summarize via LLM
+    # Summarize via LLM.  Use a structured template so the model produces
+    # decision-relevant facts instead of narrative prose.  Same token
+    # budget, ~3-4× more useful signal per token.
     try:
         summary_prompt = (
-            "Summarize this conversation history concisely. Preserve: "
-            "file paths, function/class names, error messages, test commands, "
-            "line numbers, root cause findings, and what was tried. "
-            "Be specific about file locations and code details.\n\n"
+            "Compress the following conversation history into the structured "
+            "template below.  Be concrete: include file paths, line numbers, "
+            "exact error messages, and the literal text of attempted edits.\n"
+            "Do NOT include narrative prose.  If a section has no content, "
+            "write `(none)`.  Stay under 600 words total.\n\n"
+            "ROOT CAUSE (1-2 sentences, what the bug actually is):\n"
+            "ATTEMPTED EDITS (file:line — what changed — succeeded/failed):\n"
+            "FILES READ (path — one-line relevance, no prose):\n"
+            "TESTS RUN (command — exit_code — pass/fail summary):\n"
+            "DEAD ENDS (approaches tried and ruled out, with reason):\n"
+            "NEXT ACTION (the single thing to do next):\n\n"
             + old_text
         )
         result = await client.complete(
@@ -591,4 +746,8 @@ async def compact_messages(
     # Re-inject the protected first user message right after system messages
     # so it survives compaction and remains visible to the model.
     protected_msgs = [protected] if protected is not None else []
+    # Final orphan-strip on `recent`: the anchored-pull above tries to keep
+    # tool-result pairs together, but if any tool messages were dropped
+    # mid-conversation an orphan can remain.  Strict endpoints (Azure) reject.
+    recent = _strip_orphan_assistant_tool_calls(recent)
     return system + protected_msgs + [summary_msg, ack_msg] + recent

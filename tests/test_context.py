@@ -2,7 +2,13 @@ from __future__ import annotations
  
 import json
  
-from squishy.context import build_system_prompt, detect_project, snip_old_tool_results, trim_history
+from squishy.context import (
+    build_system_prompt,
+    compact_messages,
+    detect_project,
+    snip_old_tool_results,
+    trim_history,
+)
  
  
 def test_detect_node_nextjs(tmp_path):
@@ -108,6 +114,81 @@ def test_trim_history_drops_orphan_tool_results_at_tail_start():
             assert m["tool_call_id"] in declared_ids, (
                 f"orphan tool result for {m['tool_call_id']} in trimmed history"
             )
+
+
+def test_trim_history_strips_orphan_assistant_tool_calls():
+    """An assistant message whose tool_call ids have no following tool messages
+    must have its tool_calls stripped (or be dropped) — Azure-strict endpoints
+    reject the request otherwise.
+    """
+    msgs: list[dict] = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "first user"},
+    ]
+    # Build a long history where the last 6 entries are matched pairs (3 pairs)
+    # but turn-7 assistant has tool_calls whose tool result will be dropped.
+    msgs.append({"role": "assistant", "content": "salvageable text",
+                 "tool_calls": [{"id": "orphan_x", "type": "function",
+                                 "function": {"name": "read_file", "arguments": "{}"}}]})
+    # Note: NO tool message for orphan_x.
+    for i in range(3):
+        msgs.append(_asst_tc(f"c{i}"))
+        msgs.append(_tool(f"c{i}"))
+
+    trimmed = trim_history(msgs, max_messages=10)
+    # Every assistant message with tool_calls in trimmed must have all of its
+    # tool_call.ids present as tool messages later in the trimmed list.
+    for i, m in enumerate(trimmed):
+        if m.get("role") != "assistant":
+            continue
+        tcs = m.get("tool_calls") or []
+        if not tcs:
+            continue
+        required = {tc["id"] for tc in tcs}
+        following: set[str] = set()
+        for j in range(i + 1, len(trimmed)):
+            mj = trimmed[j]
+            if mj.get("role") == "tool":
+                following.add(mj.get("tool_call_id", ""))
+            elif mj.get("role") == "assistant":
+                break
+        assert required.issubset(following), (
+            f"orphan assistant tool_calls {required - following} survived trimming"
+        )
+
+
+def test_trim_history_orphan_assistant_preserves_text_content():
+    """When orphan tool_calls are stripped, the assistant's prose content
+    should be preserved as a normal assistant message.
+    """
+    from squishy.context import _strip_orphan_assistant_tool_calls
+    msgs = [
+        {"role": "assistant", "content": "I will read the file",
+         "tool_calls": [{"id": "orphan", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "user", "content": "(no tool result followed)"},
+    ]
+    out = _strip_orphan_assistant_tool_calls(msgs)
+    assert len(out) == 2
+    assert out[0]["role"] == "assistant"
+    assert "tool_calls" not in out[0]
+    assert out[0]["content"] == "I will read the file"
+
+
+def test_trim_history_orphan_assistant_drops_when_empty():
+    """An orphan assistant message with neither content nor reasoning
+    should be dropped entirely (no empty turn left behind).
+    """
+    from squishy.context import _strip_orphan_assistant_tool_calls
+    msgs = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "orphan", "type": "function",
+                         "function": {"name": "read_file", "arguments": "{}"}}]},
+    ]
+    out = _strip_orphan_assistant_tool_calls(msgs)
+    assert len(out) == 1
+    assert out[0]["role"] == "user"
 
 
 def test_trim_history_keeps_matched_pairs_intact():
@@ -231,9 +312,11 @@ def test_trim_history_preserves_plan_status_system_message():
 
 
 def test_trim_history_noop_preserves_system_order():
-    """Plan-status is now merged into messages[0] by _refresh_system_injections,
-    not stored as a separate system message. Multiple system messages are
-    preserved in order."""
+    """trim_history preserves the system + first-user prefix when the
+    message list is already under the cap. Plan-status and notes are
+    no longer carried in the system message — they're injected as a
+    transient (assistant tool_calls, tool result) pair by
+    ``Agent._refresh_live_context_pair`` after trim/compact runs."""
     msgs = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "u"},
@@ -247,11 +330,62 @@ def test_trim_history_noop_preserves_system_order():
 
 
 def test_snip_old_tool_results_truncates_old_large_tool():
+    # F1: old read_file results get a terse marker that does NOT invite
+    # the model to re-read.  v27 regressed because the prior "call
+    # read_file again if needed" wording trained the agent into re-read
+    # storms.  The replacement must (a) say "content unchanged on disk",
+    # (b) NOT mention a (bogus) line count.
     big_content = "x" * 5000
     msgs = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "u"},
         {"role": "tool", "tool_call_id": "c0", "name": "read_file", "content": big_content},
+        *[{"role": "assistant", "content": f"a{i}"} for i in range(8)],
+    ]
+    snip_old_tool_results(msgs, max_chars=2000, preserve_last_n=6)
+    snipped = msgs[2]["content"]
+    assert len(snipped) < len(big_content)
+    assert "content unchanged on disk" in snipped
+    # Anti-regression: the harmful wording must not return.
+    assert "call read_file again" not in snipped
+    # Anti-regression: no bogus line counts (read_file results are
+    # JSON-encoded so "\n" never matches and the count was always 1).
+    assert "lines" not in snipped
+
+
+def test_snip_uses_squishy_read_path_when_present():
+    """F1b: when the dispatch layer stamps `_squishy_read_path` on the
+    tool message, the snipper should prefer it over regex-scraping the
+    JSON body — which may already be truncated by a prior pass.
+    """
+    # Opaque content with no recoverable JSON path.
+    opaque = "y" * 5000
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+        {
+            "role": "tool",
+            "tool_call_id": "c0",
+            "name": "read_file",
+            "content": opaque,
+            "_squishy_read_path": "scico/_xray.py",
+        },
+        *[{"role": "assistant", "content": f"a{i}"} for i in range(8)],
+    ]
+    snip_old_tool_results(msgs, max_chars=2000, preserve_last_n=6)
+    snipped = msgs[2]["content"]
+    assert "path=scico/_xray.py" in snipped
+    assert "content unchanged on disk" in snipped
+
+
+def test_snip_old_tool_results_mid_snips_non_read_file():
+    # Non-read_file tool results that aren't read_file still get the
+    # legacy mid-content snip when older than preserve_last_n.
+    big_content = "x" * 5000
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u"},
+        {"role": "tool", "tool_call_id": "c0", "name": "search_files", "content": big_content},
         *[{"role": "assistant", "content": f"a{i}"} for i in range(8)],
     ]
     snip_old_tool_results(msgs, max_chars=2000, preserve_last_n=6)
@@ -274,3 +408,50 @@ def test_snip_old_tool_results_preserves_recent():
     snip_old_tool_results(msgs, max_chars=2000, preserve_last_n=6)
     # Tool message is within the last 6 — should NOT be snipped
     assert msgs[5]["content"] == big_content
+
+
+# ── compact_messages tests ─────────────────────────────────────────────
+
+
+class _FakeCompactClient:
+    """Minimal client stub for compact_messages tests."""
+
+    async def complete(self, messages, tools, stream=False, on_text=None):
+        class _R:
+            text = "Summary of old messages."
+        return _R()
+
+
+async def test_compact_messages_pulls_tool_results_with_anchored_assistant():
+    """Anchored assistant messages should bring their paired tool results along."""
+    # Build a conversation long enough to trigger compaction.
+    # Use large content so char/4 estimate exceeds threshold.
+    big = "x" * 4000
+    msgs = [
+        {"role": "system", "content": "system prompt"},
+        {"role": "user", "content": "fix the bug" + big},
+        # Old assistant turn with anchored tool call
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "edit_file", "arguments": '{"path":"a.py"}'}},
+            ],
+            "_squishy_anchor": True,
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "edit_file", "content": "ok"},
+        # More messages to push the anchored one into the "old" region
+        {"role": "user", "content": "keep going" + big},
+        {"role": "assistant", "content": "working on it" + big},
+        {"role": "user", "content": "status?" + big},
+        {"role": "assistant", "content": "almost done" + big},
+    ]
+    result = await compact_messages(msgs, _FakeCompactClient(), context_limit=2000, threshold=0.1)
+
+    # Find the anchored assistant message in the result
+    anchored = [m for m in result if m.get("_squishy_anchor")]
+    assert anchored, "anchored assistant message should survive compaction"
+
+    # The matching tool result should also be present
+    tool_results = [m for m in result if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
+    assert tool_results, "tool result paired with anchored assistant should also survive compaction"

@@ -1,8 +1,10 @@
-"""Loop detection, quality gates, nudges, and stuck detection for the agent loop."""
+"""Quality gates, informational nudges, and test-failure feedback for the agent loop."""
 
 from __future__ import annotations
 
-import os
+import hashlib
+import json
+import re
 from typing import TYPE_CHECKING, Any
 
 from squishy.agent_state import LoopState, TaskResult
@@ -32,7 +34,13 @@ def inject_nudge(
     agent: Agent, st: LoopState, turn: int, content: str,
     *, min_gap: int = 2, force: bool = False,
 ) -> bool:
-    """Inject a system nudge if under the cap. Returns True if injected."""
+    """Inject a system nudge if under the cap. Returns True if injected.
+
+    Mirrors the nudge to ``agent.display.nudge`` so the user can see
+    every correction the harness sends to the model — closing the
+    long-standing opacity gap where agent behavior changes silently
+    in response to invisible system messages.
+    """
     # Hard ceiling: even forced nudges stop after 2x the normal cap.
     hard_cap = agent.config.max_system_nudges * 2
     if st.total_nudges >= hard_cap:
@@ -41,7 +49,19 @@ def inject_nudge(
         return False
     agent.messages.append({"role": "user", "content": content})
     record_nudge(st, turn)
+    if agent.display is not None:
+        agent.display.nudge(content)
     return True
+
+
+def needs_f2p_verification(st: LoopState) -> bool:
+    """True iff the agent edited but hasn't run F2P tests since that edit.
+
+    Used by the v2 auto-pytest finish gate (agent.py natural-finish and
+    done-phase exit) to decide whether to synthesize a pytest run before
+    accepting the agent's "I'm done" claim.
+    """
+    return bool(st.files_edited) and st.last_edit_turn > st.last_f2p_test_turn
 
 
 def apply_quality_gate(
@@ -56,7 +76,10 @@ def apply_quality_gate(
     """
     _is_constrained = agent.config.permission_mode in ("bench", "yolo")
 
-    ok, reason = assess_response(tool_calls, agent.messages, REGISTRY)
+    ok, reason = assess_response(
+        tool_calls, agent.messages, REGISTRY,
+        edit_fail_paths=frozenset(st.recent_edit_fail_files),
+    )
     if ok:
         st.quality_retries = 0
         return None
@@ -64,11 +87,16 @@ def apply_quality_gate(
     st.total_quality_violations += 1
 
     loop_reasons = ("repeated_tool_call", "excessive_reread", "repeated_command",
-                    "edit_verify_loop", "repeated_recall", "repeated_search")
+                    "edit_verify_loop", "repeated_recall", "repeated_search",
+                    "plan_loop")
 
     if _is_constrained:
         if reason in loop_reasons:
-            if st.files_edited and (st.total_quality_violations >= 4 or st.test_passed_after_edit):
+            # Raised from 4→6 (post-cooldown).  With cooldown of -2 per
+            # successful edit, this is effectively ~3 strikes after the
+            # last edit, instead of accumulating from exploration-phase
+            # quality noise.
+            if st.files_edited and (st.total_quality_violations >= 6 or st.test_passed_after_edit):
                 if agent.display:
                     agent.display.warn(
                         f"quality: {reason} — force finishing (violations={st.total_quality_violations})"
@@ -96,10 +124,13 @@ def apply_quality_gate(
         if agent.display:
             agent.display.warn(f"quality: {reason}")
         if st.total_nudges < agent.config.max_system_nudges * 2:
+            full_content = f"[system] {correction}"
             agent.messages.append(
-                {"role": "user", "content": f"[system] {correction}"}
+                {"role": "user", "content": full_content}
             )
             record_nudge(st, turn)
+            if agent.display is not None:
+                agent.display.nudge(full_content)
         st.quality_skips += 1
         return "skip"
 
@@ -118,57 +149,6 @@ def apply_quality_gate(
     return None
 
 
-def apply_stuck_detection(
-    agent: Agent, st: LoopState, is_bench: bool, turn: int = 0,
-) -> None:
-    """Track file-mutation progress and inject stuck nudges in bench mode."""
-    made_progress = (
-        len(st.files_created) > st.prior_created_len
-        or len(st.files_edited) > st.prior_edited_len
-    )
-    if made_progress:
-        st.turns_without_progress = 0
-    else:
-        st.turns_without_progress += 1
-    st.prior_created_len = len(st.files_created)
-    st.prior_edited_len = len(st.files_edited)
-
-    if (
-        is_bench
-        and st.turns_without_progress >= agent.config.max_stuck_turns
-        and st.turns_without_progress % agent.config.max_stuck_turns == 0
-    ):
-        urgency = (
-            "URGENT" if st.turns_without_progress >= agent.config.max_stuck_turns * 2
-            else "WARNING"
-        )
-        wd = agent.tool_ctx.working_dir
-        already_read = sorted(
-            os.path.relpath(p, wd) if os.path.isabs(p) else p
-            for p in agent.tool_ctx.files_read_count.keys()
-        )[:5]
-        already_note = (
-            f"\nYou have already read: {', '.join(already_read)}. "
-            "Do NOT read these files again — use the content you already have."
-        ) if already_read else ""
-
-        if not already_read and st.problem_files:
-            hint_files = sorted(st.problem_files)[:3]
-            hint = f"\nHint: the problem mentions: {', '.join(hint_files)}. Try reading one of those."
-        else:
-            hint = ""
-
-        inject_nudge(agent, st, turn, (
-            f"[system] [{urgency}] You have NOT edited any files in "
-            f"{st.turns_without_progress} turns. You MUST call `edit_file` NOW.\n"
-            "Stop reading, searching, and exploring. You have enough information.\n"
-            "1. Pick the most likely file and function from the problem statement.\n"
-            "2. Call `edit_file` with your best fix attempt using content you already have.\n"
-            "A wrong fix that you iterate on is better than more exploration."
-            f"{already_note}{hint}"
-        ))
-
-
 def inject_test_failure_nudge(
     agent: Agent, st: LoopState, tc: ToolCall, outcome: dict[str, Any],
     *, turn: int = 0,
@@ -183,15 +163,109 @@ def inject_test_failure_nudge(
     if tc.name != "run_command":
         return
     data = outcome.get("data", {})
-    if data.get("exit_code", 0) == 0:
+    exit_code = data.get("exit_code", 0)
+    if exit_code == 0:
         return
     command = str(tc.args.get("command", ""))
     if not any(kw in command for kw in ("pytest", "test", "unittest")):
         return
 
+    # Pytest exit code 5 = "no tests collected".  This means the test doesn't
+    # exist yet or the path is wrong — pressuring edit_file is counterproductive.
+    # Similarly, exit code 4 = "usage error" (bad args).
+    # Exit code 2 with ImportError/ModuleNotFoundError = environment issue.
+    stdout = str(data.get("stdout", ""))
+    stderr = str(data.get("stderr", ""))
+    combined_output = stdout + stderr
+    combined_lower = combined_output.lower()
+
+    # Read F2P + install_status hints from the bench harness (threaded via
+    # ToolContext.notes — see swebench.run_swebench_instance).
+    notes = getattr(agent.tool_ctx, "notes", {}) or {}
+    fail_to_pass: list[str] = []
+    raw_f2p = notes.get("fail_to_pass_tests")
+    if raw_f2p:
+        try:
+            parsed = json.loads(raw_f2p)
+            if isinstance(parsed, list):
+                fail_to_pass = [str(t) for t in parsed]
+        except (ValueError, TypeError):
+            pass
+    install_ok = True
+    raw_install = notes.get("install_status")
+    if raw_install:
+        try:
+            parsed_i = json.loads(raw_install)
+            if isinstance(parsed_i, dict):
+                install_ok = bool(parsed_i.get("ok", True))
+        except (ValueError, TypeError):
+            pass
+
+    # Detect import/environment errors separately from missing tests.
+    import_error = (
+        "importerror" in combined_lower
+        or "modulenotfounderror" in combined_lower
+        or "no module named" in combined_lower
+    )
+    if import_error and exit_code in (1, 2):
+        # When install_deps already failed, the import error is an environment
+        # artifact — do not pressure the agent to "fix imports".  Instead,
+        # remind it the source edit is what matters.
+        if not install_ok:
+            inject_nudge(agent, st, turn, (
+                "[system] Tests failed with ImportError, but the dependency install "
+                "was already degraded before you started — this is an ENVIRONMENT "
+                "issue, not your bug.\n"
+                "1. Do NOT try to fix imports or install packages.\n"
+                "2. Focus entirely on producing a correct source-code edit for the bug.\n"
+                "3. Your patch will be evaluated against a clean test environment, "
+                "so a syntactically valid edit is what matters."
+            ), min_gap=2)
+            return
+        inject_nudge(agent, st, turn, (
+            "[system] Tests failed due to an import/environment error, NOT a missing "
+            "test. This is likely a Python version or dependency issue in the test "
+            "environment — it is NOT the bug you need to fix.\n"
+            "1. Try running a more targeted test: `python -m pytest path/to/test.py::specific_test -x`\n"
+            "2. Focus on fixing the SOURCE code bug described in the problem statement.\n"
+            "3. Do NOT fix import compatibility issues — they are environment artifacts."
+        ), min_gap=2)
+        return
+
+    no_tests_collected = (
+        exit_code == 5
+        or "no tests ran" in combined_lower
+        or "collected 0 items" in combined_lower
+        or "no tests were selected" in combined_lower
+    )
+    if no_tests_collected:
+        is_bench = agent.config.permission_mode == "bench"
+        if is_bench:
+            inject_nudge(agent, st, turn, (
+                "[system] No tests were collected — the test function may not exist "
+                "in the workspace yet. In bench mode, the evaluation harness adds "
+                "new tests AFTER your fix is applied.\n"
+                "1. Run the FULL test file instead: `python -m pytest path/to/test.py -x`\n"
+                "2. Study the failing test NAME — it tells you what behavior is expected "
+                "(e.g. `test_spawn_this_typing_correct` means spawn should handle `_this` typing).\n"
+                "3. Re-read the problem statement for expected function signatures, "
+                "argument order, and return values — these are what the hidden tests check.\n"
+                "4. Focus on fixing the SOURCE code to match the described behavior."
+            ), min_gap=2)
+        else:
+            inject_nudge(agent, st, turn, (
+                "[system] No tests were collected — the test file or test function "
+                "may not exist yet, or the test path may be wrong.\n"
+                "1. Use `search_files` or `read_file` to find the correct test file.\n"
+                "2. If the test needs to be created as part of the fix, create it.\n"
+                "3. Check the failing test paths listed in the problem statement."
+            ), min_gap=2)
+        return
+
     # Build structured failure summary from parsed test output.
     test_summary = data.get("test_summary")
     failure_lines = ""
+    f2p_header_extra = ""
     if test_summary:
         failures = test_summary.get("failures", [])
         passed = test_summary.get("passed", 0)
@@ -201,6 +275,52 @@ def inject_test_failure_nudge(
         if errors:
             header += f", {errors} errors"
         header += "."
+
+        # F2P-aware ordering: pull eval-target failures to the top, count
+        # how many of the F2P set are still failing so the agent sees the
+        # signal that actually determines pass/fail.
+        f2p_count_now = -1  # -1 means "no F2P info available"
+        if failures and fail_to_pass:
+            def _is_f2p(f: dict) -> bool:
+                tname = str(f.get("test", ""))
+                return any(
+                    f2p in tname or tname in f2p
+                    for f2p in fail_to_pass
+                )
+
+            f2p_failing = [f for f in failures if _is_f2p(f)]
+            other_failing = [f for f in failures if not _is_f2p(f)]
+            failures = f2p_failing + other_failing
+            f2p_count_now = len(f2p_failing)
+            if f2p_failing:
+                f2p_header_extra = (
+                    f"\n⚠ {f2p_count_now}/{len(fail_to_pass)} of the FAIL_TO_PASS "
+                    f"evaluation tests are still failing — these are what the "
+                    f"benchmark scores on."
+                )
+                # Cross-cycle F2P-only progress: warn when F2P failure count
+                # has not decreased.  An agent fixing unrelated tests but
+                # leaving F2P red still gets the generic "Progress!" reward
+                # — the F2P-specific signal counters that.
+                if st.last_f2p_failure_count >= 0:
+                    prev_f2p = st.last_f2p_failure_count
+                    if f2p_count_now >= prev_f2p:
+                        f2p_header_extra += (
+                            f"\n⚠ F2P failure count did not decrease this cycle "
+                            f"({prev_f2p} → {f2p_count_now}). "
+                            "Your last edit did not improve the EVAL TARGET — "
+                            "non-F2P fixes do not count."
+                        )
+                    else:
+                        green = len(fail_to_pass) - f2p_count_now
+                        f2p_header_extra += (
+                            f"\nF2P progress: {green}/{len(fail_to_pass)} target tests now pass."
+                        )
+        # Always track F2P count across cycles, even when 0 failing.
+        if fail_to_pass and f2p_count_now < 0:
+            f2p_count_now = 0
+        if f2p_count_now >= 0:
+            st.last_f2p_failure_count = f2p_count_now
 
         if failures:
             items = []
@@ -233,27 +353,19 @@ def inject_test_failure_nudge(
         failure_lines = ""
         comparison = ""
 
-    # Escalation based on cycle count.
-    if st.fix_verify_cycles >= 4:
-        inject_nudge(agent, st, turn, (
-            f"[system] CRITICAL: {st.fix_verify_cycles} fix-verify cycles "
-            f"and the test still fails. {header}{failure_lines}{comparison}\n\n"
-            "STOP making small tweaks — your approach is fundamentally wrong. "
-            "You MUST:\n"
-            "1. Re-read the failing test to understand exactly what it expects.\n"
-            "2. Re-read the problem statement to check your understanding.\n"
-            "3. Try a COMPLETELY different fix strategy.\n"
-            "If you cannot fix it, respond with a text summary and stop."
-        ), min_gap=0)
-    else:
+    # Structured feedback — always informational, never threatening.
+    if f2p_header_extra and failure_lines:
         action = (
-            "Focus your next `edit_file` on fixing the FIRST failing test."
-            if failure_lines else
-            "Call `edit_file` with your fix now."
+            "Focus your next `edit_file` on the FIRST FAIL_TO_PASS test above — "
+            "non-F2P failures are noise."
         )
-        inject_nudge(agent, st, turn, (
-            f"[system] {header}{failure_lines}{comparison}\n{action}"
-        ), min_gap=0)
+    elif failure_lines:
+        action = "Focus your next `edit_file` on fixing the FIRST failing test."
+    else:
+        action = "Call `edit_file` with your fix now."
+    inject_nudge(agent, st, turn, (
+        f"[system] {header}{f2p_header_extra}{failure_lines}{comparison}\n{action}"
+    ), min_gap=2)
 
 
 def check_goal_drift(
@@ -289,109 +401,131 @@ def check_goal_drift(
         st.env_error_count = 0
         st.env_fix_files.clear()
         inject_nudge(agent, st, turn, (
-            "[system] GOAL DRIFT WARNING: You are fixing environmental/import "
-            "errors instead of the actual bug described in the problem statement. "
+            "[system] Goal drift detected: recent edits target environmental/import "
+            "issues rather than the bug described in the problem statement. "
             "These import errors are caused by Python version differences in the "
-            "test environment — they are NOT the bug you need to fix.\n\n"
-            "STOP fixing import compatibility issues. Instead:\n"
-            "1. Focus ONLY on the bug described in the problem statement.\n"
-            "2. Run a more targeted test: "
-            "`python -m pytest path/to/test.py::specific_test -x`\n"
-            "3. Or write a minimal reproduction script to verify your fix.\n\n"
-            "Re-read the problem statement and get back on track."
-        ), min_gap=0)
+            "test environment — they are not the bug you need to fix.\n"
+            "Focus on the bug described in the problem statement. "
+            "Try a more targeted test: `python -m pytest path/to/test.py::specific_test -x`"
+        ), min_gap=2, force=True)
 
 
 def track_edit_failure(
     agent: Agent, st: LoopState, tc: ToolCall, outcome: dict[str, Any],
     *, turn: int = 0,
-) -> None:
-    """Track edit_file failures per file and nudge on repeated failures."""
+) -> TaskResult | None:
+    """Track edit_file failures per file and nudge on repeated failures.
+
+    Returns a TaskResult to force-finish when the agent retries the SAME
+    `old_str` against the SAME path 5+ times in a row — a loop the existing
+    repeated_tool_call quality gate misses because `new_str` typically varies.
+    """
     if agent.config.permission_mode not in ("bench", "yolo"):
-        return
+        return None
     if tc.name != "edit_file":
-        return
+        return None
 
     path = str(tc.args.get("path", ""))
     if not path:
-        return
+        return None
 
     if not outcome.get("success"):
         st.edit_failures_per_file[path] = st.edit_failures_per_file.get(path, 0) + 1
         st.total_edit_failures += 1
         failures = st.edit_failures_per_file[path]
 
-        if failures == 3:
+        # Track identical-old_str repeats per path. Hash for compactness.
+        old_str = str(tc.args.get("old_str", ""))
+        old_hash = hashlib.blake2b(old_str.encode("utf-8", "replace"), digest_size=8).hexdigest()
+        prev = st.last_edit_old_str_per_file.get(path)
+        if prev and prev[0] == old_hash:
+            identical_count = prev[1] + 1
+        else:
+            identical_count = 1
+        st.last_edit_old_str_per_file[path] = (old_hash, identical_count)
+
+        # v6d: targeted escape hatch for "old_str not found" loops. Fire at
+        # count >= 2 (one turn before the generic 3-failure message) with
+        # action-specific guidance: re-read the file before guessing again.
+        # The unleash-157 case in v6c showed an agent burning 3 turns on
+        # successive variants of the same broken old_str without ever
+        # re-reading. Targeting only the "not found" error keeps this
+        # complementary to the generic message at >=3 (which covers
+        # permission errors, write_file outcomes, etc).
+        err_text = str(outcome.get("error") or "")
+        if failures >= 2 and "old_str not found" in err_text:
             inject_nudge(agent, st, turn, (
-                f"[system] You have failed to edit `{path}` {failures} times. "
-                "Your old_str is not matching the file content. STOP guessing and:\n"
+                f"[system] {failures} `old_str not found` failures on "
+                f"`{path}`. Your old_str does not match the current "
+                f"file content. STOP guessing — call:\n\n"
+                f"    read_file(path=\"{path}\")\n\n"
+                f"…then copy the EXACT lines (including whitespace) "
+                f"into old_str. The error message above shows the "
+                f"actual content at the line where your old_str's "
+                f"first line appears — use that to write a correct "
+                f"old_str."
+            ), min_gap=1)
+
+        # Force-finish after 5 identical-old_str failures to the same path.
+        # The agent is in a loop the model can't escape; the prior fs.py
+        # Stage 1c fallback masks most cases but not all.
+        if identical_count >= 5:
+            if agent.display:
+                agent.display.warn(
+                    f"edit-loop: {identical_count}× identical old_str failures to `{path}` — force finishing"
+                )
+            if st.files_edited:
+                return agent._build_result(
+                    st, success=True,
+                    final_text=(
+                        f"Edit loop detected: {identical_count} identical-old_str failures "
+                        f"to `{path}`. Prior edits applied; ending the run."
+                    ),
+                    turn=turn,
+                )
+            return agent._build_result(
+                st, success=False,
+                error=(
+                    f"edit loop: {identical_count} identical-old_str failures to "
+                    f"`{path}` with no successful edits"
+                ),
+                turn=turn,
+            )
+
+        if failures >= 3:
+            inject_nudge(agent, st, turn, (
+                f"[system] {failures} failed edits to `{path}`. "
+                "Your old_str is not matching the file content.\n"
                 "1. Call `read_file` on the exact line range you want to edit.\n"
                 "2. Copy the EXACT text from the read output into old_str.\n"
                 "3. Include 2-3 lines of surrounding context for uniqueness."
-            ), min_gap=0)
-        elif failures >= 5:
-            inject_nudge(agent, st, turn, (
-                f"[system] CRITICAL: {failures} failed edits to `{path}`. "
-                "You are struggling with this file. Consider:\n"
-                "1. Are you editing the RIGHT file? Re-read the problem statement.\n"
-                "2. Try a completely different approach or a different file.\n"
-                "3. Write a small reproduction script to verify you understand "
-                "the bug before editing."
-            ), min_gap=0)
+            ), min_gap=2)
     else:
         st.edit_failures_per_file[path] = 0
-
-
-def inject_consecutive_identical_nudge(
-    agent: Agent, st: LoopState, *, turn: int = 0,
-) -> None:
-    """Inject a warning when the model repeats the same tool call."""
-    if st.consecutive_identical >= 5:
-        hint_files = sorted(st.problem_files)[:3] if st.problem_files else []
-        hint = (
-            f"\nThe problem mentions these files: {', '.join(hint_files)}. "
-            "If you haven't edited one yet, do so NOW."
-        ) if hint_files else ""
-        inject_nudge(agent, st, turn, (
-            f"[system] CRITICAL: You have repeated the EXACT same call "
-            f"{st.consecutive_identical + 1} times. ONE MORE and this task "
-            "will be terminated. You MUST do something DIFFERENT right now:\n"
-            "- Call `edit_file` with your best guess fix.\n"
-            "- Or respond with text to finish."
-            f"{hint}"
-        ), min_gap=0, force=True)
-    else:
-        inject_nudge(agent, st, turn, (
-            f"[system] WARNING: You have made the EXACT same tool call "
-            f"{st.consecutive_identical + 1} times in a row. You are stuck "
-            "in a loop. You MUST try something different:\n"
-            "1. If you need to edit a file, call `edit_file` now.\n"
-            "2. If you already fixed the bug, respond with plain text.\n"
-            "3. Try a completely different file or approach.\n"
-            "Do NOT repeat the same call again."
-        ), min_gap=0, force=True)
-
-
-def check_read_only_spiral(
-    agent: Agent, st: LoopState, is_bench: bool, turn: int,
-) -> TaskResult | None:
-    """Detect read-only spiral and force-finish."""
-    if (
-        is_bench
-        and turn >= 25
-        and not st.files_edited
-        and st.commands_run == 0
-        and st.turns_without_progress >= 20
-    ):
-        msg = f"read-only spiral detected after {turn} turns — force finishing"
-        if agent.display:
-            agent.display.warn(msg)
-        return agent._build_result(st, success=False, error=msg, turn=turn)
-
-    if is_bench and turn >= 50 and not st.files_edited:
-        msg = f"no edits after {turn} turns — force finishing"
-        if agent.display:
-            agent.display.warn(msg)
-        return agent._build_result(st, success=False, error=msg, turn=turn)
-
+        st.last_edit_old_str_per_file.pop(path, None)
     return None
+
+
+_FILE_READ_CMD = re.compile(
+    r"^\s*(?:sed\s+-n|cat\s|head\s|tail\s|awk\s)", re.IGNORECASE,
+)
+
+
+def detect_shell_file_read(
+    agent: Agent, st: LoopState, tc: ToolCall, outcome: dict[str, Any],
+    *, turn: int = 0,
+) -> None:
+    """Nudge when the model uses shell commands to read files instead of read_file."""
+    if agent.config.permission_mode not in ("bench", "yolo"):
+        return
+    if tc.name != "run_command":
+        return
+    command = str(tc.args.get("command", ""))
+    if _FILE_READ_CMD.search(command):
+        inject_nudge(agent, st, turn, (
+            "[system] You used a shell command to read a file. Use the `read_file` "
+            "tool instead — it provides line numbers, caching, and is faster. "
+            "Use `run_command` only for running tests, build commands, or git operations."
+        ), min_gap=3)
+
+

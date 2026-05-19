@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
 from squishy.agent_safety import (
+    apply_quality_gate,
     can_nudge,
     check_goal_drift,
-    inject_consecutive_identical_nudge,
     inject_nudge,
     inject_test_failure_nudge,
     record_nudge,
@@ -88,7 +87,7 @@ class TestCheckGoalDrift:
 
         # env_error_count incremented to 3, then should_nudge fires
         assert len(agent.messages) >= 1
-        assert "GOAL DRIFT" in agent.messages[-1]["content"]
+        assert "drift" in agent.messages[-1]["content"].lower()
 
     def test_clears_env_fix_files_after_nudge(self):
         agent = _make_agent()
@@ -142,9 +141,10 @@ class TestTrackEditFailure:
 
         assert st.edit_failures_per_file["foo.py"] == 3
         assert st.total_edit_failures == 3
-        assert any("STOP guessing" in m["content"] for m in agent.messages)
+        assert any("failed edits" in m["content"].lower() for m in agent.messages)
 
-    def test_critical_at_5_failures(self):
+    def test_guidance_at_5_failures(self):
+        """At 5+ failures, guidance should still appear but not be CRITICAL."""
         agent = _make_agent()
         st = _make_state()
 
@@ -154,7 +154,9 @@ class TestTrackEditFailure:
         for i in range(5):
             track_edit_failure(agent, st, tc, outcome, turn=i + 1)
 
-        assert any("CRITICAL" in m["content"] for m in agent.messages)
+        # Should have guidance messages but no CRITICAL
+        assert any("old_str" in m["content"] for m in agent.messages)
+        assert not any("CRITICAL" in m["content"] for m in agent.messages)
 
     def test_passes_correct_turn(self):
         agent = _make_agent()
@@ -187,39 +189,42 @@ class TestTrackEditFailure:
         track_edit_failure(agent, st, tc, {"success": False}, turn=1)
         assert st.total_edit_failures == 0
 
-
-# -- inject_consecutive_identical_nudge ----------------------------------------
-
-class TestConsecutiveIdenticalNudge:
-    def test_warning_level(self):
+    def test_v6d_escape_hatch_fires_at_count_2_for_old_str_not_found(self):
+        """v6d: 2 consecutive `old_str not found` errors trigger a
+        targeted nudge that mandates a re-read, one turn earlier than
+        the generic 3-failure message."""
         agent = _make_agent()
         st = _make_state()
-        st.consecutive_identical = 2
 
-        inject_consecutive_identical_nudge(agent, st, turn=10)
+        tc = _tc("edit_file", {"path": "foo/bar.py", "old_str": "x"})
+        outcome = {"success": False, "error": "old_str not found in file."}
+
+        # First failure: no nudge yet (count 1, threshold is 2).
+        track_edit_failure(agent, st, tc, outcome, turn=1)
+        assert len(agent.messages) == 0
+
+        # Second failure: escape-hatch nudge fires.
+        track_edit_failure(agent, st, tc, outcome, turn=3)
         assert len(agent.messages) == 1
-        assert "WARNING" in agent.messages[0]["content"]
-        assert st.last_nudge_turn == 10
+        msg = agent.messages[0]["content"]
+        assert "STOP guessing" in msg
+        assert "foo/bar.py" in msg
+        assert 'read_file(path="foo/bar.py")' in msg
 
-    def test_critical_level(self):
+    def test_v6d_escape_hatch_skips_other_errors(self):
+        """v6d: only `old_str not found` triggers the escape hatch;
+        other failure modes (permission errors, etc.) still rely on
+        the generic 3-failure nudge."""
         agent = _make_agent()
         st = _make_state()
-        st.consecutive_identical = 5
 
-        inject_consecutive_identical_nudge(agent, st, turn=20)
-        assert len(agent.messages) == 1
-        assert "CRITICAL" in agent.messages[0]["content"]
-        assert st.last_nudge_turn == 20
+        tc = _tc("edit_file", {"path": "foo.py", "old_str": "x"})
+        outcome = {"success": False, "error": "permission denied"}
 
-    def test_includes_problem_file_hints(self):
-        agent = _make_agent()
-        st = _make_state()
-        st.consecutive_identical = 5
-        st.problem_files = {"src/core.py", "src/utils.py"}
-
-        inject_consecutive_identical_nudge(agent, st, turn=10)
-        content = agent.messages[0]["content"]
-        assert "src/core.py" in content or "src/utils.py" in content
+        track_edit_failure(agent, st, tc, outcome, turn=1)
+        track_edit_failure(agent, st, tc, outcome, turn=3)
+        # No escape-hatch nudge — only permission-style failures so far.
+        assert not any("STOP guessing" in m["content"] for m in agent.messages)
 
 
 # -- inject_test_failure_nudge -----------------------------------------------
@@ -321,7 +326,8 @@ class TestTestFailureNudge:
         content = agent.messages[-1]["content"]
         assert "no effect" in content.lower() or "DIFFERENT" in content
 
-    def test_critical_at_4_cycles(self):
+    def test_no_critical_at_4_cycles(self):
+        """At 4+ cycles, structured feedback fires but no CRITICAL escalation."""
         agent = _make_agent()
         st = _make_state()
         st.fix_verify_cycles = 4
@@ -337,7 +343,9 @@ class TestTestFailureNudge:
         inject_test_failure_nudge(agent, st, tc, outcome, turn=20)
 
         content = agent.messages[-1]["content"]
-        assert "CRITICAL" in content
+        # Should have structured feedback but NOT CRITICAL escalation
+        assert "1 failed" in content
+        assert "CRITICAL" not in content
 
     def test_skips_non_test_commands(self):
         agent = _make_agent()

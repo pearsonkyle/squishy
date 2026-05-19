@@ -18,8 +18,9 @@ from squishy.tools.plan import PLAN_TOOLS
 from squishy.tools.recall import RECALL_TOOLS
 from squishy.tools.scratchpad import SCRATCHPAD_TOOLS
 from squishy.tools.shell import SHELL_TOOLS
+from squishy.tools.web import WEB_TOOLS
 
-ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *PLAN_TOOLS, *SCRATCHPAD_TOOLS]
+ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *PLAN_TOOLS, *SCRATCHPAD_TOOLS, *WEB_TOOLS]
 REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
 # PromptFn returns either a bool (approve/decline) or a ("feedback", str) tuple
@@ -79,12 +80,18 @@ def openai_schemas(
     mode: str | None = None,
     *,
     plan_active: bool = False,
+    phase: str | None = None,
 ) -> list[dict[str, object]]:
-    """Return OpenAI-format tool schemas, optionally filtered by mode.
+    """Return OpenAI-format tool schemas, optionally filtered by mode and phase.
 
     When ``mode`` is None, all tools are returned (backwards compatibility).
     When ``mode`` is set, only tools permitted in that mode are exposed — so
     the model never sees ``write_file``/``edit_file`` in plan mode, etc.
+
+    When ``phase`` is set and ``mode`` is ``"bench"``, tools are further
+    filtered to only those available in that phase.  This is the primary
+    mechanism for phase-gated behaviour — the model literally cannot call
+    tools that are not in its schema for the current phase.
 
     ``plan_active`` should be True once a plan_task has been approved.
     The schema then hides ``plan_task`` so the model can't restart
@@ -94,6 +101,19 @@ def openai_schemas(
     """
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
+
+    # Phase-gated filtering for bench mode.
+    if phase is not None and mode == "bench":
+        from squishy.phase_machine import tools_for_phase
+        phase_tools = tools_for_phase(phase)
+        return [
+            t.openai_schema()
+            for t in ALL_TOOLS
+            if t.name in phase_tools
+            and not (plan_active and t.name == "plan_task")
+        ]
+
+    # Standard mode-based filtering (all other modes, or bench without phase).
     allowed = _get_allowed_tools(mode)
     return [
         t.openai_schema()

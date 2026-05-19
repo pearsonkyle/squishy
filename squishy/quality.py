@@ -22,6 +22,8 @@ def assess_response(
     tool_calls: list[Any],
     messages: list[dict[str, Any]],
     registry: dict[str, Any],
+    *,
+    edit_fail_paths: frozenset[str] = frozenset(),
 ) -> tuple[bool, str]:
     """Heuristic quality check on an assistant response's tool calls.
 
@@ -29,6 +31,9 @@ def assess_response(
         tool_calls: list of ToolCall objects (have .name and .args attrs).
         messages: full conversation history.
         registry: dict mapping tool name -> Tool object.
+        edit_fail_paths: set of file paths that recently had edit failures;
+            re-reads of these files are exempted from the excessive_reread gate
+            because the agent legitimately needs to re-read to get exact text.
 
     Returns:
         (ok, reason) — True if response is acceptable, False + reason if not.
@@ -75,22 +80,29 @@ def assess_response(
                             continue
                         return False, "repeated_tool_call"
 
-    # 4. Excessive same-file re-reads
+    # 4. Excessive same-file re-reads (exempt files with recent edit failures
+    #    OR successful edits — re-reading after a real edit is legitimate
+    #    verification, since the file content has actually changed).
     for tc in tool_calls:
         name = getattr(tc, "name", "")
         if name == "read_file":
             args = getattr(tc, "args", {})
+            read_path = str(args.get("path", ""))
+            # Allow re-reads of files where edit_file recently failed —
+            # the agent needs the exact text to construct a correct old_str.
+            if read_path in edit_fail_paths:
+                continue
+            # Allow re-reads of files we just successfully edited — the
+            # content changed, so the read isn't redundant.
+            if _successful_edit_for_path(messages, read_path):
+                continue
             # 4a. Exact same (path, offset, limit) read 2+ times in 8 turns
-            read_key = (
-                str(args.get("path", "")),
-                args.get("offset"),
-                args.get("limit"),
-            )
+            read_key = (read_path, args.get("offset"), args.get("limit"))
             count = _count_recent_reads(messages, read_key, lookback=8)
             if count >= 2:
                 return False, "excessive_reread"
             # 4b. Same file path (any range) read 3+ times in 10 turns
-            path_key = (str(args.get("path", "")), None, None)
+            path_key = (read_path, None, None)
             path_count = _count_recent_reads(
                 messages, path_key, lookback=10, match_path_only=True,
             )
@@ -140,6 +152,15 @@ def assess_response(
             total_searches = _count_recent_tool_calls_by_name(messages, "search_files", lookback=10)
             if total_searches >= 6:
                 return False, "repeated_search"
+            break
+
+    # 10. Excessive update_plan/finish_plan without intervening work (edit/run)
+    _PLAN_MGMT = {"update_plan", "finish_plan", "get_plan"}
+    for tc in tool_calls:
+        if getattr(tc, "name", "") in _PLAN_MGMT:
+            plan_count = _count_plan_without_work(messages, lookback=5)
+            if plan_count >= 3:
+                return False, "plan_loop"
             break
 
     return True, "ok"
@@ -198,6 +219,13 @@ def build_correction(reason: str) -> str:
         "repeated_search": (
             "You have searched for the same pattern multiple times. The results will not "
             "change. Use the results you already have or try a different search pattern."
+        ),
+        "plan_loop": (
+            "You have called update_plan/finish_plan multiple times without editing "
+            "code or running tests. Stop managing the plan and DO THE WORK: "
+            "1. Call `edit_file` to make your fix. "
+            "2. Call `run_command` to run the failing tests. "
+            "3. THEN update the plan with results."
         ),
     }
     return corrections.get(reason, f"Quality issue detected: {reason}. Please try again.")
@@ -271,6 +299,63 @@ def _edit_between_turns(
                 func = tc.get("function", {})
                 if func.get("name", "") in _EDIT_TOOLS:
                     return True
+    return False
+
+
+def _successful_edit_for_path(
+    messages: list[dict[str, Any]],
+    path: str,
+    lookback: int = 10,
+) -> bool:
+    """Check if a successful edit_file/write_file targeting ``path`` occurred
+    in the last ``lookback`` assistant turns.
+
+    A re-read after a successful edit is legitimate verification — the file
+    content has actually changed since the prior read, so the excessive_reread
+    gate should not block it.
+
+    Success is determined by inspecting the tool result message that follows
+    the edit call: if its parsed content has no ``error`` key, the edit
+    succeeded.
+    """
+    if not path:
+        return False
+    # First, find the slice of messages covering the last `lookback` assistant
+    # tool-call turns (counting from the end), then walk that slice forward so
+    # tool results come after their matching assistant calls.
+    asst_indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    ]
+    if not asst_indices:
+        return False
+    start = asst_indices[-lookback] if len(asst_indices) >= lookback else asst_indices[0]
+    pending: dict[str, str] = {}  # tool_call_id -> path
+    for msg in messages[start:]:
+        role = msg.get("role")
+        if role == "assistant" and msg.get("tool_calls"):
+            for tc in msg.get("tool_calls", []):
+                func = tc.get("function", {})
+                if func.get("name", "") not in _EDIT_TOOLS:
+                    continue
+                try:
+                    args = json.loads(func.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if str(args.get("path", "")) != path:
+                    continue
+                pending[tc.get("id", "")] = path
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            if tc_id in pending:
+                content = msg.get("content", "")
+                try:
+                    payload = json.loads(content) if isinstance(content, str) else content
+                except (json.JSONDecodeError, TypeError):
+                    payload = None
+                if isinstance(payload, dict) and not payload.get("error"):
+                    return True
+                pending.pop(tc_id, None)
     return False
 
 
@@ -534,3 +619,41 @@ def _count_recent_tool_with_arg(
                 if str(args.get(arg_key, "")) == arg_value:
                     count += 1
     return count
+
+
+_PLAN_MGMT_TOOLS = frozenset({"update_plan", "finish_plan", "get_plan"})
+_WORK_TOOLS = frozenset({"edit_file", "write_file", "run_command"})
+
+
+def _count_plan_without_work(
+    messages: list[dict[str, Any]],
+    lookback: int = 5,
+) -> int:
+    """Count consecutive plan-management turns without intervening work.
+
+    Walks backward through the last ``lookback`` assistant turns. Counts
+    turns that contain ONLY plan management tools (update_plan, finish_plan,
+    get_plan) with no edit_file/write_file/run_command.  Stops counting on
+    the first turn that contains a work tool.
+    """
+    streak = 0
+    seen_assistant = 0
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        seen_assistant += 1
+        if seen_assistant > lookback:
+            break
+        names = set()
+        for tc in msg.get("tool_calls", []):
+            func = tc.get("function", {})
+            name = func.get("name", "")
+            if name:
+                names.add(name)
+        if names & _WORK_TOOLS:
+            break  # work was done, stop counting
+        if names & _PLAN_MGMT_TOOLS:
+            streak += 1
+        # If a turn has neither plan-mgmt nor work tools (e.g. read_file),
+        # don't break the streak but don't count it either.
+    return streak

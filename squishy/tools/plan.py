@@ -147,6 +147,24 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         for item in ctx.pending_plan_evidence
         if isinstance(item, dict)
     ]
+
+    # Guard: in bench mode, don't let the model mark a step "done" with
+    # no evidence. This catches the pattern where the model calls
+    # update_plan right after plan approval without actually doing the work.
+    if (
+        status == "done"
+        and not evidence
+        and not note.strip()
+        and ctx.permission_mode == "bench"
+    ):
+        return ToolResult(False, error=(
+            "Cannot mark step as 'done' with no evidence of work. "
+            "You must first execute the step (e.g. call `edit_file`, "
+            "`run_command`, or `read_file`), then call update_plan. "
+            "If the step was already done before the plan was created, "
+            "provide a `note` explaining why."
+        ))
+
     step = plan.update_step(
         step_index=idx,
         status=status,

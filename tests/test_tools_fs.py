@@ -6,6 +6,7 @@ from squishy.tools.fs import (
     list_directory,
     read_file,
     search_files,
+    undo_edit,
     write_file,
 )
 
@@ -214,6 +215,27 @@ async def test_edit_file_unescape_not_applied_when_exact_match(ctx):
     assert r.data.get("note") is None
 
 
+async def test_edit_file_unescape_preserves_intentional_backslashes_in_new_str(ctx):
+    """When old_str is over-escaped but new_str has no escapes, new_str
+    should be written verbatim — not mangled by _unescape_str."""
+    await write_file.run(
+        {"path": "regex.py", "content": 'pattern = "hello"\n'}, ctx
+    )
+    # Model over-escapes old_str (sends \" for "), but new_str is plain text
+    # with no backslash sequences — it must NOT be unescaped.
+    r = await edit_file.run(
+        {
+            "path": "regex.py",
+            "old_str": 'pattern = \\"hello\\"',
+            "new_str": 'pattern = "world"',
+        },
+        ctx,
+    )
+    assert r.success, r.error
+    content = open(ctx.working_dir + "/regex.py").read() if isinstance(ctx.working_dir, str) else (ctx.working_dir / "regex.py").read_text()
+    assert 'pattern = "world"' in content
+
+
 async def test_edit_file_diagnostic_hint_on_miss(ctx):
     """When old_str not found, error should hint at the right line if the first
     line exists but indentation differs."""
@@ -227,3 +249,90 @@ async def test_edit_file_diagnostic_hint_on_miss(ctx):
     )
     assert not r.success
     assert "appears at line" in r.error
+
+
+async def test_undo_edit_reverts_last_change(ctx):
+    """undo_edit should restore the file to its pre-edit content."""
+    await write_file.run({"path": "undo_test.py", "content": "original\n"}, ctx)
+    r = await edit_file.run(
+        {"path": "undo_test.py", "old_str": "original", "new_str": "modified"}, ctx
+    )
+    assert r.success
+
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    assert "undo_test.py" in r.data["path"]
+
+    # read_file strips trailing newlines via splitlines()+join
+    r = await read_file.run({"path": "undo_test.py"}, ctx)
+    assert r.success
+    assert r.data["content"] == "original"
+
+
+async def test_undo_edit_empty_stack(ctx):
+    """undo_edit with no prior edits should fail gracefully."""
+    r = await undo_edit.run({}, ctx)
+    assert not r.success
+    assert "Nothing to undo" in r.error
+
+
+async def test_undo_edit_multiple(ctx):
+    """Multiple undo calls should revert edits in LIFO order."""
+    await write_file.run({"path": "multi.py", "content": "v1\n"}, ctx)
+    await edit_file.run({"path": "multi.py", "old_str": "v1", "new_str": "v2"}, ctx)
+    await edit_file.run({"path": "multi.py", "old_str": "v2", "new_str": "v3"}, ctx)
+
+    # Undo second edit: v3 -> v2
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    r = await read_file.run({"path": "multi.py"}, ctx)
+    assert r.data["content"] == "v2"
+
+    # Undo first edit: v2 -> v1
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    r = await read_file.run({"path": "multi.py"}, ctx)
+    assert r.data["content"] == "v1"
+
+
+async def test_edit_file_reports_unrecognized_keys(ctx):
+    """v6e: when required params are missing AND unknown params are present,
+    the error message should list the silently-ignored keys so the model
+    can correct its mental model on the next turn (react-datepicker-4282
+    pattern: model sent {start_line, end_line, offset, text} repeatedly)."""
+    r = await edit_file.run(
+        {
+            "path": "x.py",
+            "start_line": 1,
+            "end_line": 5,
+            "offset": 0,
+            "text": "...",
+        },
+        ctx,
+    )
+    assert not r.success
+    assert "Missing or non-string parameter(s)" in r.error
+    assert "Unrecognized parameters (silently ignored)" in r.error
+    # All four foreign keys should appear so the model knows exactly what
+    # was dropped.
+    for k in ("start_line", "end_line", "offset", "text"):
+        assert k in r.error
+
+
+async def test_edit_file_no_unrecognized_hint_when_only_aliases(ctx):
+    """v6e: the unrecognized-keys hint should not fire when the caller used
+    a recognized alias (e.g. file_path, original) but happened to omit a
+    required param.  Avoids false positives on legitimate alias usage."""
+    r = await edit_file.run(
+        {
+            "file_path": "x.py",
+            "original": "foo",
+            # missing new_str / new_string / etc.
+        },
+        ctx,
+    )
+    assert not r.success
+    assert "Missing or non-string parameter(s)" in r.error
+    assert "new_str" in r.error
+    # No unknown-keys clause should appear.
+    assert "Unrecognized parameters" not in r.error

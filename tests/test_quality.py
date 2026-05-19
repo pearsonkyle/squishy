@@ -440,3 +440,51 @@ def test_count_edit_verify_cycles_non_edit_breaks_streak():
     assert count <= 2  # streak breaks at write_file
 
 
+def test_plan_loop_detected():
+    """3+ consecutive update_plan turns without work triggers plan_loop."""
+    registry = {"update_plan": object(), "edit_file": object(), "run_command": object()}
+    messages: list[dict] = []
+    # 3 consecutive update_plan turns
+    for i in range(3):
+        messages.append(_assistant_msg_with_calls([
+            ("update_plan", {"step": i, "status": "done"})
+        ]))
+        messages.append({"role": "tool", "content": "ok"})
+    # Current turn: another update_plan
+    tc = FakeToolCall(name="update_plan", args={"step": 3, "status": "done"})
+    ok, reason = assess_response([tc], messages, registry)
+    assert ok is False
+    assert reason == "plan_loop"
+
+
+def test_plan_loop_not_triggered_with_work():
+    """update_plan turns with intervening edit_file should not trigger."""
+    registry = {"update_plan": object(), "edit_file": object(), "run_command": object()}
+    messages: list[dict] = []
+    # update_plan -> edit_file -> update_plan -> run_command -> update_plan
+    messages.append(_assistant_msg_with_calls([
+        ("update_plan", {"step": 0, "status": "done"})
+    ]))
+    messages.append({"role": "tool", "content": "ok"})
+    messages.append(_assistant_msg_with_calls([
+        ("edit_file", {"path": "f.py", "old_str": "a", "new_str": "b"})
+    ]))
+    messages.append({"role": "tool", "content": "ok"})
+    messages.append(_assistant_msg_with_calls([
+        ("update_plan", {"step": 1, "status": "done"})
+    ]))
+    messages.append({"role": "tool", "content": "ok"})
+    # Current turn: another update_plan
+    tc = FakeToolCall(name="update_plan", args={"step": 2, "status": "done"})
+    ok, reason = assess_response([tc], messages, registry)
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_plan_loop_correction_message():
+    """build_correction for plan_loop should mention edit_file."""
+    msg = build_correction("plan_loop")
+    assert "edit_file" in msg
+    assert "update_plan" in msg or "plan" in msg
+
+

@@ -19,10 +19,23 @@ DEFAULT_LIMIT = 10
 DEFAULT_DEPTH = 2
  
 _TOKEN_RX = re.compile(r"[A-Za-z0-9_]+")
- 
- 
+# Split camelCase/PascalCase: "JSONQuery" → ["JSON", "Query"]
+_CAMEL_RX = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
+
+
 def _tokens(s: str) -> set[str]:
-    return {t.lower() for t in _TOKEN_RX.findall(s) if len(t) >= 2}
+    """Extract searchable tokens, splitting snake_case and camelCase."""
+    tokens: set[str] = set()
+    for raw in _TOKEN_RX.findall(s):
+        low = raw.lower()
+        if len(low) >= 2:
+            tokens.add(low)
+        # Also split camelCase/PascalCase sub-words so "JSONQuery" yields
+        # {"jsonquery", "json", "query"} and matches query "json_query".
+        for part in _CAMEL_RX.findall(raw):
+            if len(part) >= 2:
+                tokens.add(part.lower())
+    return tokens
  
  
 def _score(node: Node, q_lower: str, q_tokens: set[str]) -> float:

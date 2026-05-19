@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Literal
 
-PermissionMode = str  # "plan" | "edits" | "yolo" | "bench"
+PermissionMode = Literal["plan", "edits", "yolo", "bench"]
 MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo", "bench")
 # Modes exposed to the interactive shift-tab cycle. "bench" is for the
 # benchmark runner only — it strips planning tools and enables aggressive
@@ -54,12 +55,20 @@ class Config:
     max_tool_output_chars: int = 32_000
     max_quality_retries: int = 3
     compaction_threshold: float = 0.7
-    max_stuck_turns: int = 3
-    max_system_nudges: int = 12  # cap total nudges to avoid flooding context
+    max_system_nudges: int = 8  # cap total nudges to avoid flooding context
     # Phase-budget thresholds (bench/yolo modes only).
-    max_explore_turns: int = 3
+    max_explore_turns: int = 8
+    max_plan_turns: int = 3
     max_fix_verify_cycles: int = 6
-    max_post_edit_read_turns: int = 4
+    # v2 auto-pytest finish gate: cap on how many times the harness will
+    # synthesize a pytest run when the agent tries to finish without
+    # verifying the F2P tests. Bench mode only.
+    max_auto_pytest_runs: int = 2
+    # v5 pre-finish F2P partial-pass gate: how many times
+    # ``check_finish_plan_gate`` may intercept ``finish_plan`` before
+    # releasing.  Bounded so a structurally unrunnable test environment
+    # cannot trap the agent.  Bench mode only.
+    max_finish_gate_intercepts: int = 2
     # Session persistence.
     session_dir: str = field(
         default_factory=lambda: os.environ.get(

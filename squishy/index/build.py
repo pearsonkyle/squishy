@@ -183,8 +183,10 @@ async def _build_index_async(
     """Async implementation of index building."""
     root_path = Path(cwd).resolve()
     
-    # Stage 1: Walk repo (sequential)
-    records, hit_cap = walk_repo(cwd)
+    # Stage 1: Walk repo (sequential).
+    # Pass prior file data so walk_repo can skip BLAKE2 when mtime is unchanged.
+    prior_data = prior.meta.file_data() if prior is not None else None
+    records, hit_cap = walk_repo(cwd, prior_file_data=prior_data)
     prior_files = _prior_file_map(prior)
 
     if not records:
@@ -223,6 +225,7 @@ async def _build_index_async(
     meta = IndexMeta(
         generated_at=time.time(),
         file_hashes={rec.path: rec.hash for rec in records},
+        file_mtimes={rec.path: rec.mtime for rec in records},
         squishy_version="",
         stats={
             "files": len(records),

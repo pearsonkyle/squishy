@@ -106,6 +106,46 @@ async def test_client_raises_llmerror_after_retries_exhausted():
     assert flaky.calls == 2
  
  
+async def test_client_retries_5xx_api_status_error():
+    """5xx APIStatusError (vLLM restart, OOM) should be retried like connection errors."""
+    from openai import APIStatusError
+
+    # Simulate a 502 Bad Gateway response.
+    resp = httpx.Response(502, request=httpx.Request("POST", "http://example.invalid/v1"))
+    err = APIStatusError("Bad Gateway", response=resp, body=None)
+    client, flaky = _client_with_fake_openai(fail_n=2, exc=err, max_retries=4)
+    original_wait = client_mod.wait_exponential
+    client_mod.wait_exponential = lambda **_: wait_none()  # type: ignore[assignment]
+    try:
+        result = await client.complete([{"role": "user", "content": "hi"}], [], stream=False)
+    finally:
+        client_mod.wait_exponential = original_wait
+        await client.aclose()
+
+    assert flaky.calls == 3
+    assert result.text == "ok"
+
+
+async def test_client_does_not_retry_4xx_api_status_error():
+    """4xx errors (auth, bad request) should NOT be retried."""
+    from openai import APIStatusError
+
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://example.invalid/v1"))
+    err = APIStatusError("Bad Request", response=resp, body=None)
+    client, flaky = _client_with_fake_openai(fail_n=5, exc=err, max_retries=4)
+    original_wait = client_mod.wait_exponential
+    client_mod.wait_exponential = lambda **_: wait_none()  # type: ignore[assignment]
+    try:
+        with pytest.raises(LLMError, match="400"):
+            await client.complete([{"role": "user", "content": "hi"}], [], stream=False)
+    finally:
+        client_mod.wait_exponential = original_wait
+        await client.aclose()
+
+    # Should fail on first call, no retries
+    assert flaky.calls == 1
+
+
 async def test_parse_tool_call_tolerates_malformed_json():
     from squishy.client import _parse_tool_call
  

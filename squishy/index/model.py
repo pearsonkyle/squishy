@@ -77,13 +77,14 @@ class Node:
 class IndexMeta:
     generated_at: float = 0.0  # unix timestamp
     file_hashes: dict[str, str] = field(default_factory=dict)  # path -> hash
+    file_mtimes: dict[str, float] = field(default_factory=dict)  # path -> mtime
     model: str = ""  # summarizer model id, empty if no summaries
     squishy_version: str = ""
     stats: dict[str, int] = field(default_factory=dict)  # {files, symbols, by_ext}
     summary_stats: dict[str, int] = field(default_factory=dict)  # {files_summarized, dirs_summarized}
  
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "generated_at": self.generated_at,
             "file_hashes": self.file_hashes,
             "model": self.model,
@@ -91,12 +92,23 @@ class IndexMeta:
             "stats": self.stats,
             "summary_stats": self.summary_stats,
         }
+        if self.file_mtimes:
+            d["file_mtimes"] = self.file_mtimes
+        return d
+
+    def file_data(self) -> dict[str, tuple[str, float]]:
+        """Return ``{path: (hash, mtime)}`` for mtime-aware walk_repo."""
+        return {
+            path: (h, self.file_mtimes.get(path, 0.0))
+            for path, h in self.file_hashes.items()
+        }
  
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> IndexMeta:
         return cls(
             generated_at=float(d.get("generated_at", 0.0)),
             file_hashes=dict(d.get("file_hashes", {})),
+            file_mtimes={k: float(v) for k, v in d.get("file_mtimes", {}).items()},
             model=str(d.get("model", "")),
             squishy_version=str(d.get("squishy_version", "")),
             stats=dict(d.get("stats", {})),

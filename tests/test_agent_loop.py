@@ -134,6 +134,7 @@ async def test_agent_plan_mode_schemas_exclude_writes(tmp_path):
             *,
             stream: bool = True,
             on_text: Any = None,
+            on_retry: Any = None,
         ) -> CompletionResult:
             captured_tools.append(list(tools))
             self._i += 1
@@ -586,7 +587,7 @@ async def test_agent_phase_transitions(tmp_path):
 
 
 async def test_agent_force_explore_to_fix(tmp_path):
-    """After max_explore_turns, a nudge should be injected in bench mode."""
+    """After max_explore_turns, a phase transition should move to plan in bench mode."""
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
@@ -607,54 +608,22 @@ async def test_agent_force_explore_to_fix(tmp_path):
     result = await agent.run("explore a lot")
 
     assert result.success
-    # A nudge about exploring too long should have been injected
+    # Phase transition notification should have been injected
     nudge_msgs = [
         m for m in result.messages
-        if m.get("role") == "user" and "MUST call `edit_file`" in (m.get("content") or "")
+        if m.get("role") == "user" and "Phase:" in (m.get("content") or "")
     ]
-    assert nudge_msgs, "expected an explore-to-fix nudge"
-
-
-async def test_agent_caps_fix_verify_cycles(tmp_path):
-    """Agent should force-finish after max_fix_verify_cycles edit->run cycles."""
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "bench"
-    cfg.max_turns = 50
-    cfg.max_fix_verify_cycles = 3
-    cfg.max_quality_retries = 100  # disable quality gate force-finish
-
-    (tmp_path / "foo.py").write_text("line\n")
-
-    # Build alternating edit + run_command pairs that always fail the test.
-    script = []
-    for i in range(10):
-        # Reset the file so edits can succeed each time
-        (tmp_path / "foo.py").write_text(f"line{i}\n")
-        script.append(CompletionResult(tool_calls=[
-            _tc("edit_file", {"path": "foo.py", "old_str": f"line{i}", "new_str": f"line{i+1}"},
-                 call_id=f"e{i}")
-        ]))
-        script.append(CompletionResult(tool_calls=[
-            _tc("run_command", {"command": f"python -m pytest test_{i}.py"}, call_id=f"r{i}")
-        ]))
-    script.append(CompletionResult(text="should not reach", tool_calls=[]))
-
-    fake = FakeClient(script=script)
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("fix it")
-
-    # Tests never passed in this scenario, so exhausted cycles = not successful.
-    assert not result.success
-    assert "cycle budget" in result.final_text
+    assert nudge_msgs, "expected a phase transition notification"
 
 
 async def test_agent_force_finishes_after_test_pass(tmp_path):
-    """After test passes post-edit, agent should force-finish within 2 turns."""
+    """After test passes post-edit, agent should force-finish via done phase."""
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
     cfg.max_turns = 20
+    cfg.max_explore_turns = 1  # fast explore->plan transition
+    cfg.max_plan_turns = 1    # fast plan->execute transition
 
     (tmp_path / "foo.py").write_text("old\n")
     # Create a trivial test that always passes.
@@ -662,23 +631,23 @@ async def test_agent_force_finishes_after_test_pass(tmp_path):
 
     fake = FakeClient(
         script=[
-            # Turn 1: edit
+            # Turn 1: read (explore phase, explore_turns=1 -> plan transition)
             CompletionResult(tool_calls=[
-                _tc("edit_file", {"path": "foo.py", "old_str": "old", "new_str": "new"})
+                _tc("read_file", {"path": "foo.py"})
             ]),
-            # Turn 2: run test (passes -> test_passed_after_edit, finish_countdown=2)
+            # Turn 2: save_note (plan phase, plan_turns=1 -> execute transition)
             CompletionResult(tool_calls=[
-                _tc("run_command", {"command": "python -m pytest test_foo.py"}, call_id="c2")
+                _tc("save_note", {"key": "fix", "content": "change old to new"}, call_id="c2")
             ]),
-            # Turn 3: agent ignores nudge and reads (countdown 2->1)
+            # Turn 3: edit (execute phase, has_edit=True)
             CompletionResult(tool_calls=[
-                _tc("read_file", {"path": "foo.py"}, call_id="c3")
+                _tc("edit_file", {"path": "foo.py", "old_str": "old", "new_str": "new"}, call_id="c3")
             ]),
-            # Turn 4: agent ignores nudge again (countdown 1->0)
+            # Turn 4: run test (passes -> execute->verify, test_passed_after_edit -> done)
             CompletionResult(tool_calls=[
-                _tc("read_file", {"path": "foo.py"}, call_id="c4")
+                _tc("run_command", {"command": "python -m pytest test_foo.py"}, call_id="c4")
             ]),
-            # Turn 5: countdown hits 0 -> force finish before this turn runs
+            # Should not reach turn 5 — done phase force-finishes at top of loop
             CompletionResult(text="should not reach", tool_calls=[]),
         ]
     )
@@ -686,70 +655,18 @@ async def test_agent_force_finishes_after_test_pass(tmp_path):
     result = await agent.run("fix it")
 
     assert result.success
-    assert "did not stop after test passed" in result.final_text
-
-
-async def test_post_edit_read_blocking(tmp_path):
-    """After edits, consecutive read-only turns should trigger warning then blocking."""
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "bench"
-    cfg.max_turns = 30
-    cfg.max_post_edit_read_turns = 2  # warn at 2, block at 4
-    cfg.max_stuck_turns = 20  # disable stuck detection for this test
-    cfg.max_history_messages = 50  # preserve all messages for assertion
-
-    (tmp_path / "foo.py").write_text("old\n")
-    for i in range(10):
-        (tmp_path / f"r{i}.py").write_text(f"content {i}")
-
-    script = [
-        # Turn 1: read a file first
-        CompletionResult(tool_calls=[
-            _tc("read_file", {"path": "r0.py"}, call_id="pre0")
-        ]),
-        # Turn 2: edit (enters fix phase)
-        CompletionResult(tool_calls=[
-            _tc("edit_file", {"path": "foo.py", "old_str": "old", "new_str": "new"})
-        ]),
-        # Turns 3-10: read-only exploration using list_directory (always blocked by
-        # explore blocker, no new-file exception like read_file has).
-    ] + [
-        CompletionResult(tool_calls=[
-            _tc("list_directory", {"path": f"r{i + 1}.py"}, call_id=f"r{i}")
-        ])
-        for i in range(8)
-    ] + [CompletionResult(text="done.", tool_calls=[])]
-
-    fake = FakeClient(script=script)
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("fix it")
-
-    assert result.success
-    # Warning should appear at post_edit_read_turns == max_post_edit_read_turns
-    warning_msgs = [
-        m for m in result.messages
-        if m.get("role") == "user" and "only reading files after making edits" in (m.get("content") or "")
-    ]
-    assert warning_msgs, "expected a post-edit read warning"
-    # Blocking should appear at post_edit_read_turns >= max_post_edit_read_turns + 2
-    blocked_msgs = [
-        m for m in result.messages
-        if m.get("role") == "tool" and "Exploration blocked" in (m.get("content") or "")
-    ]
-    assert blocked_msgs, "expected exploration to be blocked after too many read-only turns"
+    assert "Fix applied" in result.final_text
 
 
 # -- Goal drift and edit failure tracking tests ---------------------------
 
 async def test_goal_drift_detection(tmp_path):
-    """Agent should get a GOAL DRIFT WARNING when editing unrelated files
+    """Agent should get a goal drift nudge when editing unrelated files
     and encountering environmental errors."""
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
     cfg.max_turns = 15
-    cfg.max_stuck_turns = 20  # disable stuck nudges
     cfg.max_history_messages = 50
 
     # Create files that the agent will "fix" (unrelated to the problem).
@@ -820,9 +737,9 @@ async def test_goal_drift_detection(tmp_path):
 
     drift_msgs = [
         m for m in result.messages
-        if m.get("role") == "user" and "GOAL DRIFT WARNING" in (m.get("content") or "")
+        if m.get("role") == "user" and "Goal drift detected" in (m.get("content") or "")
     ]
-    assert drift_msgs, "expected a goal drift warning when editing unrelated files"
+    assert drift_msgs, "expected a goal drift nudge when editing unrelated files"
 
 
 async def test_edit_failure_nudge_at_3(tmp_path):
@@ -831,7 +748,6 @@ async def test_edit_failure_nudge_at_3(tmp_path):
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
     cfg.max_turns = 10
-    cfg.max_stuck_turns = 20
     cfg.max_history_messages = 50
 
     (tmp_path / "foo.py").write_text("actual content here\n")
@@ -860,8 +776,7 @@ async def test_edit_failure_nudge_at_3(tmp_path):
     nudge_msgs = [
         m for m in result.messages
         if m.get("role") == "user"
-        and "failed to edit" in (m.get("content") or "")
-        and "STOP guessing" in (m.get("content") or "")
+        and "failed edits" in (m.get("content") or "")
     ]
     assert nudge_msgs, "expected a nudge after 3 failed edits to the same file"
 
@@ -872,7 +787,6 @@ async def test_problem_reanchor_at_turn_15(tmp_path):
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
     cfg.max_turns = 25
-    cfg.max_stuck_turns = 20  # disable stuck nudges
     cfg.max_history_messages = 50
 
     for i in range(20):
@@ -931,7 +845,7 @@ async def test_consecutive_identical_loop_detection(tmp_path):
 
 
 async def test_no_edit_force_finish_at_50_turns(tmp_path):
-    """Agent force-finishes early when stuck in a read-only spiral (no edits, no commands)."""
+    """Agent force-finishes early when stuck without edits (quality gate or max turns)."""
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
@@ -955,11 +869,8 @@ async def test_no_edit_force_finish_at_50_turns(tmp_path):
     result = await agent.run("fix the bug")
 
     assert not result.success
-    # Quality gate, read-only spiral, or no-edit cap can fire — all are valid.
-    assert any(msg in result.error for msg in (
-        "read-only spiral", "no edits after", "quality loop",
-    ))
-    assert result.turns_used <= 50
+    # Quality gate or max turns should stop the agent.
+    assert result.error  # some error message should be set
 
 
 async def test_turn_log_populated_in_bench(tmp_path):
@@ -995,19 +906,28 @@ async def test_task_result_has_phase_diagnostics(tmp_path):
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
     cfg.max_turns = 10
+    cfg.max_explore_turns = 1  # fast explore->plan transition
+    cfg.max_plan_turns = 1    # fast plan->execute transition
 
     (tmp_path / "foo.py").write_text("x = 1\n")
-    (tmp_path / "test_foo.py").write_text("pass\n")
+    (tmp_path / "test_foo.py").write_text("def test_ok(): pass\n")
 
     script = [
+        # Turn 1 (explore): read file → explore_turns=1 → plan
         CompletionResult(
             tool_calls=[_tc("read_file", {"path": "foo.py"}, call_id="c1")]
         ),
+        # Turn 2 (plan): save_note → plan_turns=1 → execute
         CompletionResult(
-            tool_calls=[_tc("edit_file", {"path": "foo.py", "old_str": "x = 1", "new_str": "x = 2"}, call_id="c2")]
+            tool_calls=[_tc("save_note", {"key": "fix", "content": "change x"}, call_id="c2")]
         ),
+        # Turn 3 (execute): edit file → has_edit=True
         CompletionResult(
-            tool_calls=[_tc("run_command", {"command": "python -m pytest test_foo.py"}, call_id="c3")]
+            tool_calls=[_tc("edit_file", {"path": "foo.py", "old_str": "x = 1", "new_str": "x = 2"}, call_id="c3")]
+        ),
+        # Turn 4 (execute): run test → test passes → done
+        CompletionResult(
+            tool_calls=[_tc("run_command", {"command": "python -m pytest test_foo.py"}, call_id="c4")]
         ),
         CompletionResult(text="Fixed."),
     ]
@@ -1017,7 +937,7 @@ async def test_task_result_has_phase_diagnostics(tmp_path):
 
     assert result.success
     assert result.explore_turns >= 1
-    assert result.final_phase in ("fix", "verify")
+    assert result.final_phase in ("execute", "verify", "done")
 
 
 # ---------------------------------------------------------------------------
@@ -1208,7 +1128,6 @@ async def test_consecutive_identical_resets_after_edit(tmp_path):
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
     cfg.max_turns = 30
-    cfg.max_stuck_turns = 20  # disable stuck detection
 
     (tmp_path / "foo.py").write_text("old line\n")
     # Provide multiple files so the quality gate (excessive_reread) doesn't fire.

@@ -27,19 +27,22 @@ READ_ONLY_TOOLS = frozenset({
 MUTATING_TOOLS = frozenset({
     "write_file",
     "edit_file",
+    "undo_edit",
+})
+
+WEB_TOOLS = frozenset({
+    "fetch_url",
 })
 
 SHELL_TOOL_NAMES = frozenset({
     "run_command",
 })
 
-ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOL_NAMES
+ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOL_NAMES | WEB_TOOLS
 
-# Plan tools excluded from bench mode to reduce schema size and prevent
-# the model from wasting turns on planning instead of fixing.
-_PLAN_TOOLS = frozenset({"plan_task", "update_plan", "get_plan", "finish_plan"})
-
-BENCH_TOOLS = ALL_TOOLS - _PLAN_TOOLS
+# Bench mode is air-gapped — `fetch_url` cannot work and just bloats the
+# tool schema (~150 tokens × every bench call).  Drop it.
+BENCH_TOOLS = ALL_TOOLS - WEB_TOOLS
 
 # Shell commands allowed in plan mode. Single-word binaries are matched on the
 # first token; two-word entries (e.g. "git log") match on the first two.

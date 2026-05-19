@@ -30,6 +30,7 @@ class _ScriptedClient:
         *,
         stream: bool = True,
         on_text: Any = None,
+        on_retry: Any = None,
     ) -> CompletionResult:
         if self._i >= len(self._script):
             return CompletionResult(text="done.", tool_calls=[])
@@ -126,6 +127,60 @@ def test_tool_schemas_differ_by_mode():
     assert "read_file" in edits_names
 
 
+async def test_chat_session_multi_turn(tmp_path):
+    """ChatSession should persist agent state across multiple send() calls."""
+    script = [
+        # Turn 1: create a file
+        CompletionResult(
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="write_file",
+                    args={"path": "app.py", "content": "x = 1\n"},
+                )
+            ]
+        ),
+        CompletionResult(text="Created app.py", tool_calls=[]),
+        # Turn 2: edit the file (agent remembers it exists)
+        CompletionResult(
+            tool_calls=[
+                ToolCall(
+                    id="c2",
+                    name="edit_file",
+                    args={"path": "app.py", "old_str": "x = 1", "new_str": "x = 42"},
+                )
+            ]
+        ),
+        CompletionResult(text="Updated x to 42", tool_calls=[]),
+    ]
+    with patch("squishy.api.Client", return_value=_ScriptedClient(script)):
+        async with Squishy(model="fake") as sq:
+            async with sq.chat(working_dir=str(tmp_path)) as session:
+                r1 = await session.send("create app.py")
+                assert r1.success
+                assert "app.py" in r1.files_created
+
+                r2 = await session.send("change x to 42")
+                assert r2.success
+
+    assert (tmp_path / "app.py").read_text() == "x = 42\n"
+
+
+async def test_chat_session_on_text_callback(tmp_path):
+    """ChatSession should forward text chunks to the on_text callback."""
+    script = [CompletionResult(text="hello from chat", tool_calls=[])]
+    chunks: list[str] = []
+
+    with patch("squishy.api.Client", return_value=_ScriptedClient(script)):
+        async with Squishy(model="fake") as sq:
+            async with sq.chat(
+                working_dir=str(tmp_path), on_text=chunks.append
+            ) as session:
+                await session.send("say hi")
+
+    assert "".join(chunks) == "hello from chat"
+
+
 async def test_mode_switch_between_runs(tmp_path):
     """Running with different permission modes should use different tool schemas."""
     schemas_seen: list[list[dict]] = []
@@ -156,3 +211,36 @@ async def test_mode_switch_between_runs(tmp_path):
     # Plan shouldn't have write tools, edits should.
     assert "edit_file" not in plan_tools
     assert "edit_file" in edits_tools
+
+
+def test_squishy_api_fields_cover_config():
+    """Regression: every Config field that can be set programmatically
+    should also be settable on Squishy.
+
+    This protects against latent gaps where Config grows a knob but the
+    public API silently drops it (the v25 audit found 4 such fields).
+    """
+    from dataclasses import fields as dc_fields
+    from squishy.api import Squishy
+    from squishy.config import Config
+
+    config_field_names = {
+        f.name for f in dc_fields(Config)
+        # working_dir is set per-call via Squishy.run(working_dir=...)
+        if f.name != "working_dir"
+    }
+    squishy_field_names = {
+        f.name for f in dc_fields(Squishy)
+        if not f.name.startswith("_")
+    }
+    missing = config_field_names - squishy_field_names
+    assert not missing, (
+        f"Squishy dataclass missing Config fields: {sorted(missing)}"
+    )
+
+
+def test_bench_tools_excludes_fetch_url():
+    """B6: bench mode is air-gapped so fetch_url should not appear in
+    the tool schema."""
+    from squishy.tool_restrictions import BENCH_TOOLS
+    assert "fetch_url" not in BENCH_TOOLS

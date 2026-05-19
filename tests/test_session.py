@@ -10,6 +10,7 @@ import pytest
 from squishy.session import (
     Session,
     append_messages,
+    cleanup_sessions,
     create_session,
     export_training,
     export_training_to_file,
@@ -268,3 +269,29 @@ def test_export_strips_trailing_tool_messages(tmp_sessions: str) -> None:
     msgs = record["messages"]
     # The tool message at the end should be stripped.
     assert msgs[-1]["role"] == "assistant"
+
+
+def test_cleanup_sessions_removes_old(tmp_sessions: str) -> None:
+    """Sessions older than max_age_days should be removed."""
+    # Create a session and backdate its meta.json.
+    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
+    meta_path = Path(tmp_sessions) / sess.id / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["updated_at"] = "2020-01-01T00:00:00+00:00"
+    meta_path.write_text(json.dumps(meta))
+
+    # Create a recent session that should survive.
+    recent = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
+
+    removed = cleanup_sessions(max_age_days=30, root=tmp_sessions)
+    assert removed == 1
+    assert not (Path(tmp_sessions) / sess.id).exists()
+    assert (Path(tmp_sessions) / recent.id).exists()
+
+
+def test_cleanup_sessions_keeps_recent(tmp_sessions: str) -> None:
+    """Recent sessions should not be removed."""
+    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
+    removed = cleanup_sessions(max_age_days=30, root=tmp_sessions)
+    assert removed == 0
+    assert (Path(tmp_sessions) / sess.id).exists()

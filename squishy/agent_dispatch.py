@@ -6,7 +6,7 @@ import os
 import time
 from typing import TYPE_CHECKING, Any
 
-from squishy.agent_state import LoopState, brief
+from squishy.agent_state import LoopState, brief, is_test_path
 from squishy.plan_state import clear_plan, save_plan
 from squishy.tools import ToolResult, dispatch
 
@@ -67,6 +67,54 @@ async def run_tool(agent: Agent, turn: int, tc: ToolCall) -> dict[str, Any]:
                 agent.display.stats.commands_run += 1
 
     append_tool_result(agent, tc, message=outcome.to_message())
+
+    # F1b: stamp the read path on the tool message so snip_old_tool_results
+    # can build an accurate stub without scraping the (possibly truncated)
+    # JSON body. Use the path string as-given by the agent — relative paths
+    # are most useful to the model anyway.
+    if tc.name == "read_file" and outcome.success and agent.messages:
+        last_msg = agent.messages[-1]
+        if last_msg.get("role") == "tool":
+            last_msg["_squishy_read_path"] = str(tc.args.get("path", ""))
+
+    # B3: invalidate prior recall results that mention this exact file
+    # path once the agent has actually read the file.  Recall returns
+    # path/symbol summaries for ~10 entries; once read_file lands on
+    # one of those paths, the recall hit is redundant.
+    if tc.name == "read_file" and outcome.success:
+        _invalidate_superseded_recall(agent, str(tc.args.get("path", "")))
+
+    # In bench mode, plan approval is NOT terminal — nudge the model to execute.
+    if plan_approved and agent.config.permission_mode in ("bench", "yolo"):
+        # Gate the EXECUTE nudge on prior exploration. If the agent hasn't
+        # read at least one test file AND one non-test source file, push it
+        # to explore first instead of jumping straight to edits — wrong-fix
+        # patches frequently trace to skipping the test-file read.
+        read_paths = list(agent.tool_ctx.files_read.keys())
+        read_test = any(is_test_path(p) for p in read_paths)
+        read_source = any(not is_test_path(p) for p in read_paths)
+        if not (read_test and read_source):
+            missing = []
+            if not read_test:
+                missing.append("a failing-test file")
+            if not read_source:
+                missing.append("a source file you plan to edit")
+            agent.messages.append({"role": "user", "content": (
+                f"[system] Plan approved, but you have not yet read "
+                f"{' and '.join(missing)}. Before editing:\n"
+                "1. `read_file` on each failing-test file (path is in the test "
+                "ID before `::`) — the new tests follow these conventions.\n"
+                "2. `read_file` on the source file(s) you plan to edit.\n"
+                "Then call `edit_file` to implement your fix."
+            )})
+        else:
+            agent.messages.append({"role": "user", "content": (
+                "[system] Plan approved. Now EXECUTE the plan:\n"
+                "1. `edit_file` to implement your fix.\n"
+                "2. `run_command` to verify the failing tests now pass.\n"
+                "3. `update_plan(step_index=N, status=\"done\")` AFTER each step is actually done.\n"
+                "Do NOT call update_plan before doing the actual work (edit/run)."
+            )})
 
     # Semantic anchoring: tag important tool results so they survive trimming.
     if agent.messages and agent.messages[-1].get("role") == "tool":
@@ -177,10 +225,47 @@ def append_tool_result(agent: Agent, tc: ToolCall, message: str) -> None:
     })
 
 
+def _invalidate_superseded_recall(agent: Agent, read_path: str) -> None:
+    """Replace prior recall tool results that explicitly mention *read_path*
+    with a one-line stub.  Exact-path match only — substring fuzzing risks
+    invalidating useful entries that share a parent directory name.
+    """
+    if not read_path:
+        return
+    norm = read_path.replace("\\", "/").lstrip("./")
+    for m in agent.messages[:-1]:
+        if m.get("role") != "tool" or m.get("name") != "recall":
+            continue
+        content = m.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        if content.startswith("[recall result superseded"):
+            continue
+        # Look for `"path": "..."` JSON entries that exactly match.
+        # The recall tool emits paths in its result objects.
+        check_norm = content.replace("\\", "/")
+        # Quoted-path match guards against partial substring collisions.
+        if (
+            f'"{norm}"' in check_norm
+            or f'"./{norm}"' in check_norm
+            or f': "{norm}"' in check_norm
+        ):
+            m["content"] = (
+                f"[recall result superseded by read_file({read_path})]"
+            )
+
+
 def track_tool_outcome(
     agent: Agent, st: LoopState, tc: ToolCall, outcome: dict[str, Any],
+    turn: int = 0,
 ) -> None:
-    """Update loop state based on a tool call outcome."""
+    """Update loop state based on a tool call outcome.
+
+    ``turn`` (default 0 for callers that don't care) stamps
+    ``last_edit_turn`` / ``last_f2p_test_turn`` for the v2 auto-pytest
+    finish gate. Default-0 keeps the gate inert when it isn't passed,
+    so existing callers stay safe.
+    """
     if outcome["success"]:
         st.consecutive_errors = 0
         if tc.name in ("read_file", "list_directory", "search_files"):
@@ -204,6 +289,7 @@ def track_tool_outcome(
                 st.total_quality_violations += 1
             else:
                 st.files_edited.add(str(tc.args.get("path", "?")))
+                st.last_edit_turn = turn
                 # Clear edit-fail exemption after successful edit.
                 edit_path = str(tc.args.get("path", ""))
                 abs_edit = os.path.join(agent.tool_ctx.working_dir, edit_path)
@@ -213,13 +299,77 @@ def track_tool_outcome(
                     pass
                 agent.tool_ctx.edit_fail_files.discard(abs_edit)
                 st.recent_edit_fail_files.discard(edit_path)
+                # Cooldown: a real edit means the agent is making progress
+                # again — decay accumulated quality violations so old
+                # exploration-phase noise doesn't trip the post-edit
+                # force-finish gate (was hitting at violation 4 even after
+                # the agent recovered and edited).
+                if st.total_quality_violations > 0:
+                    st.total_quality_violations = max(
+                        0, st.total_quality_violations - 2,
+                    )
         elif tc.name == "run_command":
             st.commands_run += 1
             cmd = str(tc.args.get("command", ""))
-            from squishy.agent_state import is_test_command, test_covers_fail_to_pass
+            from squishy.agent_state import (
+                distinct_f2p_files,
+                f2p_files_in_command,
+                is_test_command,
+                test_covers_fail_to_pass,
+            )
+            exit_code = outcome.get("data", {}).get("exit_code")
+            # v2: stamp the F2P-test turn whenever pytest hits any F2P file,
+            # regardless of pass/fail — the auto-pytest finish gate just needs
+            # to know the agent attempted verification since its last edit.
+            if is_test_command(cmd) and f2p_files_in_command(
+                cmd, st.fail_to_pass_tests,
+            ):
+                st.last_f2p_test_turn = turn
+                # v5: capture failing F2P test IDs + assertion errors for
+                # the pre-finish partial-pass gate.  Runs regardless of
+                # exit_code because pytest exits non-zero on failure but
+                # the structured ``test_summary`` (failed/errors counts)
+                # is the source of truth.  Filter to F2P-listed tests so
+                # the gate message stays signal-rich.
+                test_summary = outcome.get("data", {}).get("test_summary")
+                if test_summary and (
+                    test_summary.get("failed", 0) > 0
+                    or test_summary.get("errors", 0) > 0
+                ):
+                    f2p_set = set(st.fail_to_pass_tests)
+                    captured: list[dict[str, str]] = []
+                    for fail in test_summary.get("failures", []):
+                        tid = str(fail.get("test", ""))
+                        # Prefix-match in either direction: handles
+                        # parametrized tests (test_foo[3d]) where F2P
+                        # names just the base, and handles F2P entries
+                        # that include params the test command omits.
+                        is_f2p = tid in f2p_set or any(
+                            tid.startswith(f) or f.startswith(tid)
+                            for f in st.fail_to_pass_tests
+                        )
+                        if is_f2p:
+                            captured.append({
+                                "test": tid,
+                                "error": str(fail.get("error", "")),
+                            })
+                    st.last_f2p_failures = captured[:5]
+                    # v6b: when pytest reported errors but produced no
+                    # parseable per-test failure lines, surface a flag
+                    # so check_finish_plan_gate can emit a "fix
+                    # collection first" hint instead of falling silent.
+                    st.last_f2p_collection_error = (
+                        not captured and test_summary.get("errors", 0) > 0
+                    )
+                elif test_summary and test_summary.get("failed", 0) == 0 \
+                        and test_summary.get("errors", 0) == 0:
+                    # Clean run — clear stale failures so the finish_plan
+                    # gate doesn't re-cite stale IDs after an edit fixes
+                    # the previously-failing tests.
+                    st.last_f2p_failures = []
+                    st.last_f2p_collection_error = False
             if (
-                st.files_edited
-                and outcome.get("data", {}).get("exit_code") == 0
+                exit_code == 0
                 and is_test_command(cmd)
                 and test_covers_fail_to_pass(cmd, st.fail_to_pass_tests)
             ):
@@ -228,8 +378,35 @@ def track_tool_outcome(
                 test_summary = outcome.get("data", {}).get("test_summary")
                 if test_summary and test_summary.get("failed", 0) > 0:
                     pass  # False positive — failures detected in output
+                elif st.files_edited:
+                    # F5: record which F2P file(s) this command covered.
+                    # `test_passed_after_edit` only flips True when *every*
+                    # distinct F2P file has been exercised by a passing run.
+                    # In bench mode the phase machine performs the same
+                    # accounting against PhaseState; the LoopState copy is
+                    # kept here so non-bench callers (and diagnostics) see
+                    # the same view.
+                    covered = f2p_files_in_command(cmd, st.fail_to_pass_tests)
+                    st.f2p_files_covered.update(covered)
+                    needed = distinct_f2p_files(st.fail_to_pass_tests)
+                    if not needed or st.f2p_files_covered >= needed:
+                        st.test_passed_after_edit = True
                 else:
-                    st.test_passed_after_edit = True
+                    # Tests pass BEFORE any edits — the workspace already has
+                    # the old code, so the eval harness will apply different
+                    # test expectations.  Warn the agent.
+                    from squishy.agent_safety import inject_nudge
+                    inject_nudge(agent, st, 0, (
+                        "[system] WARNING: The listed failing tests PASSED without "
+                        "any edits. This likely means the test file in the workspace "
+                        "does not yet contain the updated test expectations that will "
+                        "be applied during evaluation.\n"
+                        "1. Read the test file carefully — the test may need to call "
+                        "functions with different arguments or check different behavior.\n"
+                        "2. Read the problem statement again to understand what "
+                        "source code change is expected.\n"
+                        "3. Do NOT assume the bug is already fixed."
+                    ), min_gap=0)
     elif tc.name == "run_command":
         st.commands_run += 1
         st.consecutive_errors = 0

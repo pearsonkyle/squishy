@@ -16,11 +16,23 @@ class LLMError(SquishyError):
 
 
 class AgentTimeout(SquishyError):
-    """Overall task wall-clock timeout exceeded."""
+    """Overall task wall-clock timeout exceeded.
+
+    May carry a ``partial_result`` attribute (TaskResult) built from the
+    in-progress LoopState so callers (the bench harness) can recover the
+    transcript / turn_log accumulated up to the timeout.
+    """
+
+    partial_result: object | None = None  # TaskResult; loose typing avoids cycle
 
 
 class AgentCancelled(SquishyError):
-    """Task cancelled by the caller (e.g. Ctrl-C, asyncio.CancelledError)."""
+    """Task cancelled by the caller (e.g. Ctrl-C, asyncio.CancelledError).
+
+    May carry a ``partial_result`` like AgentTimeout.
+    """
+
+    partial_result: object | None = None
 
 
 class BenchError(SquishyError):

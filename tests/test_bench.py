@@ -235,9 +235,11 @@ def test_classify_error_maps_common_cases():
 
 
 def test_build_prompt_includes_env_error_guidance():
-    """Bench mode block contains the expected mode header."""
+    """Bench mode block contains the expected mode header and phase-gated info."""
     from squishy.context import _mode_block
 
     bench_block = _mode_block("bench", "/tmp")
     assert "bench" in bench_block
-    assert "No approval prompts" in bench_block
+    assert "phase-gated" in bench_block
+    assert "explore" in bench_block
+    assert "execute" in bench_block

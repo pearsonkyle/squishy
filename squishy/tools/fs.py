@@ -62,8 +62,21 @@ def _unescape_str(s: str) -> str:
     result = result.replace("\\'", "'")
     result = result.replace("\\n", "\n")
     result = result.replace("\\t", "\t")
-    # Don't unescape \\ → \ (that would break actual backslash content)
+    # Don't unescape \\ → \ here (that would break actual backslash content);
+    # see _collapse_double_backslash for the last-resort handler.
     return result
+
+
+def _collapse_double_backslash(s: str) -> str:
+    """Collapse literal ``\\\\`` → ``\\`` in model-generated strings.
+
+    Used only as a last-resort fallback after _unescape_str fails to match.
+    Models occasionally re-escape backslashes from a tool's JSON-rendered error
+    message (e.g. shell escapes like ``\\(`` rendered as ``\\\\(`` in JSON, which
+    the model copies back verbatim). Caller must guard with a uniqueness check
+    to avoid corrupting content that legitimately uses ``\\\\``.
+    """
+    return s.replace("\\\\", "\\") if "\\\\" in s else s
 
 
 def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
@@ -100,7 +113,7 @@ def _collect_match_context(
  
  
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    path = args.get("path")
+    path = args.get("path") or args.get("file_path") or args.get("file")
     if not isinstance(path, str):
         return ToolResult(False, error="`path` is required (string)")
     abs_path, err = _safe_resolve(path, ctx.working_dir)
@@ -198,8 +211,8 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
  
 async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    path = args.get("path")
-    content = args.get("content")
+    path = args.get("path") or args.get("file_path") or args.get("file")
+    content = next((args[k] for k in ("content", "text", "data") if k in args and args[k] is not None), None)
     if not isinstance(path, str) or not isinstance(content, str):
         return ToolResult(False, error="`path` and `content` are required strings")
     abs_path, err = _safe_resolve(path, ctx.working_dir)
@@ -224,6 +237,25 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             ),
         )
 
+    # Bench mode: block creating test files and reproduction scripts.
+    if ctx.permission_mode == "bench":
+        basename = os.path.basename(abs_path).lower()
+        rel = os.path.relpath(abs_path, ctx.working_dir)
+        is_test_file = (
+            basename.startswith("test_")
+            or "/tests/" in rel or rel.startswith("tests/")
+            or "repro" in basename or "reproduction" in basename
+        )
+        if is_test_file:
+            return ToolResult(
+                False,
+                error=(
+                    f"write_file refused — creating test/reproduction files is not "
+                    f"allowed in bench mode. Fix the SOURCE code instead.\n"
+                    f"Use `edit_file` on the existing source file to apply your fix."
+                ),
+            )
+
     os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(content)
@@ -238,12 +270,49 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
  
 async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    path = args.get("path")
-    old_str = args.get("old_str")
-    new_str = args.get("new_str")
+    # Accept common aliases for parameter names (models sometimes use wrong names).
+    _OLD_KEYS = ("old_str", "old_string", "old_text", "original", "search", "insert_after")
+    _NEW_KEYS = ("new_str", "new_string", "new_text", "replacement", "replace", "new_lines")
+    # v6e: full set of keys we recognize, used to flag silently-ignored params
+    # in the missing-required-param error path below.
+    _KNOWN_EDIT_KEYS = (
+        {"path", "file_path", "file", "replace_all", "_tool_arg_error"}
+        | set(_OLD_KEYS) | set(_NEW_KEYS)
+    )
+    path = args.get("path") or args.get("file_path") or args.get("file")
+    old_str = next((args[k] for k in _OLD_KEYS if k in args and args[k] is not None), None)
+    new_str = next((args[k] for k in _NEW_KEYS if k in args and args[k] is not None), None)
     replace_all = bool(args.get("replace_all", False))
-    if not isinstance(path, str) or not isinstance(old_str, str) or not isinstance(new_str, str):
-        return ToolResult(False, error="`path`, `old_str`, `new_str` are required strings")
+    missing = []
+    if not isinstance(path, str):
+        missing.append("path")
+    if not isinstance(old_str, str):
+        missing.append("old_str")
+    if not isinstance(new_str, str):
+        missing.append("new_str")
+    if missing:
+        # v6e: also surface any unrecognized keys the caller sent — when a
+        # model uses a different schema (e.g. {start_line, end_line, text}),
+        # silently ignoring those keys leads to repeat failures on the next
+        # turn.  Listing them tells the model exactly which params were
+        # dropped so it can correct its mental model.
+        unknown = sorted(set(args) - _KNOWN_EDIT_KEYS)
+        extra_hint = (
+            f" Unrecognized parameters (silently ignored): {', '.join(unknown)}."
+            if unknown else ""
+        )
+        # Surface the accepted aliases so the model can self-correct on retry.
+        return ToolResult(
+            False,
+            error=(
+                f"Missing or non-string parameter(s): {', '.join(missing)}. "
+                f"Required parameters are `path`, `old_str`, `new_str` (all strings). "
+                f"Accepted aliases: path/file_path/file, "
+                f"old_str/old_string/old_text/original/search, "
+                f"new_str/new_string/new_text/replacement/replace."
+                f"{extra_hint}"
+            ),
+        )
  
     abs_path, err = _safe_resolve(path, ctx.working_dir)
     if err:
@@ -253,6 +322,9 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     with open(abs_path, encoding="utf-8", errors="replace") as f:
         text = f.read()
+
+    def _save_undo() -> None:
+        ctx.undo_stack.append((abs_path, text))
 
     count = text.count(old_str)
     if count == 0:
@@ -272,7 +344,9 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             old_line_count = old_stripped.count("\n") + 1
             end_line = start_line + old_line_count
 
-            new_stripped = "\n".join(line.rstrip() for line in new_str.split("\n"))
+            # Unescape new_str if it contains literal escape sequences
+            _new_str = _unescape_str(new_str) if "\\" in new_str else new_str
+            new_stripped = "\n".join(line.rstrip() for line in _new_str.split("\n"))
             before = "\n".join(orig_lines[:start_line])
             after = "\n".join(orig_lines[end_line:])
             parts = [p for p in (before, new_stripped, after) if p]
@@ -280,11 +354,12 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             # Preserve trailing newline if original had one
             if text.endswith("\n") and not new_text.endswith("\n"):
                 new_text += "\n"
+            _save_undo()
             with open(abs_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
             _invalidate_read_cache(ctx, abs_path)
             old_lines = len(old_str.splitlines()) or 1
-            new_lines = len(new_str.splitlines()) or 1
+            new_lines = len(_new_str.splitlines()) or 1
             return ToolResult(
                 True,
                 data={
@@ -293,7 +368,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                     "old_lines": old_lines,
                     "new_lines": new_lines,
                     "old_str": old_str,
-                    "new_str": new_str,
+                    "new_str": _new_str,
                     "note": "trailing whitespace normalized",
                 },
                 display=f"{old_lines} -> {new_lines} lines (trailing whitespace normalized)",
@@ -317,11 +392,15 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         # Models sometimes double-escape JSON strings, producing literal backslash
         # sequences that don't match the actual file content.
         old_unesc = _unescape_str(old_str)
-        new_unesc = _unescape_str(new_str)
         if old_unesc != old_str:
             unesc_count = text.count(old_unesc)
+            # Only unescape new_str if it also contains escape sequences —
+            # otherwise the model sent intentional backslashes (e.g. regex
+            # patterns, Windows paths) that must be preserved verbatim.
+            new_unesc = _unescape_str(new_str) if "\\" in new_str else new_str
             if unesc_count == 1 or (unesc_count > 1 and replace_all):
                 new_text = text.replace(old_unesc, new_unesc, -1 if replace_all else 1)
+                _save_undo()
                 with open(abs_path, "w", encoding="utf-8") as f:
                     f.write(new_text)
                 _invalidate_read_cache(ctx, abs_path)
@@ -351,6 +430,93 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                         f"Add more surrounding context or use replace_all=true. "
                         f"Match sites:\n" + context_snippets
                     ),
+                )
+
+        # Stage 1c: last-resort fallback — collapse literal `\\` → `\`. Models
+        # sometimes re-escape backslashes copied from a JSON-rendered error
+        # message (e.g. shell escapes like `\(` shown as `\\(` in tool output,
+        # which the model echoes back verbatim). Guard with uniqueness check to
+        # avoid corrupting content that legitimately contains `\\`.
+        old_collapsed = _collapse_double_backslash(old_str)
+        if old_collapsed != old_str:
+            collapsed_count = text.count(old_collapsed)
+            new_collapsed = (
+                _collapse_double_backslash(new_str) if "\\\\" in new_str else new_str
+            )
+            if collapsed_count == 1 or (collapsed_count > 1 and replace_all):
+                new_text = text.replace(
+                    old_collapsed, new_collapsed, -1 if replace_all else 1
+                )
+                _save_undo()
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                _invalidate_read_cache(ctx, abs_path)
+                old_lines = len(old_collapsed.splitlines()) or 1
+                new_lines = len(new_collapsed.splitlines()) or 1
+                return ToolResult(
+                    True,
+                    data={
+                        "path": path,
+                        "replacements": collapsed_count if replace_all else 1,
+                        "old_lines": old_lines,
+                        "new_lines": new_lines,
+                        "old_str": old_collapsed,
+                        "new_str": new_collapsed,
+                        "note": "double-backslash collapsed",
+                    },
+                    display=f"{old_lines} → {new_lines} lines (double-backslash collapsed)",
+                )
+            if collapsed_count > 1 and not replace_all:
+                context_snippets = _collect_match_context(
+                    text, old_collapsed, max_matches=3, context_lines=2
+                )
+                return ToolResult(
+                    False,
+                    error=(
+                        f"old_str matched {collapsed_count} times after collapsing "
+                        f"double-backslashes. Add more surrounding context or use "
+                        f"replace_all=true. Match sites:\n" + context_snippets
+                    ),
+                )
+
+        # Stage 1d: combined fallback — collapse double-backslashes first, THEN
+        # unescape the usual sequences. Catches double-JSON-encoded payloads
+        # where the model sent both `\\"` (escaped quote) AND `\\\\` (escaped
+        # backslash) AND `\\n` (escaped newline) in the same string. Stage 1b
+        # alone leaves `\\\\` partially mangled; Stage 1c alone leaves `\\"`
+        # untouched. Composing 1c → 1b in that order is the only fix.
+        # Guard tightly with uniqueness check so we don't corrupt strings that
+        # legitimately contain `\\` (e.g. Windows paths, regex patterns).
+        old_combined = _unescape_str(_collapse_double_backslash(old_str))
+        if old_combined != old_str and old_combined != _unescape_str(old_str) \
+                and old_combined != _collapse_double_backslash(old_str):
+            combined_count = text.count(old_combined)
+            new_combined = (
+                _unescape_str(_collapse_double_backslash(new_str))
+                if "\\" in new_str else new_str
+            )
+            if combined_count == 1 or (combined_count > 1 and replace_all):
+                new_text = text.replace(
+                    old_combined, new_combined, -1 if replace_all else 1
+                )
+                _save_undo()
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                _invalidate_read_cache(ctx, abs_path)
+                old_lines = len(old_combined.splitlines()) or 1
+                new_lines = len(new_combined.splitlines()) or 1
+                return ToolResult(
+                    True,
+                    data={
+                        "path": path,
+                        "replacements": combined_count if replace_all else 1,
+                        "old_lines": old_lines,
+                        "new_lines": new_lines,
+                        "old_str": old_combined,
+                        "new_str": new_combined,
+                        "note": "double-encoded escapes normalized",
+                    },
+                    display=f"{old_lines} → {new_lines} lines (double-encoded escapes normalized)",
                 )
 
         # Stage 2: no match even after normalization — provide diagnostic hint
@@ -416,7 +582,16 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             ),
         )
  
+    # Proactively unescape new_str if it contains literal escape sequences
+    # (e.g. \n, \t, \") that the model serialized instead of real characters.
+    # Safe: old_str matched the real file, so backslash sequences in new_str
+    # at function/class boundaries are clearly serialization artefacts.
+    new_unesc = _unescape_str(new_str) if "\\" in new_str else new_str
+    if new_unesc != new_str:
+        new_str = new_unesc
+
     new_text = text.replace(old_str, new_str, -1 if replace_all else 1)
+    _save_undo()
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(new_text)
 
@@ -701,6 +876,23 @@ show_diff = Tool(
 GLOB_CAP = 200
 
 
+def _glob_files_sync(abs_path: str, pattern: str) -> list[str]:
+    """Synchronous glob helper — runs in a thread to avoid blocking the loop."""
+    from pathlib import Path
+
+    base = Path(abs_path)
+    matches: list[str] = []
+    for p in sorted(base.glob(pattern)):
+        parts = p.relative_to(base).parts
+        if any(part.startswith(".") or part in SKIP_DIRS for part in parts):
+            continue
+        if p.is_file():
+            matches.append(str(p.relative_to(base)))
+        if len(matches) >= GLOB_CAP:
+            break
+    return matches
+
+
 async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     """Find files matching a glob pattern recursively."""
     pattern = args.get("pattern")
@@ -713,20 +905,8 @@ async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if not os.path.isdir(abs_path):
         return ToolResult(False, error=f"not a directory: {path}")
 
-    from pathlib import Path
-
-    base = Path(abs_path)
-    matches: list[str] = []
     try:
-        for p in sorted(base.glob(pattern)):
-            # Skip hidden files and vendor directories
-            parts = p.relative_to(base).parts
-            if any(part.startswith(".") or part in SKIP_DIRS for part in parts):
-                continue
-            if p.is_file():
-                matches.append(str(p.relative_to(base)))
-            if len(matches) >= GLOB_CAP:
-                break
+        matches = await asyncio.to_thread(_glob_files_sync, abs_path, pattern)
     except (ValueError, OSError) as e:
         return ToolResult(False, error=f"glob error: {e}")
 
@@ -762,4 +942,31 @@ glob_files = Tool(
 )
 
 
-FS_TOOLS: list[Tool] = [read_file, write_file, edit_file, list_directory, search_files, show_diff, glob_files]
+async def _undo_edit(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    if not ctx.undo_stack:
+        return ToolResult(False, error="Nothing to undo. No edits have been made yet.")
+    abs_path, original = ctx.undo_stack.pop()
+    rel_path = os.path.relpath(abs_path, ctx.working_dir)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(original)
+    _invalidate_read_cache(ctx, abs_path)
+    return ToolResult(
+        True,
+        data={"path": rel_path, "reverted_bytes": len(original.encode("utf-8"))},
+        display=f"reverted {rel_path}",
+    )
+
+
+undo_edit = Tool(
+    name="undo_edit",
+    description=(
+        "Revert the most recent edit_file change. Restores the file to its "
+        "content before the last successful edit. Can be called multiple times "
+        "to undo multiple edits (LIFO order)."
+    ),
+    parameters={"type": "object", "properties": {}},
+    run=_undo_edit,
+)
+
+
+FS_TOOLS: list[Tool] = [read_file, write_file, edit_file, undo_edit, list_directory, search_files, show_diff, glob_files]

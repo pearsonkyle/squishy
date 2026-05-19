@@ -6,7 +6,8 @@ Retry policy: exponential backoff on transient failures (timeout, connection,
 """
  
 from __future__ import annotations
- 
+
+import asyncio
 import json
 import logging
 import re
@@ -18,7 +19,7 @@ import httpx
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI, RateLimitError
 from tenacity import (
     AsyncRetrying,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -34,6 +35,19 @@ TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
     httpx.TimeoutException,
     httpx.ConnectError,
 )
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Return True for transient errors that should be retried.
+
+    Includes connection/timeout errors plus 5xx APIStatusError (server errors
+    from vLLM restarts, OOM recovery, etc.).
+    """
+    if isinstance(exc, TRANSIENT_ERRORS):
+        return True
+    if isinstance(exc, APIStatusError) and exc.status_code >= 500:
+        return True
+    return False
  
  
 @dataclass
@@ -65,6 +79,12 @@ class CompletionResult:
  
  
 OnTextFn = Callable[[str], Awaitable[None] | None]
+# Fired when tenacity is about to sleep before retrying a transient error.
+# Receives (attempt_number, max_attempts, exception) so the caller can
+# both warn the user and reset any in-flight streaming state — without
+# the reset, a partial first-attempt stream gets concatenated with the
+# retry's full response and the user sees garbled output.
+OnRetryFn = Callable[[int, int, BaseException], None]
  
  
 @dataclass
@@ -75,11 +95,17 @@ class Client:
     temperature: float = 0.3
     max_tokens: int = 8192
     request_timeout: float = 120.0
-    max_retries: int = 4
+    max_retries: int = 8
     context_window: int = 0  # discovered from endpoint; 0 = unknown (no % display)
     thinking: bool = False
     """Our own retry count. The underlying SDK retries are disabled to avoid double-counting."""
- 
+
+    # Number of retries consumed by the most recent `complete()` call.
+    # Reset at the top of each call, incremented in tenacity's before_sleep
+    # callback.  The agent loop reads this to detect retry storms (vLLM
+    # transient outages eating the per-task budget).
+    last_call_retries: int = 0
+
     _client: AsyncOpenAI = field(init=False, repr=False)
  
     def __post_init__(self) -> None:
@@ -107,17 +133,23 @@ class Client:
             log.debug("health check failed: %s", e)
             return False
 
-    async def discover_model_name(self) -> str:
+    async def discover_model_name(self, *, timeout: float = 10.0) -> str:
         """Try to discover the actual model name from the endpoint.
+
+        Bounded by a tight per-call timeout (default 10s) so a down
+        endpoint can't strand the user on a 120s blank-screen wait
+        before the REPL prompt appears. The configured model name is
+        used as the fallback, and the failure is logged at WARNING
+        so callers can surface it.
 
         As a side-effect, sets ``self.context_window`` when the endpoint
         exposes it (LM Studio returns ``context_length`` on model objects).
-
-        Returns the configured model if discovery fails, or 'unknown-model'.
         """
         try:
             # Try to list models and get the first one
-            models = await self._client.models.list()
+            models = await asyncio.wait_for(
+                self._client.models.list(), timeout=timeout,
+            )
             if models.data:
                 model = models.data[0]
                 # LM Studio (and some vLLM builds) expose context_length.
@@ -125,8 +157,17 @@ class Client:
                 if isinstance(ctx, int) and ctx > 0:
                     self.context_window = ctx
                 return model.id
-        except Exception:  # noqa: BLE001
-            pass
+        except asyncio.TimeoutError:
+            log.warning(
+                "model discovery timed out after %.1fs against %s — "
+                "endpoint may be down; using configured model name",
+                timeout, self.base_url,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "model discovery failed against %s: %s — using configured model name",
+                self.base_url, e,
+            )
 
         # Return configured model name if discovery fails
         return self.model
@@ -138,13 +179,46 @@ class Client:
         *,
         stream: bool = True,
         on_text: OnTextFn | None = None,
+        on_retry: OnRetryFn | None = None,
     ) -> CompletionResult:
-        """Run one chat completion. Retries transient failures with exponential backoff."""
+        """Run one chat completion. Retries transient failures with exponential backoff.
+
+        ``on_retry`` (optional) is invoked just before each backoff sleep
+        with ``(attempt_number, max_attempts, exception)``. The agent
+        wires this to ``display.reset_streaming`` + a warn line so (a)
+        the partial first-attempt stream is dropped before the retry
+        appends to it, and (b) the user knows the wait isn't a hang.
+        """
+        # Reset per-call retry counter so the agent can read how many retries
+        # this single completion consumed.
+        self.last_call_retries = 0
+
+        def _bump_retries(retry_state: Any) -> None:
+            self.last_call_retries += 1
+            if on_retry is not None:
+                exc = None
+                outcome = getattr(retry_state, "outcome", None)
+                if outcome is not None:
+                    try:
+                        exc = outcome.exception()
+                    except Exception:  # noqa: BLE001
+                        exc = None
+                try:
+                    on_retry(
+                        retry_state.attempt_number,
+                        self.max_retries,
+                        exc or RuntimeError("transient error"),
+                    )
+                except Exception:  # noqa: BLE001
+                    # Never let a flaky display callback break the retry loop.
+                    log.debug("on_retry callback failed", exc_info=True)
+
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(self.max_retries),
-                wait=wait_exponential(multiplier=1, min=1, max=30),
-                retry=retry_if_exception_type(TRANSIENT_ERRORS),
+                wait=wait_exponential(multiplier=2, min=2, max=60),
+                retry=retry_if_exception(_is_transient),
+                before_sleep=_bump_retries,
                 reraise=True,
             ):
                 with attempt:
@@ -158,6 +232,23 @@ class Client:
                         return await self._complete_stream(messages, tools, on_text)
                     return await self._complete_sync(messages, tools)
         except APIStatusError as e:
+            # Azure / OpenAI content-filter rejections are 400s with
+            # `content_filter` in the body.  These are deterministic — retrying
+            # the same prompt will never succeed.  Surface them with a stable
+            # marker so the agent loop can fail-fast on this instance instead
+            # of burning the whole retry budget.
+            msg = str(getattr(e, "message", "")) or str(e)
+            msg_lower = msg.lower()
+            if e.status_code == 400 and "content_filter" in msg_lower:
+                raise LLMError(f"content_filter: {msg}") from e
+            # Azure-strict schema violation: orphan tool_calls (assistant
+            # message has tool_calls without paired tool responses).  Same
+            # request will fail forever — fail-fast instead of retrying.
+            if e.status_code == 400 and (
+                "tool_call_ids did not have response" in msg_lower
+                or "must be followed by tool messages" in msg_lower
+            ):
+                raise LLMError(f"azure_strict_orphan_tool_calls: {msg}") from e
             raise LLMError(f"LLM returned {e.status_code}: {e.message}") from e
         except TRANSIENT_ERRORS as e:  # retries exhausted (reraise=True path)
             raise LLMError(f"transient error after {self.max_retries} retries: {e}") from e
@@ -165,14 +256,24 @@ class Client:
     def _build_create_kwargs(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        kwargs = dict(
+        # gpt-5 / o-series reasoning models reject `max_tokens` and require
+        # `max_completion_tokens` instead.  Detect by model name prefix.
+        m = (self.model or "").lower()
+        is_reasoning_family = (
+            m.startswith("gpt-5") or m.startswith("o1") or m.startswith("o3")
+            or m.startswith("o4")
+        )
+        kwargs: dict[str, Any] = dict(
             model=self.model,
             messages=messages,
             tools=tools or None,
             tool_choice="auto" if tools else None,
             temperature=self.temperature,
-            max_tokens=self.max_tokens,
         )
+        if is_reasoning_family:
+            kwargs["max_completion_tokens"] = self.max_tokens
+        else:
+            kwargs["max_tokens"] = self.max_tokens
         if self.thinking:
             # Enable Qwen3 thinking mode — the model uses the `reasoning` field
             # for chain-of-thought, which improves tool-call formatting.
