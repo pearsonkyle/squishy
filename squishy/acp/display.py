@@ -28,6 +28,8 @@ from acp import helpers
 from acp.schema import AvailableCommand, ToolCallProgress, ToolCallStart
 
 from squishy.display import Stats
+from squishy.plan_state import _ACP_STATUS_MAP
+from squishy.tools import REGISTRY
 
 log = logging.getLogger("squishy.acp.display")
 
@@ -68,7 +70,6 @@ class AcpDisplay:
         # Track the most recent tool call so we can correlate the result
         # (which arrives via a separate Display call) with the right id.
         self._current_tool_id: str | None = None
-        self._current_tool_name: str | None = None
         # squishy code path expects ``display.stats`` and ``display.console``.
         self.stats = Stats()
         self.console = _NullConsole()
@@ -78,7 +79,12 @@ class AcpDisplay:
     # ── async plumbing ────────────────────────────────────────────────
 
     def _emit(self, update: Any) -> None:
-        """Schedule an async session_update on the agent's event loop."""
+        """Schedule an async session_update on the agent's event loop.
+
+        Tasks accumulate in ``self._pending``; ``flush()`` drains them at
+        each turn boundary so the list can't grow unboundedly across a
+        session.
+        """
         if self._conn is None:
             return
         try:
@@ -89,8 +95,6 @@ class AcpDisplay:
             # Loop has been closed — happens during shutdown. Drop the update.
             return
         self._pending.append(task)
-        # Best-effort: prune already-done tasks so the list doesn't grow.
-        self._pending = [t for t in self._pending if not t.done()]
 
     async def flush(self) -> None:
         """Await every queued notification before returning to the client."""
@@ -134,7 +138,6 @@ class AcpDisplay:
     ) -> None:
         tool_call_id = uuid.uuid4().hex[:16]
         self._current_tool_id = tool_call_id
-        self._current_tool_name = tool_name
         update: ToolCallStart = helpers.start_tool_call(
             tool_call_id=tool_call_id,
             title=f"{tool_name}{(' ' + brief) if brief else ''}",
@@ -261,8 +264,6 @@ class _NullConsole:
 
 
 def _plan_entry_from_step(step: dict[str, Any]) -> Any:
-    from squishy.plan_state import _ACP_STATUS_MAP  # local import to avoid cycles
-
     desc = str(step.get("description", "")) or ""
     status = _ACP_STATUS_MAP.get(str(step.get("status", "pending")), "pending")
     note = str(step.get("note", "")) if step.get("status") == "blocked" else ""
@@ -280,11 +281,8 @@ def _plan_entries_from_dict(plan_dict: dict[str, Any]) -> list[Any]:
 
 def _tool_description(name: str) -> str:
     """Render a one-line description for an AvailableCommand entry."""
-    from squishy.tools import REGISTRY
-
     tool = REGISTRY.get(name)
     if tool is None:
         return name
-    desc = tool.description or name
     # AvailableCommand.description should be a short sentence.
-    return desc.splitlines()[0][:160]
+    return (tool.description or name).splitlines()[0][:160]

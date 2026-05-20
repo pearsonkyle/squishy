@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from typing import Any
 
 from acp.schema import (
@@ -84,7 +84,6 @@ class _AcpSession:
     agent: Agent
     display: AcpDisplay
     permission_mode: PermissionMode = "plan"
-    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     run_task: asyncio.Task[Any] | None = None
 
 
@@ -166,8 +165,11 @@ class SquishyAcpAgent:
         mcp_servers: list[Any] | None = None,
         **_: Any,
     ) -> NewSessionResponse:
+        # ``mcp_servers`` is accepted by the protocol but not yet merged
+        # into squishy's MCP registry (which loads from .mcp.json on first
+        # tool use). When we wire that in, this is the seam.
         session_id = f"sq-{os.urandom(8).hex()}"
-        session = self._build_session(session_id, cwd, mcp_servers or [])
+        session = self._build_session(session_id, cwd)
         self._sessions[session_id] = session
         # Emit available commands + initial mode so the editor's chips render.
         self._emit_available_commands(session)
@@ -191,7 +193,6 @@ class SquishyAcpAgent:
         if not text.strip():
             return PromptResponse(stopReason=_STOP_END)
 
-        session.cancel_event.clear()
         loop = asyncio.get_running_loop()
         session.run_task = loop.create_task(session.agent.run(text))
         try:
@@ -215,7 +216,6 @@ class SquishyAcpAgent:
         session = self._sessions.get(session_id)
         if session is None:
             return
-        session.cancel_event.set()
         if session.run_task is not None and not session.run_task.done():
             session.run_task.cancel()
 
@@ -234,9 +234,7 @@ class SquishyAcpAgent:
 
     # ── helpers ───────────────────────────────────────────────────────
 
-    def _build_session(
-        self, session_id: str, cwd: str, mcp_servers: list[Any],
-    ) -> _AcpSession:
+    def _build_session(self, session_id: str, cwd: str) -> _AcpSession:
         cfg = _config_for_session(self._base_config, cwd)
         loop = asyncio.get_running_loop()
         display = AcpDisplay(self._conn, session_id, loop)
@@ -257,16 +255,6 @@ class SquishyAcpAgent:
         if self._client_caps_terminal:
             agent.tool_ctx.terminal_client = AcpTerminalClient(
                 self._conn, session_id,
-            )
-
-        # Merge editor-supplied MCP servers into the squishy MCP registry
-        # so an editor can hand off project-specific MCP backends without
-        # the user editing ~/.squishy/mcp.json. We attach them to the
-        # agent's tool_ctx as metadata; squishy's own MCP loader picks
-        # them up on first use.
-        if mcp_servers:
-            agent.tool_ctx.notes["acp_mcp_servers"] = ",".join(
-                getattr(s, "name", "?") for s in mcp_servers
             )
 
         return _AcpSession(
@@ -324,8 +312,6 @@ def _join_prompt_blocks(blocks: list[Any]) -> str:
 
 def _config_for_session(base: Config, cwd: str) -> Config:
     """Return a Config copy bound to *cwd* for a new ACP session."""
-    from dataclasses import replace
-
     return replace(base, working_dir=cwd)
 
 

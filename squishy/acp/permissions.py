@@ -8,6 +8,7 @@ the editor can render a native permission dialog instead.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any
 
 from acp.schema import (
@@ -57,7 +58,7 @@ def make_prompt_fn(conn: Any, session_id: str) -> Any:
             )
 
         tool_call = ToolCallUpdate(
-            tool_call_id=f"perm-{id(args):x}",
+            tool_call_id=f"perm-{uuid.uuid4().hex[:12]}",
             title=title,
             kind=_acp_kind_for(tool.name),
             status="pending",
@@ -68,7 +69,7 @@ def make_prompt_fn(conn: Any, session_id: str) -> Any:
             resp = await conn.request_permission(
                 options=options, session_id=session_id, tool_call=tool_call,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             log.warning("session/request_permission failed: %s", exc)
             return False
 
