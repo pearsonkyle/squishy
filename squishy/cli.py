@@ -90,6 +90,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--resume", metavar="UUID", help="Resume a previous session by UUID")
     p.add_argument("--session-dir", help="Session storage directory (env SQUISHY_SESSION_DIR)")
     p.add_argument("--no-sessions", action="store_true", help="Disable session persistence")
+    p.add_argument(
+        "--acp",
+        action="store_true",
+        help="Run as an Agent Client Protocol agent over stdio (for editors like Zed)",
+    )
     return p.parse_args(argv)
  
  
@@ -180,6 +185,27 @@ async def _amain() -> None:
 
     args = _parse_args(sys.argv[1:])
     cfg = _build_config(args)
+
+    # --acp: hand off to the ACP server using the already-built Config.
+    # Logs go to stderr; the legacy banner/REPL paths are skipped so the
+    # JSON-RPC stream on stdout stays clean.
+    if args.acp:
+        import logging
+
+        import acp  # noqa: PLC0415 — local import so non-ACP users don't pay
+
+        from squishy.acp.agent import SquishyAcpAgent
+
+        logging.basicConfig(
+            stream=sys.stderr, level=logging.WARNING,
+            format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+        )
+        agent = SquishyAcpAgent(cfg)
+        try:
+            await acp.run_agent(agent)
+        finally:
+            await agent.aclose()
+        return
     display = Display()
     display.set_mode(cfg.permission_mode)
     client = Client(
@@ -327,7 +353,7 @@ async def _run_direct_command(cmd: str, timeout: float = 120.0) -> int:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(Exception):

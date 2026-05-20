@@ -79,6 +79,32 @@ def _collapse_double_backslash(s: str) -> str:
     return s.replace("\\\\", "\\") if "\\\\" in s else s
 
 
+async def _read_text(abs_path: str, ctx: ToolContext) -> str:
+    """Read a UTF-8 text file, routing through ctx.fs_client when set.
+
+    The fs_client path lets the editor mediate file access in ACP sessions
+    so its buffer state stays consistent with disk (and dirty buffers can
+    surface their unsaved content to the agent).
+    """
+    if ctx.fs_client is not None:
+        return await ctx.fs_client.read_text_file(abs_path)
+    with open(abs_path, encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+async def _write_text(abs_path: str, content: str, ctx: ToolContext) -> None:
+    """Write a UTF-8 text file, routing through ctx.fs_client when set.
+
+    When the ACP client provides write_text_file, the editor performs the
+    write so its diff view updates live and unsaved buffers can be merged.
+    """
+    if ctx.fs_client is not None:
+        await ctx.fs_client.write_text_file(abs_path, content)
+        return
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
     """Drop any cached reads for *abs_path* after a mutating write/edit."""
     for key in [k for k in ctx.files_read_meta if k[0] == abs_path]:
@@ -171,8 +197,7 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         )
 
     try:
-        with open(abs_path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+        text = await _read_text(abs_path, ctx)
     except OSError as e:
         return ToolResult(False, error=str(e))
 
@@ -250,15 +275,15 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             return ToolResult(
                 False,
                 error=(
-                    f"write_file refused — creating test/reproduction files is not "
-                    f"allowed in bench mode. Fix the SOURCE code instead.\n"
-                    f"Use `edit_file` on the existing source file to apply your fix."
+                    "write_file refused — creating test/reproduction files is not "
+                    "allowed in bench mode. Fix the SOURCE code instead.\n"
+                    "Use `edit_file` on the existing source file to apply your fix."
                 ),
             )
 
-    os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    if ctx.fs_client is None:
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+    await _write_text(abs_path, content, ctx)
 
     _invalidate_read_cache(ctx, abs_path)
     encoded = content.encode("utf-8")
@@ -317,11 +342,15 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     abs_path, err = _safe_resolve(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
-    if not os.path.isfile(abs_path):
+    # When fs_client is set, defer existence checks to the editor —
+    # the file may live in an unsaved buffer that doesn't exist on disk.
+    if ctx.fs_client is None and not os.path.isfile(abs_path):
         return ToolResult(False, error=f"file not found: {path}")
 
-    with open(abs_path, encoding="utf-8", errors="replace") as f:
-        text = f.read()
+    try:
+        text = await _read_text(abs_path, ctx)
+    except OSError as e:
+        return ToolResult(False, error=str(e))
 
     def _save_undo() -> None:
         ctx.undo_stack.append((abs_path, text))
@@ -355,8 +384,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             if text.endswith("\n") and not new_text.endswith("\n"):
                 new_text += "\n"
             _save_undo()
-            with open(abs_path, "w", encoding="utf-8") as f:
-                f.write(new_text)
+            await _write_text(abs_path, new_text, ctx)
             _invalidate_read_cache(ctx, abs_path)
             old_lines = len(old_str.splitlines()) or 1
             new_lines = len(_new_str.splitlines()) or 1
@@ -401,8 +429,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             if unesc_count == 1 or (unesc_count > 1 and replace_all):
                 new_text = text.replace(old_unesc, new_unesc, -1 if replace_all else 1)
                 _save_undo()
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(new_text)
+                await _write_text(abs_path, new_text, ctx)
                 _invalidate_read_cache(ctx, abs_path)
                 old_lines = len(old_unesc.splitlines()) or 1
                 new_lines = len(new_unesc.splitlines()) or 1
@@ -448,8 +475,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                     old_collapsed, new_collapsed, -1 if replace_all else 1
                 )
                 _save_undo()
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(new_text)
+                await _write_text(abs_path, new_text, ctx)
                 _invalidate_read_cache(ctx, abs_path)
                 old_lines = len(old_collapsed.splitlines()) or 1
                 new_lines = len(new_collapsed.splitlines()) or 1
@@ -500,8 +526,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                     old_combined, new_combined, -1 if replace_all else 1
                 )
                 _save_undo()
-                with open(abs_path, "w", encoding="utf-8") as f:
-                    f.write(new_text)
+                await _write_text(abs_path, new_text, ctx)
                 _invalidate_read_cache(ctx, abs_path)
                 old_lines = len(old_combined.splitlines()) or 1
                 new_lines = len(new_combined.splitlines()) or 1
@@ -592,8 +617,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
     new_text = text.replace(old_str, new_str, -1 if replace_all else 1)
     _save_undo()
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(new_text)
+    await _write_text(abs_path, new_text, ctx)
 
     _invalidate_read_cache(ctx, abs_path)
     old_lines = len(old_str.splitlines()) or 1
@@ -947,8 +971,7 @@ async def _undo_edit(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         return ToolResult(False, error="Nothing to undo. No edits have been made yet.")
     abs_path, original = ctx.undo_stack.pop()
     rel_path = os.path.relpath(abs_path, ctx.working_dir)
-    with open(abs_path, "w", encoding="utf-8") as f:
-        f.write(original)
+    await _write_text(abs_path, original, ctx)
     _invalidate_read_cache(ctx, abs_path)
     return ToolResult(
         True,

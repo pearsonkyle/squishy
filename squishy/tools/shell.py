@@ -3,6 +3,7 @@
 from __future__ import annotations
  
 import asyncio
+import contextlib
 import os
 import re
 import shutil
@@ -207,6 +208,87 @@ def _extract_test_failures(output: str) -> dict[str, Any] | None:
 
 def _docker_available() -> bool:
     return shutil.which("docker") is not None
+
+
+async def _run_via_acp_terminal(
+    term: Any,
+    command: str,
+    cwd: str,
+    timeout: float,
+    permission_mode: str,
+) -> ToolResult:
+    """Execute *command* via the ACP terminal bridge.
+
+    The bridge spawns a terminal in the editor, waits for the command to
+    exit (subject to *timeout*), captures output, and releases the terminal.
+    The post-processing path (pytest summary parsing, output capping,
+    bench-mode tighter caps) mirrors the local subprocess code path so the
+    rest of the agent loop sees identical-shape ToolResults regardless of
+    where the command actually ran.
+    """
+    try:
+        terminal_id = await term.create("sh", ["-c", command], cwd=cwd)
+    except Exception as e:  # noqa: BLE001
+        return ToolResult(False, error=f"terminal/create failed: {e}")
+
+    timed_out = False
+    try:
+        exit_status = await asyncio.wait_for(
+            term.wait_for_exit(terminal_id), timeout=timeout,
+        )
+    except TimeoutError:
+        timed_out = True
+        exit_status = None
+        with contextlib.suppress(Exception):
+            await term.kill(terminal_id)
+
+    try:
+        raw_output = await term.output(terminal_id)
+    except Exception:  # noqa: BLE001
+        raw_output = ""
+    with contextlib.suppress(Exception):
+        await term.release(terminal_id)
+
+    if timed_out:
+        return ToolResult(False, error=f"command timed out after {timeout}s")
+
+    stdout_b = raw_output.encode("utf-8", errors="replace")
+    stdout_cap = 6000 if permission_mode == "bench" else OUTPUT_CAP_STDOUT
+    stdout_decoded = raw_output
+    test_summary = None
+    if _looks_like_pytest(stdout_decoded):
+        stdout_text, stdout_truncated = _smart_cap_pytest(stdout_b, stdout_cap)
+        test_summary = _extract_test_failures(stdout_decoded)
+    else:
+        stdout_text, stdout_truncated = _cap_output(stdout_b, stdout_cap)
+
+    exit_code = (
+        int(exit_status.get("exit_code"))
+        if isinstance(exit_status, dict) and exit_status.get("exit_code") is not None
+        else -1
+    )
+    success = exit_code == 0
+    data: dict[str, Any] = {
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout_text,
+        "stderr": "",
+        "sandboxed": False,
+        "truncated": stdout_truncated,
+        "via": "acp_terminal",
+    }
+    if test_summary:
+        data["test_summary"] = test_summary
+    display = f"exit={exit_code} \\[editor]"
+    if success:
+        return ToolResult(True, data=data, display=display)
+    tail = stdout_text.strip()[-400:]
+    return ToolResult(
+        False,
+        data=data,
+        error=(f"command exited {exit_code}: {tail}" if tail else f"command exited {exit_code}"),
+        display=display,
+    )
  
  
 async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -222,7 +304,16 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             return ToolResult(False, error=cwd_err)
     else:
         cwd = ctx.working_dir
- 
+
+    # ACP terminal bridge: when the editor advertises terminal support,
+    # route through it so output streams to the editor's terminal pane.
+    # Sandbox/extra_env are not honored on this path — the editor owns the
+    # execution environment.
+    if ctx.terminal_client is not None:
+        return await _run_via_acp_terminal(
+            ctx.terminal_client, command, cwd, timeout, ctx.permission_mode,
+        )
+
     sandboxed = ctx.use_sandbox and _docker_available()
 
     if sandboxed:
