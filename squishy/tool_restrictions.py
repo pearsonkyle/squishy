@@ -80,6 +80,43 @@ _FD_REDIRECT_RE = re.compile(r"\s*\d*>&\d+")
 # every segment to independently be a read-only command.
 _CHAIN_RE = re.compile(r"\|\||&&|;|\|")
 
+# Per-binary argument denylists. A binary being on the allowlist is not
+# sufficient — several allowlisted tools have flags that run arbitrary
+# commands or mutate the filesystem, which would defeat the plan-mode
+# read-only guarantee. These are matched against the segment's tokens.
+#
+# `find` actions that execute commands or write/delete files.
+_FIND_DANGEROUS_ARGS = frozenset({
+    "-exec", "-execdir", "-ok", "-okdir",
+    "-delete", "-fprintf", "-fprint", "-fprint0", "-fls",
+})
+# ripgrep flags that spawn an arbitrary preprocessor per searched file.
+_RG_DANGEROUS_ARGS = frozenset({
+    "--pre", "--pre-glob", "--hostname-bin",
+})
+
+
+def _has_dangerous_binary_args(tokens: list[str]) -> bool:
+    """Return True if a segment invokes an allowlisted binary with an
+    argument that grants arbitrary code execution or filesystem mutation.
+
+    Covers ``find -exec/-delete/-fprintf/...`` and ``rg --pre/...`` — both
+    are RCE vectors that a name-only allowlist would otherwise wave through.
+    Matching is prefix-aware so ``--pre=cmd`` is caught alongside ``--pre cmd``.
+    """
+    if not tokens:
+        return False
+    binary = tokens[0]
+    rest = tokens[1:]
+    if binary == "find":
+        return any(t in _FIND_DANGEROUS_ARGS for t in rest)
+    if binary == "rg":
+        for t in rest:
+            head = t.split("=", 1)[0]
+            if head in _RG_DANGEROUS_ARGS:
+                return True
+    return False
+
 
 def is_readonly_shell(command: str) -> bool:
     """Return True if ``command`` is safe to run in plan mode.
@@ -133,6 +170,12 @@ def _segment_is_readonly(segment: str) -> bool:
     except ValueError:
         return False
     if not tokens:
+        return False
+
+    # Argument-level guard: an allowlisted binary name is necessary but not
+    # sufficient. `find -exec/-delete/...` and `rg --pre` run arbitrary
+    # commands or mutate the filesystem, defeating the read-only guarantee.
+    if _has_dangerous_binary_args(tokens):
         return False
 
     # Three-word match first (e.g. "python -m pytest --collect-only").

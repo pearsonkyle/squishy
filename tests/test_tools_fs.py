@@ -336,3 +336,18 @@ async def test_edit_file_no_unrecognized_hint_when_only_aliases(ctx):
     assert "new_str" in r.error
     # No unknown-keys clause should appear.
     assert "Unrecognized parameters" not in r.error
+
+
+async def test_edit_file_rejects_empty_old_str(ctx):
+    """edit_file with an empty old_str must be refused — with replace_all it
+    would splice new_str between every character and corrupt the file."""
+    from squishy.tools.fs import edit_file
+    await write_file.run({"path": "app.py", "content": "a = 1\nb = 2\n"}, ctx)
+    r = await edit_file.run(
+        {"path": "app.py", "old_str": "", "new_str": "X", "replace_all": True}, ctx
+    )
+    assert not r.success
+    assert "empty" in r.error.lower()
+    # File is untouched.
+    body = open(ctx.working_dir + "/app.py").read()
+    assert body == "a = 1\nb = 2\n"

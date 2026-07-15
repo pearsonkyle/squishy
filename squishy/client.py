@@ -34,6 +34,14 @@ TRANSIENT_ERRORS: tuple[type[Exception], ...] = (
     RateLimitError,
     httpx.TimeoutException,
     httpx.ConnectError,
+    # A local LLM server (vLLM/LM Studio/llama.cpp) dropping the connection
+    # mid-generation raises these — NOT ConnectError — while the SSE body is
+    # being iterated. Without them here the disconnect is neither retried nor
+    # translated to LLMError, and a raw httpx error escapes the client seam.
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.PoolTimeout,
 )
 
 
@@ -242,16 +250,28 @@ class Client:
             if e.status_code == 400 and "content_filter" in msg_lower:
                 raise LLMError(f"content_filter: {msg}") from e
             # Azure-strict schema violation: orphan tool_calls (assistant
-            # message has tool_calls without paired tool responses).  Same
-            # request will fail forever — fail-fast instead of retrying.
+            # message has tool_calls without paired tool responses), OR the
+            # reverse — a role="tool" message not preceded by a matching
+            # assistant tool_calls.  Same request will fail forever —
+            # fail-fast instead of retrying.
             if e.status_code == 400 and (
                 "tool_call_ids did not have response" in msg_lower
                 or "must be followed by tool messages" in msg_lower
+                or "must be a response to a preceding message" in msg_lower
+                or ("role" in msg_lower and "tool" in msg_lower and "preceding" in msg_lower)
             ):
                 raise LLMError(f"azure_strict_orphan_tool_calls: {msg}") from e
             raise LLMError(f"LLM returned {e.status_code}: {e.message}") from e
         except TRANSIENT_ERRORS as e:  # retries exhausted (reraise=True path)
             raise LLMError(f"transient error after {self.max_retries} retries: {e}") from e
+        except LLMError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # Catch-all so nothing untyped escapes the client seam — the
+            # facade promises only squishy.errors types cross this boundary.
+            # asyncio.CancelledError / KeyboardInterrupt are BaseException,
+            # not Exception, so they still propagate for clean cancellation.
+            raise LLMError(f"unexpected client error: {type(e).__name__}: {e}") from e
  
     def _build_create_kwargs(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]],

@@ -47,7 +47,13 @@ from squishy.agent_state import (
 from squishy.phase_machine import PhaseState, advance, check_finish_plan_gate, check_transition
 from squishy.client import Client, CompletionResult, ToolCall
 from squishy.config import Config
-from squishy.context import build_system_prompt, compact_messages, detect_project, trim_history
+from squishy.context import (
+    build_system_prompt,
+    compact_messages,
+    detect_project,
+    normalize_messages,
+    trim_history,
+)
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.index.store import has_index
@@ -141,6 +147,7 @@ class Agent:
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
             plan=load_plan(self.config.working_dir),
+            max_tool_output_chars=self.config.max_tool_output_chars,
         )
         self.has_index = has_index(self.config.working_dir)
         project = detect_project(self.config.working_dir)
@@ -420,6 +427,11 @@ class Agent:
             name="run_command",
             args={"command": cmd, "timeout": 120},
         )
+        # Append the paired assistant tool_calls message BEFORE dispatching, so
+        # the synthetic run_command result isn't a reverse-orphan tool message
+        # (strict endpoints 400 on an unpaired role="tool"). run_tool only
+        # appends the tool result; it does not synthesize the assistant call.
+        self.messages.append(assistant_msg("", [tc]))
         await run_tool(self, turn, tc)
         st.auto_pytest_runs += 1
         return True
@@ -831,6 +843,12 @@ class Agent:
                         min_gap=5, force=True,
                     )
 
+            # Enforce the assistant↔tool pairing invariant on the exact list
+            # we send. Any nudge/gate/compaction that severed a pair or
+            # injected a stray tool result is repaired here, once, so no
+            # malformed transcript reaches the endpoint.
+            self.messages[:] = normalize_messages(self.messages)
+
             # LLM call. In interactive modes, show a spinner so a slow
             # first token / cold model doesn't look like a hung process.
             # The spinner cancels itself on the first streamed chunk.
@@ -924,19 +942,21 @@ class Agent:
                     final_text="Fix applied." if st.files_edited else "",
                     turn=turn,
                 )
-            # Mid-loop nudge (interactive modes only).
+            # Mid-loop nudge (interactive modes only). Deferred to AFTER the
+            # tool results are appended — inserting a user message between the
+            # assistant tool_calls and its results violates the API pairing
+            # invariant (assistant tool_calls must be immediately followed by
+            # tool messages). Captured here, appended after dispatch.
+            pending_repeat_nudge: str | None = None
             if not _is_constrained and st.consecutive_identical >= 2:
-                self.messages.append({
-                    "role": "user",
-                    "content": (
-                        f"[system] You repeated the same tool call "
-                        f"{st.consecutive_identical + 1} times in a row with no "
-                        "new information. Either try a different action, call "
-                        "`finish_plan` if the work is done, or respond with a "
-                        "plain-text summary to end the turn. Do not repeat "
-                        "this call again."
-                    ),
-                })
+                pending_repeat_nudge = (
+                    f"[system] You repeated the same tool call "
+                    f"{st.consecutive_identical + 1} times in a row with no "
+                    "new information. Either try a different action, call "
+                    "`finish_plan` if the work is done, or respond with a "
+                    "plain-text summary to end the turn. Do not repeat "
+                    "this call again."
+                )
 
             # --- Quality gate ---
             gate = apply_quality_gate(self, completion.tool_calls, st, turn)
@@ -986,6 +1006,11 @@ class Agent:
                     if self.display:
                         self.display.error(msg)
                     return self._build_result(st, success=False, error=msg, turn=turn)
+
+            # Deferred repeat-nudge: now that all tool results are appended,
+            # it's safe to add the trailing user message (see capture above).
+            if pending_repeat_nudge is not None:
+                self.messages.append({"role": "user", "content": pending_repeat_nudge})
 
             # Recall-first enforcement (plan mode only).
             if self.config.permission_mode == "plan" and not is_bench:

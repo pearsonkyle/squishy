@@ -486,6 +486,43 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list
     return system + first_user + tail
 
 
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Enforce the assistant↔tool pairing invariant on an outgoing message list.
+
+    Two failure modes exist and different sites can introduce either:
+
+    * **Forward orphan** — an ``assistant`` message with ``tool_calls`` whose
+      paired ``tool`` responses are missing (trimming/compaction dropped them).
+      Handled by :func:`_strip_orphan_assistant_tool_calls`.
+    * **Reverse orphan** — a ``role="tool"`` message whose ``tool_call_id`` was
+      never declared by any preceding ``assistant`` ``tool_calls`` (a synthetic
+      result injected without its paired assistant call, or a tool message left
+      at the head of a compaction split). Strict endpoints (Azure/OpenAI) 400 on
+      both. This drops reverse orphans.
+
+    Runs once immediately before every ``client.complete`` in the loop, so the
+    transcript is well-formed regardless of which nudge/gate mutated it. Returns
+    a new list; does not mutate the input.
+    """
+    msgs = _strip_orphan_assistant_tool_calls(messages)
+    declared: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for m in msgs:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    declared.add(tc["id"])
+            out.append(m)
+        elif m.get("role") == "tool":
+            tcid = m.get("tool_call_id", "")
+            if tcid and tcid in declared:
+                out.append(m)
+            # else: reverse orphan — drop it.
+        else:
+            out.append(m)
+    return out
+
+
 def _strip_orphan_assistant_tool_calls(
     msgs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -746,6 +783,12 @@ async def compact_messages(
     # Re-inject the protected first user message right after system messages
     # so it survives compaction and remains visible to the model.
     protected_msgs = [protected] if protected is not None else []
+    # The split is chosen purely by token count, so `recent` can begin with a
+    # `role="tool"` message whose assistant tool_calls was summarized into
+    # `old` — a reverse orphan the strict endpoints reject. Drop any such
+    # leading tool messages (mirrors trim_history's tail guard).
+    while recent and recent[0].get("role") == "tool":
+        recent = recent[1:]
     # Final orphan-strip on `recent`: the anchored-pull above tries to keep
     # tool-result pairs together, but if any tool messages were dropped
     # mid-conversation an orphan can remain.  Strict endpoints (Azure) reject.

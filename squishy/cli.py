@@ -219,7 +219,14 @@ async def _amain() -> None:
         display.stats.context_window = client.context_window
 
         if cfg.auto_init:
-            await _run_init(cfg, client, display, summaries=cfg.index_summaries)
+            # A failed --init build must not abort startup — the REPL/one-shot
+            # can still run (recall just won't be available).
+            try:
+                await _run_init(cfg, client, display, summaries=cfg.index_summaries)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                display.warn("[index] --init cancelled")
+            except Exception as e:  # noqa: BLE001
+                display.error(f"[index] --init failed: {e}")
 
         # Initialize MCP servers (non-blocking).
         try:
@@ -287,7 +294,18 @@ async def _amain() -> None:
 
  
         if args.message:
-            await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout, mode_cycler)
+            # -m is a one-shot ("send one message, print result, exit"). Only
+            # wire the interactive approval prompt when stdin is a real TTY —
+            # otherwise (piped/CI/non-TTY) a plan-mode plan_task would block
+            # forever on an approval prompt that can never be answered. Non-TTY
+            # falls back to auto-approve, matching the stdin-pipe branch below.
+            interactive = sys.stdin.isatty()
+            await _run_one(
+                cfg, client, display,
+                prompt_fn if interactive else None,
+                args.message, args.timeout,
+                mode_cycler if interactive else None,
+            )
             return
 
         if not sys.stdin.isatty():
@@ -631,7 +649,14 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")
             summaries = cfg.index_summaries and "--no-summaries" not in rest.split()
-            await _run_init(cfg, client, display, summaries=summaries)
+            # Fault-isolate: a mid-build indexing failure must not kill the
+            # whole REPL. Ctrl+C returns cleanly to the prompt.
+            try:
+                await _run_init(cfg, client, display, summaries=summaries)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                display.warn("[index] /init cancelled")
+            except Exception as e:  # noqa: BLE001
+                display.error(f"[index] /init failed: {e}")
             continue
         if line.startswith("/mode"):
             _, _, rest = line.partition(" ")

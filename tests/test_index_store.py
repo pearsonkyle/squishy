@@ -48,3 +48,26 @@ def test_json_is_pretty(tmp_path: Path) -> None:
     assert "\n" in raw
     data = json.loads(raw)
     assert "root" in data and "meta" in data
+
+
+def test_has_index_false_for_corrupt_json(tmp_path):
+    """A truncated/corrupt index.json must report has_index=False so the
+    prompt/enforcement don't push the model toward a recall that will fail."""
+    from squishy.index.store import INDEX_DIR, INDEX_FILE, has_index
+    d = tmp_path / INDEX_DIR
+    d.mkdir()
+    (d / INDEX_FILE).write_text('{"root": {"kind": "repo"')  # truncated
+    assert has_index(str(tmp_path)) is False
+
+
+def test_save_index_is_atomic_no_tmp_left(tmp_path):
+    """save_index must not leave a .tmp turd and must be reloadable."""
+    from squishy.index import build_index
+    from squishy.index.store import INDEX_DIR, has_index, load_index, save_index
+    (tmp_path / "m.py").write_text('"""M."""\ndef f(): return 1\n')
+    idx = build_index(str(tmp_path))
+    save_index(str(tmp_path), idx)
+    assert has_index(str(tmp_path))
+    assert load_index(str(tmp_path)) is not None
+    leftovers = list((tmp_path / INDEX_DIR).glob("*.tmp"))
+    assert leftovers == [], f"temp files left behind: {leftovers}"

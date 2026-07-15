@@ -314,6 +314,19 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             ),
         )
  
+    # An empty old_str matches between every character; with replace_all it
+    # would splice new_str throughout the file (corruption), and without it the
+    # replacement is meaningless. Reject it outright.
+    if old_str == "":
+        return ToolResult(
+            False,
+            error=(
+                "old_str must not be empty. To insert text, include an exact "
+                "anchor snippet from the file in old_str and put the anchor plus "
+                "your new text in new_str. To create a new file, use write_file."
+            ),
+        )
+
     abs_path, err = _safe_resolve(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)

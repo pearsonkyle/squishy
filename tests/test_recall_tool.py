@@ -254,3 +254,31 @@ async def test_depth_one_shows_methods(tmp_path: Path) -> None:
             assert "children" in result
             method_names = [c.get("name") for c in result["children"]]
             assert "load" in method_names or "save" in method_names
+
+
+async def test_recall_reloads_after_index_rebuild(tmp_path: Path) -> None:
+    """recall must invalidate its cached index when index.json changes on disk
+    (e.g. a /init rebuild mid-session), not serve the first-loaded tree forever."""
+    import os
+    _make_repo(tmp_path)
+    idx = build_index(str(tmp_path))
+    save_index(str(tmp_path), idx)
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
+
+    r1 = await _recall({"query": "colors"}, ctx)
+    assert r1.success
+    assert any("colors.py" in res.get("path", "") for res in r1.data["results"])
+
+    # A brand-new file the first index never saw.
+    (tmp_path / "pkg" / "auth.py").write_text('"""Authentication login."""\ndef login(): return 1\n')
+    idx2 = build_index(str(tmp_path), prior=idx)
+    save_index(str(tmp_path), idx2)
+    # Bump mtime so the change is observable even on coarse clocks.
+    ip = str(tmp_path / ".squishy" / "index.json")
+    st = os.stat(ip)
+    os.utime(ip, (st.st_atime, st.st_mtime + 10))
+
+    r2 = await _recall({"query": "authentication login"}, ctx)
+    assert r2.success
+    assert any("auth.py" in res.get("path", "") for res in r2.data["results"]), \
+        "recall served a stale cached index after rebuild"

@@ -6,9 +6,59 @@ from squishy.context import (
     build_system_prompt,
     compact_messages,
     detect_project,
+    normalize_messages,
     snip_old_tool_results,
     trim_history,
 )
+
+
+def _asst_tc(call_id, name="run_command"):
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": call_id, "type": "function",
+             "function": {"name": name, "arguments": "{}"}},
+        ],
+    }
+
+
+def test_normalize_drops_reverse_orphan_tool_message():
+    """A tool message whose id was never declared by a preceding assistant
+    (e.g. a synthetic result injected without its assistant call) is dropped."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": "done"},  # no tool_calls
+        {"role": "tool", "tool_call_id": "auto-pytest-0", "name": "run_command", "content": "F"},
+        {"role": "user", "content": "[system] nudge"},
+    ]
+    out = normalize_messages(msgs)
+    assert not any(m.get("role") == "tool" for m in out)
+    assert [m["role"] for m in out] == ["system", "user", "assistant", "user"]
+
+
+def test_normalize_keeps_well_formed_pairs():
+    """A properly paired assistant tool_calls + tool result survives."""
+    msgs = [
+        {"role": "user", "content": "go"},
+        _asst_tc("c1"),
+        {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": "ok"},
+    ]
+    out = normalize_messages(msgs)
+    assert out == msgs
+
+
+def test_normalize_keeps_result_after_intervening_user():
+    """A user message between the assistant call and its result does not
+    orphan the result — its id was still declared earlier."""
+    msgs = [
+        _asst_tc("c1"),
+        {"role": "user", "content": "[system] nudge"},
+        {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": "ok"},
+    ]
+    out = normalize_messages(msgs)
+    assert any(m.get("role") == "tool" and m["tool_call_id"] == "c1" for m in out)
  
  
 def test_detect_node_nextjs(tmp_path):

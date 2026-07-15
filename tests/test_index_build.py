@@ -76,3 +76,23 @@ def test_deleted_file_dropped(tmp_path: Path) -> None:
     idx2 = build_index(str(tmp_path), prior=idx1)
     assert idx2.find_file("pkg/b.py") is None
     assert idx2.find_file("pkg/a.py") is not None
+
+
+def test_root_with_no_indexable_file_keeps_all_top_level_dirs(tmp_path: Path) -> None:
+    """A repo whose root holds no indexable file (only subdirs) must not drop
+    all-but-one top-level directory from the index (build.py root-drop bug)."""
+    (tmp_path / "backend").mkdir()
+    (tmp_path / "backend" / "api.py").write_text('"""API."""\ndef handler(): return 1\n')
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "frontend" / "app.py").write_text('"""App."""\ndef render(): return 2\n')
+    # Root-level non-indexable noise only.
+    (tmp_path / ".gitignore").write_text("*.pyc\n")
+
+    idx = build_index(str(tmp_path))
+    assert idx.root.kind == "repo"
+    top = {c.name for c in idx.root.children if c.kind == "dir"}
+    assert {"backend", "frontend"} <= top, f"lost a subtree: {top}"
+    # Both files are reachable from the tree.
+    all_files = {n.path for n in idx.root.walk() if n.kind == "file"}
+    assert "backend/api.py" in all_files
+    assert "frontend/app.py" in all_files

@@ -11,7 +11,7 @@ import re
 from typing import Any
  
 from squishy.index.model import Node
-from squishy.index.store import load_index
+from squishy.index.store import index_path, load_index
 from squishy.tools.base import Tool, ToolContext, ToolResult
  
 MAX_RESULTS = 25
@@ -89,11 +89,18 @@ async def _recall(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     limit = min(int(args.get("limit", DEFAULT_LIMIT)), MAX_RESULTS)
     depth = max(0, min(depth, 4))
  
+    # Cache the loaded index, but invalidate when index.json changes on disk
+    # (e.g. after a `/init` rebuild mid-session) so recall never serves a
+    # stale tree for the whole session.
+    try:
+        cur_mtime = index_path(ctx.working_dir).stat().st_mtime
+    except OSError:
+        cur_mtime = -1.0
     idx = ctx._cached_index
-    if idx is None:
+    if idx is None or cur_mtime != ctx._cached_index_mtime:
         idx = load_index(ctx.working_dir)
-        if idx is not None:
-            ctx._cached_index = idx
+        ctx._cached_index = idx
+        ctx._cached_index_mtime = cur_mtime
     if idx is None:
         return ToolResult(
             False,
