@@ -11,7 +11,10 @@ Use from Python code or benchmark harnesses:
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
+import inspect
+import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
@@ -20,6 +23,44 @@ from squishy.agent import Agent, TaskResult
 from squishy.client import Client
 from squishy.config import MODES, Config, PermissionMode
 from squishy.display import Stats
+
+log = logging.getLogger("squishy.api")
+
+
+async def _await_and_log(awaitable: Any) -> None:
+    try:
+        await awaitable
+    except Exception:  # noqa: BLE001
+        log.warning("async squishy callback raised", exc_info=True)
+
+
+def _invoke_callback(fn: Callable[[Any], Any], arg: Any) -> None:
+    """Call a user callback (sync or async) without letting it break the loop.
+
+    Exceptions are logged, not swallowed silently. An async callback is
+    scheduled on the running loop (best-effort) instead of being created and
+    dropped — the previous behavior lost every async on_text callback.
+    """
+    try:
+        result = fn(arg)
+    except Exception:  # noqa: BLE001
+        log.warning("squishy callback raised", exc_info=True)
+        return
+    if inspect.isawaitable(result):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            log.warning("async squishy callback returned outside a running loop; dropped")
+            return
+        loop.create_task(_await_and_log(result))
+
+
+def _wrap_event(
+    on_event: Callable[[dict[str, Any]], Any],
+) -> Callable[[dict[str, Any]], None]:
+    def _cb(ev: dict[str, Any]) -> None:
+        _invoke_callback(on_event, ev)
+    return _cb
 
 # Field names shared between Squishy and Config (for _make_config).
 _CONFIG_FIELDS = frozenset(
@@ -31,9 +72,24 @@ _CONFIG_FIELDS = frozenset(
 class Squishy:
     """Facade around Config + Client + Agent, suitable for library use and benchmarks."""
 
-    model: str
-    base_url: str = "http://localhost:1234/v1"
-    api_key: str = "local"
+    # Connection fields default to the SAME env-var resolution the CLI/Config
+    # use, so a programmatic caller who set SQUISHY_BASE_URL / OPENAI_API_KEY /
+    # SQUISHY_MODEL gets them honored instead of silently overridden by hard
+    # facade defaults. Passing an explicit value still wins.
+    model: str = field(
+        default_factory=lambda: os.environ.get("SQUISHY_MODEL", "local-model")
+    )
+    base_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "SQUISHY_BASE_URL", os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1"),
+        )
+    )
+    api_key: str = field(
+        repr=False,
+        default_factory=lambda: os.environ.get(
+            "SQUISHY_API_KEY", os.environ.get("OPENAI_API_KEY", "local"),
+        ),
+    )
     temperature: float = 0.3
     max_tokens: int = 8192
     max_turns: int = 30
@@ -104,31 +160,38 @@ class Squishy:
         *,
         working_dir: str | None = None,
         timeout: float | None = None,
-        on_text: Callable[[str], None] | None = None,
+        on_text: Callable[[str], Any] | None = None,
+        on_event: Callable[[dict[str, Any]], Any] | None = None,
+        permission_mode: PermissionMode | None = None,
         session_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         notes: dict[str, str] | None = None,
     ) -> TaskResult:
         """Run a single user turn to completion.
 
-        ``notes`` pre-populates ``ToolContext.notes`` — bench harnesses use this
-        to thread eval metadata (e.g. FAIL_TO_PASS test names, install status)
-        through to the agent loop without polluting the prompt.
+        ``on_text`` receives streamed assistant text chunks. ``on_event``
+        receives structured lifecycle events (turn start, each tool call +
+        result, completion) as dicts — see ``Agent._emit`` for the shapes.
+        Both may be sync or async callables.
+
+        ``permission_mode`` overrides the facade's mode for this run only
+        (e.g. run one task in ``"plan"`` and the next in ``"yolo"`` off one
+        ``Squishy``). ``notes`` pre-populates ``ToolContext.notes`` — bench
+        harnesses thread eval metadata (FAIL_TO_PASS, install status) through
+        without polluting the prompt.
         """
-        cfg = self._make_config(working_dir)
-        display = _CallbackDisplay(on_text) if on_text else None
-        agent = Agent(cfg, self._client, display=display, session_id=session_id)  # type: ignore[arg-type]
-        if extra_env:
-            agent.tool_ctx.extra_env.update(extra_env)
-        if notes:
-            agent.tool_ctx.notes.update(notes)
+        agent = self._make_agent(
+            working_dir, permission_mode, on_text, on_event, session_id, extra_env, notes,
+        )
         return await agent.run(message, timeout=timeout)
 
     def chat(
         self,
         *,
         working_dir: str | None = None,
-        on_text: Callable[[str], None] | None = None,
+        on_text: Callable[[str], Any] | None = None,
+        on_event: Callable[[dict[str, Any]], Any] | None = None,
+        permission_mode: PermissionMode | None = None,
         session_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         notes: dict[str, str] | None = None,
@@ -141,16 +204,36 @@ class Squishy:
                 r1 = await session.send("read the code in app.py")
                 r2 = await session.send("now fix the bug you found")
         """
-        cfg = self._make_config(working_dir)
+        agent = self._make_agent(
+            working_dir, permission_mode, on_text, on_event, session_id, extra_env, notes,
+        )
+        return ChatSession(agent)
+
+    def _make_agent(
+        self,
+        working_dir: str | None,
+        permission_mode: PermissionMode | None,
+        on_text: Callable[[str], Any] | None,
+        on_event: Callable[[dict[str, Any]], Any] | None,
+        session_id: str | None,
+        extra_env: dict[str, str] | None,
+        notes: dict[str, str] | None,
+    ) -> Agent:
+        cfg = self._make_config(working_dir, permission_mode)
         display = _CallbackDisplay(on_text) if on_text else None
-        agent = Agent(cfg, self._client, display=display, session_id=session_id)  # type: ignore[arg-type]
+        agent = Agent(
+            cfg, self._client, display=display,  # type: ignore[arg-type]
+            session_id=session_id, on_event=_wrap_event(on_event) if on_event else None,
+        )
         if extra_env:
             agent.tool_ctx.extra_env.update(extra_env)
         if notes:
             agent.tool_ctx.notes.update(notes)
-        return ChatSession(agent)
+        return agent
 
-    def _make_config(self, working_dir: str | None) -> Config:
+    def _make_config(
+        self, working_dir: str | None, permission_mode: PermissionMode | None = None,
+    ) -> Config:
         overrides = {
             f.name: getattr(self, f.name)
             for f in fields(self)
@@ -162,6 +245,10 @@ class Squishy:
             overrides.pop("session_dir", None)
         if working_dir:
             overrides["working_dir"] = working_dir
+        if permission_mode is not None:
+            if permission_mode not in MODES:
+                raise ValueError(f"permission_mode must be one of {MODES}")
+            overrides["permission_mode"] = permission_mode
         return replace(Config(), **overrides)
 
 
@@ -201,7 +288,7 @@ class _CallbackDisplay:
     that we don't need to handle (turn_header, tool_result, etc.).
     """
 
-    def __init__(self, on_text: Callable[[str], None]) -> None:
+    def __init__(self, on_text: Callable[[str], Any]) -> None:
         self._on_text = on_text
         self.stats = Stats()
         self.console = type(
@@ -210,8 +297,9 @@ class _CallbackDisplay:
         )()
 
     def streaming_text_chunk(self, chunk: str) -> None:
-        with contextlib.suppress(Exception):
-            self._on_text(chunk)
+        # Errors are logged (not silently swallowed); async callbacks are
+        # scheduled instead of dropped.
+        _invoke_callback(self._on_text, chunk)
 
     def __getattr__(self, name: str) -> Any:
         return lambda *a, **kw: None

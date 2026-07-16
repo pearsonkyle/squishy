@@ -19,6 +19,22 @@ from pathlib import Path
 from typing import Any, Protocol
  
 log = logging.getLogger("squishy.bench.runner")
+
+
+def load_records(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
+    """Load benchmark records from a ``.jsonl`` file or a JSON file.
+
+    ``.jsonl`` -> one object per non-blank line. Any other suffix is parsed as
+    JSON and normalized to a list (a bare object becomes a one-element list).
+    Shared by the SWE-bench and Terminal-bench loaders so the format handling
+    lives in one place.
+    """
+    p = Path(path)
+    text = p.read_text(encoding="utf-8")
+    if p.suffix == ".jsonl":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    data = json.loads(text)
+    return data if isinstance(data, list) else [data]
  
  
 class BenchTask(Protocol):

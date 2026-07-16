@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import difflib
-import math
 from dataclasses import dataclass, field
 
 from rich.console import Console
@@ -15,21 +14,12 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from squishy.plan_state import STATUS_ICONS
+# Re-exported so existing `from squishy.display import estimate_tokens`
+# imports keep working; the implementation now lives in squishy.tokens.
+from squishy.tokens import estimate_tokens as estimate_tokens
 from squishy.tool_restrictions import get_allowed_tools
 
 MODE_COLORS = {"plan": "ansicyan", "edits": "ansigreen", "yolo": "ansimagenta", "bench": "ansiyellow"}
-
-
-def estimate_tokens(text: str) -> int:
-    """Estimate token count from text.
-
-    Uses ~3.5 chars/token (better for code-heavy content than the
-    common 4 chars/token) plus a small per-message overhead to
-    account for role/formatting tokens the API adds.
-    """
-    if not text:
-        return 0
-    return math.ceil(len(text) / 3.5) + 4
 
 
 def fmt_tokens(count: int, context_window: int = 0) -> str:

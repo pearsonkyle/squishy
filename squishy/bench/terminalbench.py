@@ -20,7 +20,6 @@ to spawn that contract by changing how ``setup`` / ``verify`` execute.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import tempfile
 from collections import Counter
@@ -288,18 +287,8 @@ def _classify_error(task_result: TaskResult, verified: bool) -> str:
  
 def load_tasks(path: str | Path) -> list[TerminalTask]:
     """Load tasks from a JSONL or JSON file."""
-    p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    tasks: list[dict[str, Any]] = []
-    if p.suffix == ".jsonl":
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                tasks.append(json.loads(line))
-    else:
-        data = json.loads(text)
-        tasks = data if isinstance(data, list) else [data]
-    return [TerminalTask.from_dict(t) for t in tasks]
+    from squishy.bench.runner import load_records
+    return [TerminalTask.from_dict(t) for t in load_records(path)]
  
  
 def _snapshot_workspace(workspace: Path) -> list[dict[str, Any]]:

@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -126,6 +127,11 @@ class Agent:
     client: Client
     display: Display | None = None
     prompt_fn: PromptFn | None = None
+    # Optional structured-event sink (programmatic API). Receives dicts:
+    #   {"type": "turn", "turn": n}
+    #   {"type": "tool", "name": str, "args": dict, "success": bool}
+    #   {"type": "done", "success": bool, "turns": n}
+    on_event: Callable[[dict[str, Any]], None] | None = None
     tool_ctx: ToolContext = field(init=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
     consecutive_reads_without_recall: int = 0
@@ -274,6 +280,7 @@ class Agent:
 
         self._persist_new_messages()
         self._finish_session(st, status="completed" if success else "error")
+        self._emit({"type": "done", "success": success, "turns": turn})
         return TaskResult(
             success=success, final_text=final_text, error=error,
             turns_used=turn,
@@ -686,6 +693,7 @@ class Agent:
 
         for turn in range(1, self.config.max_turns + 1):
             self._active_turn = turn
+            self._emit({"type": "turn", "turn": turn})
             # Done phase (bench): no tools available, model must produce prose.
             if ps and ps.phase == "done":
                 # v2 auto-pytest finish gate (Site B — done phase).  Same
@@ -823,8 +831,8 @@ class Agent:
             # — no file bodies — to keep the nudge cheap.
             if did_compact and is_bench and st.problem_text:
                 try:
-                    from squishy.bench.swebench import _recall_from_index
-                    pointers = _recall_from_index(
+                    from squishy.tools.recall import recall_from_index
+                    pointers = recall_from_index(
                         self.config.working_dir, st.problem_text, limit=5,
                     )
                 except Exception:  # noqa: BLE001
@@ -982,6 +990,11 @@ class Agent:
 
                 outcome = await run_tool(self, turn, tc)
                 dispatched_pairs.append((tc, outcome))
+                self._emit({
+                    "type": "tool", "name": tc.name,
+                    "args": dict(tc.args) if isinstance(tc.args, dict) else tc.args,
+                    "success": bool(outcome.get("success")),
+                })
 
                 # Informational feedback.
                 inject_test_failure_nudge(self, st, tc, outcome, turn=turn)
@@ -1171,6 +1184,18 @@ class Agent:
             self.display.warn(msg)
             self._sync_display_stats(st, self.config.max_turns)
         return self._build_result(st, success=False, error=msg, turn=self.config.max_turns)
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        """Send a structured lifecycle event to the optional on_event sink.
+
+        Never lets a caller's sink break the loop.
+        """
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001
+            log.debug("on_event sink raised", exc_info=True)
 
     async def _on_text(self, chunk: str) -> None:
         if self.display:

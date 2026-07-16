@@ -12,6 +12,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from squishy.index.store import has_index
+from squishy.tokens import (
+    CHARS_PER_TOKEN,
+    PER_MSG_OVERHEAD,
+    estimate_message_tokens,
+    message_chars,
+)
 from squishy.tools.fs import SKIP_DIRS
 
  
@@ -584,24 +590,10 @@ def _strip_orphan_assistant_tool_calls(
 # ── Layer 2: LLM-based context compaction ────────────────────────────────
 
 
-def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
-    """Estimate token count from message contents.
-
-    Uses ~3.5 chars/token (better for code-heavy content) plus 4-token
-    overhead per message for role/formatting added by the API.
-    """
-    total = 0
-    for m in messages:
-        chars = 0
-        content = m.get("content", "")
-        if isinstance(content, str):
-            chars += len(content)
-        for tc in m.get("tool_calls", []):
-            if isinstance(tc, dict):
-                func = tc.get("function", {})
-                chars += len(func.get("name", "")) + len(func.get("arguments", ""))
-        total += int(chars / 3.5) + 4  # per-message overhead
-    return total
+# Token estimation lives in squishy.tokens (single source of the 3.5
+# chars/token heuristic). Kept as a module-local alias for readability and
+# back-compat with any importer of _estimate_message_tokens.
+_estimate_message_tokens = estimate_message_tokens
 
 
 def find_compaction_split(
@@ -612,18 +604,11 @@ def find_compaction_split(
     Walks backwards from end, accumulating token estimates, and returns
     the index where the recent portion reaches keep_ratio of total tokens.
     """
-    total = _estimate_message_tokens(messages)
+    total = estimate_message_tokens(messages)
     target = int(total * keep_ratio)
     running = 0
     for i in range(len(messages) - 1, -1, -1):
-        m = messages[i]
-        content = m.get("content", "")
-        chars = len(content) if isinstance(content, str) else 0
-        for tc in m.get("tool_calls", []):
-            if isinstance(tc, dict):
-                func = tc.get("function", {})
-                chars += len(func.get("name", "")) + len(func.get("arguments", ""))
-        running += int(chars / 3.5) + 4
+        running += int(message_chars(messages[i]) / CHARS_PER_TOKEN) + PER_MSG_OVERHEAD
         if running >= target:
             return i
     return 0

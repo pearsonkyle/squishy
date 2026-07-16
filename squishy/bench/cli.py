@@ -9,26 +9,19 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import sys
-from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
  
 from squishy.api import Squishy
-from squishy.bench.runner import BenchResult, PredictionWriter, run_batch
+from squishy.bench.runner import BenchResult, PredictionWriter, load_records, run_batch
 from squishy.bench.swebench import run_swebench_instance
 from squishy.bench.terminalbench import TerminalTask, load_tasks, run_terminal_task
  
  
 def _load_instances(path: str) -> list[dict[str, Any]]:
-    p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    if p.suffix == ".jsonl":
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
-    data = json.loads(text)
-    return data if isinstance(data, list) else [data]
+    return load_records(path)
 
 
 def _parse() -> argparse.Namespace:

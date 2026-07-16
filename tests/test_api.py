@@ -244,3 +244,85 @@ def test_bench_tools_excludes_fetch_url():
     the tool schema."""
     from squishy.tool_restrictions import BENCH_TOOLS
     assert "fetch_url" not in BENCH_TOOLS
+
+
+# -- Phase 5: API ergonomics --------------------------------------------------
+
+async def test_env_var_precedence_when_not_overridden(monkeypatch):
+    """A caller who sets env vars (and doesn't pass explicit values) gets them
+    honored instead of silently overridden by facade defaults."""
+    monkeypatch.setenv("SQUISHY_BASE_URL", "http://envhost:9999/v1")
+    monkeypatch.setenv("SQUISHY_API_KEY", "env-secret")
+    monkeypatch.setenv("SQUISHY_MODEL", "env-model")
+    with patch("squishy.api.Client", return_value=_ScriptedClient([])):
+        sq = Squishy()  # no explicit connection args
+        cfg = sq._make_config(None)
+    assert cfg.base_url == "http://envhost:9999/v1"
+    assert cfg.api_key == "env-secret"
+    assert cfg.model == "env-model"
+
+
+async def test_explicit_args_win_over_env(monkeypatch):
+    monkeypatch.setenv("SQUISHY_BASE_URL", "http://envhost:9999/v1")
+    with patch("squishy.api.Client", return_value=_ScriptedClient([])):
+        sq = Squishy(model="m", base_url="http://explicit:1/v1")
+        cfg = sq._make_config(None)
+    assert cfg.base_url == "http://explicit:1/v1"
+
+
+async def test_per_run_mode_override(tmp_path):
+    """run(permission_mode=...) overrides the facade's mode for that run only."""
+    with patch("squishy.api.Client", return_value=_ScriptedClient([CompletionResult(text="ok", tool_calls=[])])):
+        sq = Squishy(model="fake", permission_mode="yolo")
+        agent = sq._make_agent(str(tmp_path), "plan", None, None, None, None, None)
+    assert agent.config.permission_mode == "plan"
+
+
+async def test_per_run_mode_override_rejects_bad_mode(tmp_path):
+    with patch("squishy.api.Client", return_value=_ScriptedClient([])):
+        sq = Squishy(model="fake")
+        with pytest.raises(ValueError):
+            sq._make_config(str(tmp_path), "bogus")  # type: ignore[arg-type]
+
+
+async def test_on_event_emits_turn_tool_done(tmp_path):
+    script = [
+        CompletionResult(tool_calls=[ToolCall(id="c1", name="write_file",
+                         args={"path": "a.py", "content": "x"})]),
+        CompletionResult(text="done", tool_calls=[]),
+    ]
+    events: list[dict] = []
+    with patch("squishy.api.Client", return_value=_ScriptedClient(script)):
+        async with Squishy(model="fake", permission_mode="yolo") as sq:
+            await sq.run("write a.py", working_dir=str(tmp_path), on_event=events.append)
+    types = [e["type"] for e in events]
+    assert "turn" in types
+    assert "done" in types
+    tool_events = [e for e in events if e["type"] == "tool"]
+    assert any(e["name"] == "write_file" and e["success"] for e in tool_events)
+
+
+async def test_on_text_exception_is_logged_not_fatal(tmp_path):
+    """A throwing on_text must not crash the run (and is no longer swallowed
+    silently — it's logged)."""
+    def boom(_chunk):
+        raise RuntimeError("callback boom")
+    script = [CompletionResult(text="hello", tool_calls=[])]
+    with patch("squishy.api.Client", return_value=_ScriptedClient(script)):
+        async with Squishy(model="fake") as sq:
+            result = await sq.run("hi", working_dir=str(tmp_path), on_text=boom)
+    assert result.success
+
+
+async def test_async_on_text_is_scheduled_not_dropped(tmp_path):
+    seen: list[str] = []
+    async def async_cb(chunk):
+        seen.append(chunk)
+    script = [CompletionResult(text="abc", tool_calls=[])]
+    with patch("squishy.api.Client", return_value=_ScriptedClient(script)):
+        async with Squishy(model="fake") as sq:
+            await sq.run("hi", working_dir=str(tmp_path), on_text=async_cb)
+    # Let scheduled callback tasks run.
+    import asyncio
+    await asyncio.sleep(0)
+    assert "".join(seen) == "abc"

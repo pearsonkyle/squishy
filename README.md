@@ -119,7 +119,9 @@ async def main():
             "Fix the TypeError in app.py",
             working_dir="/tmp/repo",
             timeout=300,                 # overall task timeout
+            permission_mode="edits",     # per-run override of the facade default
             on_text=lambda chunk: print(chunk, end=""),
+            on_event=lambda ev: print(ev),   # structured lifecycle events
         )
         print(result.success, result.files_edited, result.turns_used)
 
@@ -127,6 +129,20 @@ asyncio.run(main())
 ```
 
 `TaskResult` fields: `success`, `final_text`, `turns_used`, `tokens_used`, `files_created`, `files_edited`, `commands_run`, `elapsed_s`, `error`, `messages`, `plan_state`.
+
+Ergonomics:
+
+- **Config precedence** — connection defaults (`model`, `base_url`, `api_key`)
+  fall back to the same env vars the CLI uses (`SQUISHY_MODEL`,
+  `SQUISHY_BASE_URL`/`OPENAI_BASE_URL`, `SQUISHY_API_KEY`/`OPENAI_API_KEY`).
+  An explicit argument always wins.
+- **Per-run mode** — pass `permission_mode=` to `run()`/`chat()` to override the
+  facade's mode for a single call (e.g. plan one task, then execute the next).
+- **`on_text`** — streamed assistant text chunks. May be sync or async;
+  exceptions are logged, not swallowed.
+- **`on_event`** — structured lifecycle events as dicts: `{"type": "turn",
+  "turn": n}`, `{"type": "tool", "name", "args", "success"}`, `{"type": "done",
+  "success", "turns"}`. May be sync or async.
 
 ### Error model
 

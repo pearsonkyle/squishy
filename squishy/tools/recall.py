@@ -171,6 +171,76 @@ async def _recall(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     )
  
  
+def recall_from_index(
+    workspace: str, problem_text: str, limit: int = 8,
+) -> list[dict[str, Any]]:
+    """Pre-query the repo index using a free-text problem statement.
+
+    Returns a list of ``{kind, name, path, lines, summary}`` dicts for the
+    most relevant symbols/files — used to seed the agent with likely-relevant
+    code (bench prompt build + post-compaction re-injection). Lives here (not
+    in the bench package) so the core loop never imports from ``squishy.bench``.
+
+    When a recalled symbol is a class in a multi-class file, its sibling
+    classes are also surfaced so the agent doesn't fix one and miss the rest.
+    """
+    from squishy.index.store import load_index
+
+    idx = load_index(str(workspace))
+    if idx is None:
+        return []
+
+    q_lower = problem_text.strip().lower()[:500]
+    q_tokens = _tokens(problem_text)
+    if not q_tokens:
+        return []
+
+    scored: list[tuple[float, Node]] = []
+    for node in idx.root.walk():
+        if node.kind == "repo":
+            continue
+        s = _score(node, q_lower, q_tokens)
+        if s > 0:
+            scored.append((s, node))
+    scored.sort(key=lambda t: (-t[0], t[1].path, t[1].name))
+
+    # Build a path → file-node map once so sibling-class lookup is O(1).
+    file_by_path: dict[str, Node] = {}
+    for node in idx.root.walk():
+        if node.kind == "file":
+            file_by_path[node.path] = node
+
+    results: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    def _emit(node: Node) -> bool:
+        key = f"{node.path}:{node.name}"
+        if key in seen_keys:
+            return False
+        seen_keys.add(key)
+        results.append(_trim(node, 0))
+        return True
+
+    for _, node in scored[: limit * 3]:
+        if len(results) >= limit:
+            break
+        if not _emit(node):
+            continue
+        if node.kind != "class":
+            continue
+        file_node = file_by_path.get(node.path)
+        if file_node is None:
+            continue
+        for sib in file_node.children:
+            if sib.kind != "class" or sib.name == node.name:
+                continue
+            if len(results) >= limit:
+                break
+            _emit(sib)
+
+    return results
+
+
 recall = Tool(
     name="recall",
     description=(
@@ -201,4 +271,4 @@ recall = Tool(
 RECALL_TOOLS: list[Tool] = [recall]
  
  
-__all__ = ["recall", "RECALL_TOOLS"]
+__all__ = ["recall", "recall_from_index", "RECALL_TOOLS"]
