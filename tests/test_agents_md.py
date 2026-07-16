@@ -143,3 +143,18 @@ def test_sessions_dir_is_skipped(tmp_path):
     assert "sessions/" not in out
     assert "abc123" not in out
     assert "real.py" in out
+
+
+def test_agents_md_permits_fallback_exploration():
+    """Generated AGENTS.md must prefer recall but NOT forbid fallback tools —
+    the never-block-exploration contract."""
+    from squishy.index import build_index
+    from squishy.index.agents_md import generate_agents_md
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "m.py"), "w") as f:
+            f.write('"""M."""\ndef f(): return 1\n')
+        idx = build_index(tmp)
+        md = generate_agents_md(idx, cwd=tmp)
+    assert "fall back" in md.lower() or "fallback" in md.lower()
+    assert "Do not call read_file, list_directory, or search_files without" not in md

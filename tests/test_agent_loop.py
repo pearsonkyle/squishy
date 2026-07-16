@@ -1162,3 +1162,42 @@ async def test_consecutive_identical_resets_after_edit(tmp_path):
     )
     # The edit should have been applied.
     assert (tmp_path / "foo.py").read_text() == "new line\n"
+
+
+async def test_recall_miss_relaxes_recall_enforcement(tmp_path):
+    """When recall returns zero matches, plan-mode enforcement must relax so
+    the model can fall back to reads without being nagged to 'use recall'."""
+    from squishy.index import build_index, save_index
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 6
+    cfg.max_recall_skip_turns = 2
+    (tmp_path / "foo.py").write_text('"""Foo module."""\ndef widget(): return 1\n')
+    save_index(str(tmp_path), build_index(str(tmp_path)))
+
+    fake = FakeClient(
+        script=[
+            # recall for something not in the index -> total_matched == 0
+            CompletionResult(tool_calls=[_tc("recall", {"query": "zzz_no_such_symbol"})]),
+            CompletionResult(tool_calls=[_tc("read_file", {"path": "foo.py"})]),
+            CompletionResult(tool_calls=[_tc("read_file", {"path": "foo.py", "offset": 1}, "c2")]),
+            CompletionResult(tool_calls=[_tc("read_file", {"path": "foo.py", "offset": 2}, "c3")]),
+            CompletionResult(tool_calls=[_tc("plan_task", {"problem": "p", "solution": "s", "steps": ["a"]})]),
+        ]
+    )
+
+    async def auto_approve(_tool, _args):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    assert agent.has_index  # index was built, so enforcement is otherwise active
+    result = await agent.run("find the widget")
+
+    assert result.success
+    assert agent.recall_missed
+    assert not any(
+        "Too many read calls without `recall`" in (m.get("content") or "")
+        for m in result.messages
+    ), "recall-miss should have relaxed the recall-first enforcement"

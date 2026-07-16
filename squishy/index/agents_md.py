@@ -324,8 +324,10 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
     lines.append("3. plan_task(problem=..., solution=..., steps=[...])")
     lines.append("")
     lines.append(
-        "Do not call read_file, list_directory, or search_files without first "
-        "calling recall. The index lives at .squishy/index.json."
+        "Prefer recall(query=...) to locate code fast. If the index misses or "
+        "returns nothing useful, fall back to search_files / glob_files / "
+        "read_file — exploration is never blocked. The index lives at "
+        ".squishy/index.json."
     )
     lines.append("")
 

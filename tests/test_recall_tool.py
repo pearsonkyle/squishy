@@ -282,3 +282,44 @@ async def test_recall_reloads_after_index_rebuild(tmp_path: Path) -> None:
     assert r2.success
     assert any("auth.py" in res.get("path", "") for res in r2.data["results"]), \
         "recall served a stale cached index after rebuild"
+
+
+def test_is_downranked_paths():
+    from squishy.tools.recall import _is_downranked
+    assert _is_downranked("tests/test_foo.py")
+    assert _is_downranked("pkg/tests/helpers.py")
+    assert _is_downranked("vendor/lib/x.py")
+    assert _is_downranked("examples/demo.py")
+    assert _is_downranked("src/test_widget.py")
+    assert not _is_downranked("src/widget.py")
+    assert not _is_downranked("pkg/core.py")
+
+
+def test_score_downranks_test_paths_below_source():
+    """A source symbol should outrank a same-name test symbol."""
+    from squishy.index.model import Node
+    from squishy.tools.recall import _score, _tokens
+    src = Node(id="s", kind="function", name="parse_config", path="src/config.py")
+    tst = Node(id="t", kind="function", name="parse_config", path="tests/test_config.py")
+    q = "parse_config"
+    assert _score(src, q, _tokens(q)) > _score(tst, q, _tokens(q))
+
+
+async def test_recall_ranks_source_above_test(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "widget.py").write_text(
+        '"""Widget rendering."""\ndef render_widget(): return 1\n'
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_widget.py").write_text(
+        '"""Widget tests."""\ndef render_widget(): return 1\n'
+    )
+    idx = build_index(str(tmp_path))
+    save_index(str(tmp_path), idx)
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
+    r = await _recall({"query": "render_widget"}, ctx)
+    assert r.success
+    paths = [res.get("path", "") for res in r.data["results"]]
+    src_i = next(i for i, p in enumerate(paths) if p.startswith("src/"))
+    tst_i = next(i for i, p in enumerate(paths) if p.startswith("tests/"))
+    assert src_i < tst_i, f"source should rank above test: {paths}"

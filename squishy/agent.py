@@ -129,6 +129,10 @@ class Agent:
     tool_ctx: ToolContext = field(init=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
     consecutive_reads_without_recall: int = 0
+    # Set once recall returns zero matches in this user turn — a thin/irrelevant
+    # index must not trap the model in a recall→miss→"use recall" loop, so
+    # enforcement relaxes and normal exploration (read/list/search) is allowed.
+    recall_missed: bool = field(init=False, default=False)
     has_index: bool = field(init=False, default=False)
     session_id: str | None = None
     _last_persisted_idx: int = field(init=False, default=0)
@@ -187,6 +191,7 @@ class Agent:
     ) -> TaskResult:
         """Run one user turn to completion."""
         self.consecutive_reads_without_recall = 0
+        self.recall_missed = False
         self.messages.append({"role": "user", "content": user_message})
         start = time.monotonic()
         try:
@@ -991,6 +996,14 @@ class Agent:
                 if tc.name in ("read_file", "list_directory", "search_files") and outcome["success"]:
                     local_read_without_recall += 1
 
+                # A recall that matched nothing means the index can't guide
+                # this task — stop pushing the model toward recall so it can
+                # fall back to plain exploration.
+                if tc.name == "recall" and outcome.get("success") and not (
+                    outcome.get("data", {}) or {}
+                ).get("total_matched"):
+                    self.recall_missed = True
+
                 # Plan-approved terminal event (interactive plan mode).
                 if outcome.get("plan_approved") and self.config.permission_mode == "plan":
                     self._sync_display_stats(st, turn)
@@ -1016,7 +1029,11 @@ class Agent:
             if self.config.permission_mode == "plan" and not is_bench:
                 recall_skip_budget = self.config.max_recall_skip_turns
                 self.consecutive_reads_without_recall += local_read_without_recall
-                if self.has_index and self.consecutive_reads_without_recall >= recall_skip_budget:
+                if (
+                    self.has_index
+                    and not self.recall_missed
+                    and self.consecutive_reads_without_recall >= recall_skip_budget
+                ):
                     if self.consecutive_reads_without_recall == recall_skip_budget:
                         warning_msg = (
                             f"You've called read tools {recall_skip_budget} times without using `recall`. "

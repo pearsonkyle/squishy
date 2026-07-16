@@ -22,6 +22,30 @@ _TOKEN_RX = re.compile(r"[A-Za-z0-9_]+")
 # Split camelCase/PascalCase: "JSONQuery" → ["JSON", "Query"]
 _CAMEL_RX = re.compile(r"[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z]+|[A-Z]+|[0-9]+")
 
+# Path segments that mark lower-priority (non-authored / non-source) code.
+# A match under one of these is down-weighted so first-party source ranks
+# above tests/examples/vendored code — the single most impactful lexical
+# ranking signal. It is a *penalty*, never a filter: these still surface when
+# they are the best (or only) match, so exploration is never blocked.
+_DOWNRANK_SEGMENTS = frozenset({
+    "tests", "test", "vendor", "third_party", "third-party",
+    "examples", "example", "docs", "doc", "fixtures", "testdata",
+    "site-packages", "node_modules",
+})
+_DOWNRANK_FACTOR = 0.55
+
+
+def _is_downranked(path: str) -> bool:
+    """True if any path segment marks non-authored / non-source code."""
+    if not path:
+        return False
+    segs = path.lower().replace("\\", "/").split("/")
+    if any(s in _DOWNRANK_SEGMENTS for s in segs):
+        return True
+    # test_*.py / *_test.go style filenames.
+    base = segs[-1]
+    return base.startswith("test_") or base.endswith(("_test.py", "_test.go"))
+
 
 def _tokens(s: str) -> set[str]:
     """Extract searchable tokens, splitting snake_case and camelCase."""
@@ -62,10 +86,16 @@ def _score(node: Node, q_lower: str, q_tokens: set[str]) -> float:
     # Small bonus for leaf symbols — only when the node matched at all.
     if score > 0 and node.kind in ("class", "function", "method"):
         score += 0.5
+    # Down-weight non-authored / non-source matches so first-party code ranks
+    # higher, but never zero them out — they remain available.
+    if score > 0 and _is_downranked(node.path):
+        score *= _DOWNRANK_FACTOR
     return score
  
  
-def _trim(node: Node, depth: int) -> dict[str, Any]:
+def _trim(
+    node: Node, depth: int, q_lower: str = "", q_tokens: set[str] | None = None,
+) -> dict[str, Any]:
     d: dict[str, Any] = {
         "kind": node.kind,
         "name": node.name,
@@ -76,7 +106,14 @@ def _trim(node: Node, depth: int) -> dict[str, Any]:
     if node.summary:
         d["summary"] = node.summary
     if depth > 0 and node.children:
-        d["children"] = [_trim(c, depth - 1) for c in node.children[:8]]
+        # Surface the children most relevant to the query first, so a matching
+        # method in a >8-member class isn't dropped by arbitrary source order.
+        qt = q_tokens or set()
+        children = sorted(
+            node.children,
+            key=lambda c: (-_score(c, q_lower, qt), c.name),
+        )
+        d["children"] = [_trim(c, depth - 1, q_lower, qt) for c in children[:8]]
     return d
  
  
@@ -121,7 +158,7 @@ async def _recall(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             scored.append((s, node))
     scored.sort(key=lambda t: (-t[0], t[1].path, t[1].name))
  
-    results = [_trim(n, depth) for _, n in scored[:limit]]
+    results = [_trim(n, depth, q_lower, q_tokens) for _, n in scored[:limit]]
     return ToolResult(
         True,
         data={
