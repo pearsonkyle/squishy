@@ -46,6 +46,7 @@ from squishy.agent_state import (
     prose_msg,
 )
 from squishy.phase_machine import PhaseState, advance, check_finish_plan_gate, check_transition
+from squishy.tool_aliases import normalize_call
 from squishy.client import Client, CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.context import (
@@ -932,6 +933,14 @@ class Agent:
                 if isinstance(result, TaskResult):
                     return result
                 continue
+
+            # Tolerance layer: map alternate tool/parameter vocabularies (bash,
+            # grep, str_replace, file_path, …) onto squishy's canonical tools so
+            # a model fine-tuned on a different harness isn't penalized. Applied
+            # before recording, loop detection, quality checks, and dispatch so
+            # everything downstream sees canonical names.
+            for tc in completion.tool_calls:
+                tc.name, tc.args = normalize_call(tc.name, tc.args)
 
             self.messages.append(assistant_msg(completion.text, completion.tool_calls, completion.reasoning))
 

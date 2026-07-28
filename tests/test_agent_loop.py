@@ -1201,3 +1201,31 @@ async def test_recall_miss_relaxes_recall_enforcement(tmp_path):
         "Too many read calls without `recall`" in (m.get("content") or "")
         for m in result.messages
     ), "recall-miss should have relaxed the recall-first enforcement"
+
+
+async def test_alias_tool_call_dispatches_canonically(tmp_path):
+    """A model that emits `create`/`file_path` (another harness's vocabulary)
+    should have it normalized and dispatched as write_file."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 4
+    fake = FakeClient(
+        script=[
+            CompletionResult(tool_calls=[_tc("create", {"file_path": "hi.py", "content": "print(1)\n"})]),
+            CompletionResult(text="done", tool_calls=[]),
+        ]
+    )
+    agent = Agent(cfg, fake, display=None)  # type: ignore[arg-type]
+    result = await agent.run("make hi.py")
+    assert result.success
+    assert (tmp_path / "hi.py").read_text() == "print(1)\n"
+    assert "hi.py" in result.files_created
+    # The recorded assistant call was rewritten to the canonical tool name.
+    tool_names = [
+        tc["function"]["name"]
+        for m in result.messages if m.get("role") == "assistant"
+        for tc in (m.get("tool_calls") or [])
+    ]
+    assert "write_file" in tool_names
+    assert "create" not in tool_names
