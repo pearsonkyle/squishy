@@ -123,7 +123,6 @@ def build_system_prompt(
     project_line = _project_line(project)
     index_block = _index_header(cwd)
     top_files_block = "" if has_idx else _top_level_files_block(cwd)
-    mcp_block = _mcp_block()
     instructions_block = load_agent_instructions(cwd)
 
     parts = [
@@ -139,7 +138,11 @@ def build_system_prompt(
     parts = [p for p in parts if p]
     body = "\n\n".join(parts)
     # Tail blocks already start with their own leading "\n" or are empty.
-    return body + index_block + top_files_block + mcp_block + instructions_block
+    # MCP tools are NOT listed in prose here: they're already in the tool
+    # schema (with names + descriptions) in edits/yolo, and correctly hidden
+    # from the schema in plan mode — so a prose block would only duplicate them
+    # (wasting context) or advertise tools that are blocked in plan mode.
+    return body + index_block + top_files_block + instructions_block
 
 
 def _rules_block(has_idx: bool) -> str:
@@ -270,24 +273,6 @@ def _mode_block(mode: str, cwd: str = "") -> str:
         "## Mode: edits\n"
         "- `run_command` requires per-call user approval.\n"
         "- If a plan was approved, follow it (see `## Rules` for the update_plan / finish_plan flow)."
-    )
-
-
-def _mcp_block() -> str:
-    """Return a system prompt section listing available MCP tools."""
-    try:
-        from squishy.mcp.tools import get_mcp_tools
-        tools = get_mcp_tools()
-    except Exception:
-        return ""
-    if not tools:
-        return ""
-    lines = [f"- `{t.name}`: {t.description}" for t in tools]
-    return (
-        "\n## MCP Tools\n"
-        "External tools available via MCP (Model Context Protocol):\n"
-        + "\n".join(lines) + "\n"
-        "Call these tools by name like any built-in tool.\n"
     )
 
 
