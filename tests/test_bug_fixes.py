@@ -65,3 +65,40 @@ def test_at_reference_missing_marker_uses_clean_path(tmp_path):
     assert "[file not found: nope.py]" in result
     # The trailing sentence period survives outside the marker.
     assert result.rstrip().endswith(".")
+
+
+# --- #5: model save_note cannot corrupt harness-reserved notes ------------
+
+async def test_save_note_cannot_evict_reserved(tmp_path):
+    from squishy.tools.base import ToolContext
+    from squishy.tools.scratchpad import MAX_NOTES, _save_note
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="bench", use_sandbox=False)
+    ctx.notes["fail_to_pass_tests"] = '["tests/a.py::t1"]'
+    ctx.reserved_note_keys.add("fail_to_pass_tests")
+    # Fill past capacity with model notes.
+    for i in range(MAX_NOTES + 3):
+        r = await _save_note({"key": f"n{i}", "content": f"v{i}"}, ctx)
+        assert r.success
+    # The reserved harness key survives eviction.
+    assert ctx.notes.get("fail_to_pass_tests") == '["tests/a.py::t1"]'
+
+
+async def test_save_note_cannot_overwrite_reserved(tmp_path):
+    from squishy.tools.base import ToolContext
+    from squishy.tools.scratchpad import _save_note
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="bench", use_sandbox=False)
+    ctx.notes["install_status"] = '{"ok": false}'
+    ctx.reserved_note_keys.add("install_status")
+    r = await _save_note({"key": "install_status", "content": "garbage"}, ctx)
+    assert not r.success
+    assert "reserved" in r.error
+    assert ctx.notes["install_status"] == '{"ok": false}'
+
+
+async def test_save_note_caps_key_length(tmp_path):
+    from squishy.tools.base import ToolContext
+    from squishy.tools.scratchpad import MAX_NOTE_KEY_CHARS, _save_note
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="yolo", use_sandbox=False)
+    r = await _save_note({"key": "k" * 5000, "content": "v"}, ctx)
+    assert r.success
+    assert all(len(k) <= MAX_NOTE_KEY_CHARS for k in ctx.notes)

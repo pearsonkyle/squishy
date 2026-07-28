@@ -229,6 +229,9 @@ class Squishy:
             agent.tool_ctx.extra_env.update(extra_env)
         if notes:
             agent.tool_ctx.notes.update(notes)
+            # Harness-threaded metadata (FAIL_TO_PASS, install status, …) must
+            # not be evictable/overwritable by the model's save_note.
+            agent.tool_ctx.reserved_note_keys.update(notes.keys())
         return agent
 
     def _make_config(

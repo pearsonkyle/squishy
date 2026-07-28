@@ -30,6 +30,12 @@ async def run_tool(agent: Agent, turn: int, tc: ToolCall) -> dict[str, Any]:
         if old_str and new_str:
             agent.display.edit_diff(str(tc.args.get("path", "")), old_str, new_str)
 
+    # Re-sync the permission mode immediately before dispatch so a mid-turn
+    # shift-tab (e.g. yolo→plan to abort a destructive command) is enforced on
+    # the remaining in-flight tool calls, not only from the next turn. The
+    # ModeCycler mutates config.permission_mode between awaits during dispatch.
+    agent.tool_ctx.permission_mode = agent.config.permission_mode
+
     t0 = time.monotonic()
     outcome = await dispatch(tc.name, tc.args, agent.tool_ctx, prompt_fn=agent.prompt_fn)
     dt_ms = (time.monotonic() - t0) * 1000

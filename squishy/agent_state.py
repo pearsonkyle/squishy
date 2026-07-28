@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -266,28 +267,52 @@ def is_test_path(path: str) -> bool:
 # Command classification
 # ---------------------------------------------------------------------------
 
-def is_test_command(cmd: str) -> bool:
-    """Return True if ``cmd`` looks like a test invocation (not just a path containing 'test').
+# Runner flags that inspect/collect rather than actually run the suite — an
+# exit-0 for one of these must NOT count as "tests passed".
+_META_RUNNER_FLAGS = frozenset({
+    "--version", "--help", "-h", "--collect-only", "--co", "--fixtures", "--markers",
+})
 
-    Requires an actual test runner keyword at the start of the command or after
-    a shell separator.  Simply having 'test_' in a file path (e.g. ``ls tests/``)
+
+def _runner_args(cmd: str) -> list[str] | None:
+    """If any &&/;/| segment is a genuine test-runner invocation — the runner as
+    the segment's leading token(s), not merely the word "pytest" appearing
+    inside a string — return the runner's argument tokens (everything after the
+    runner spec). Otherwise None.
+
+    This is what stops ``git commit -m "fix pytest failure"`` or
+    ``echo running pytest`` from being classified as a passing test run.
+    """
+    for seg in re.split(r"&&|\|\||;|\|", cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        low = [t.lower() for t in toks]
+        if low[0] == "pytest":
+            return toks[1:]
+        if low[0] in ("python", "python3"):
+            if len(toks) >= 3 and low[1] == "-m" and low[2] in ("pytest", "unittest"):
+                return toks[3:]
+            # `python test_x.py` / `python ./test_x.py` — the script is the target.
+            if len(toks) >= 2 and os.path.basename(toks[1]).startswith("test_"):
+                return toks[1:]
+    return None
+
+
+def is_test_command(cmd: str) -> bool:
+    """Return True if ``cmd`` is a genuine test-runner invocation.
+
+    Requires a real runner as a segment's leading token — merely having
+    ``test_`` in a path (``ls tests/``) or ``pytest`` inside a commit message
     does not count.
     """
-    # Strip leading cd/env prefix to find the actual command.
-    text = cmd.strip()
-    while text.startswith("cd "):
-        for sep in ("&&", ";"):
-            idx = text.find(sep)
-            if idx != -1:
-                text = text[idx + len(sep):].strip()
-                break
-        else:
-            break
-    # Check if the command starts with a real test runner or runs a test script.
-    _RUNNERS = ("pytest", "python -m pytest", "python -m unittest", "unittest",
-                "python test_", "python3 test_", "python ./test_", "python3 ./test_")
-    text_lower = text.lower()
-    return any(text_lower.startswith(r) or f" {r}" in text_lower for r in _RUNNERS)
+    return _runner_args(cmd) is not None
 
 
 def test_covers_fail_to_pass(cmd: str, fail_to_pass: list[str]) -> bool:
@@ -311,9 +336,13 @@ def distinct_f2p_files(fail_to_pass: list[str]) -> set[str]:
     """
     out: set[str] = set()
     for tid in fail_to_pass:
-        if "::" not in tid:
-            continue
-        path = tid.split("::", 1)[0].replace("\\", "/").strip()
+        if "::" in tid:
+            path = tid.split("::", 1)[0].replace("\\", "/").strip()
+        else:
+            # Non-pytest / bare id (e.g. terminal-bench "test_foo"): use the id
+            # itself as the selector so coverage can still be satisfied — the
+            # old code skipped these, leaving the gate permanently unmet.
+            path = tid.replace("\\", "/").strip()
         if path:
             out.add(path)
     return out
@@ -333,17 +362,20 @@ def f2p_files_in_command(cmd: str, fail_to_pass: list[str]) -> set[str]:
     files = distinct_f2p_files(fail_to_pass)
     if not files:
         return set()
-    cmd_norm = cmd.replace("\\", "/")
-    cmd_lower = cmd_norm.lower()
 
-    # Bare pytest invocation (no positional path arg) — assume full suite.
-    # Heuristic: pytest is mentioned but no F2P test path appears as a
-    # substring AND no .py path appears anywhere on the line.
-    has_runner = ("pytest" in cmd_lower) or ("unittest" in cmd_lower)
-    has_any_path = ".py" in cmd_norm or "::" in cmd_norm
-    if has_runner and not has_any_path:
+    args = _runner_args(cmd)
+    if args is None:
+        # Not a genuine test-runner invocation (e.g. `git commit -m "…pytest…"`).
+        return set()
+    # A meta invocation (`pytest --version` / `--collect-only`) did not run the
+    # suite, so it covers nothing — this closes the exit-0 false-positive.
+    if any(a.lower() in _META_RUNNER_FLAGS for a in args):
+        return set()
+    # Bare runner with no positional path arg — assume it ran the whole suite.
+    if not any(not a.startswith("-") for a in args):
         return set(files)
 
+    cmd_norm = cmd.replace("\\", "/")
     covered: set[str] = set()
     for path in files:
         if path in cmd_norm:

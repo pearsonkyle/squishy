@@ -23,6 +23,9 @@ class ToolContext:
     pending_plan_evidence: list[dict[str, Any]] = field(default_factory=list)
     plan_switch_prompted: bool = False
     notes: dict[str, str] = field(default_factory=dict)
+    # Keys in `notes` seeded by the harness (e.g. FAIL_TO_PASS metadata) that
+    # the model's save_note must not evict or overwrite.
+    reserved_note_keys: set[str] = field(default_factory=set)
     _cached_index: Any = field(default=None, repr=False)
     _cached_index_mtime: float = field(default=-1.0, repr=False)
     files_read_count: dict[str, int] = field(default_factory=dict)
