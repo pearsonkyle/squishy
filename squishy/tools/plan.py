@@ -119,7 +119,9 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     note = args.get("note", "")
     add_steps = args.get("add_steps")
 
-    if not isinstance(step_index, int):
+    # bool is a subclass of int — reject it so step_index=true doesn't silently
+    # become index 0 and mark the first step complete.
+    if not isinstance(step_index, int) or isinstance(step_index, bool):
         return ToolResult(False, error="`step_index` is required (integer, 1-based)")
     if not isinstance(note, str):
         return ToolResult(False, error="`note` must be a string")

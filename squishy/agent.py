@@ -289,14 +289,20 @@ class Agent:
         self, st: LoopState, *, success: bool, final_text: str = "", error: str = "",
         turn: int,
     ) -> TaskResult:
-        # Capture remaining messages before building result.
-        remaining = self.messages[self._full_log_idx:]
+        # Capture remaining messages before building result. The synthetic
+        # live-context pair (plan status / notes) is a view-only artifact and
+        # must never reach full_log (SFT export) or TaskResult.messages — it
+        # would teach a `_squishy_context` tool call that does not exist.
+        remaining = [
+            m for m in self.messages[self._full_log_idx:]
+            if not m.get(self._LIVE_CTX_MARKER)
+        ]
         if remaining:
             self._full_log.extend(remaining)
             self._full_log_idx = len(self.messages)
 
         self._persist_new_messages()
-        self._finish_session(st, status="completed" if success else "error")
+        self._finish_session(st, status="completed" if success else "error", turns=turn)
         self._emit({"type": "done", "success": success, "turns": turn})
         return TaskResult(
             success=success, final_text=final_text, error=error,
@@ -306,7 +312,7 @@ class Agent:
             files_edited=sorted(st.files_edited),
             commands_run=st.commands_run,
             elapsed_s=time.monotonic() - st.start,
-            messages=list(self.messages),
+            messages=[m for m in self.messages if not m.get(self._LIVE_CTX_MARKER)],
             plan_state=self._plan_snapshot(),
             empty_responses=st.empty_responses,
             quality_skips=st.quality_skips,
@@ -341,14 +347,22 @@ class Agent:
             log.debug("session persist failed for %s", self.session_id, exc_info=True)
         self._last_persisted_idx = len(self.messages)
 
-    def _finish_session(self, st: LoopState, *, status: str = "completed") -> None:
+    def _finish_session(
+        self, st: LoopState, *, status: str = "completed", turns: int | None = None,
+    ) -> None:
         if not self.session_id:
             return
+        # turn_log is only populated in bench/yolo, so fall back to the actual
+        # turn count passed by _build_result for interactive sessions (which
+        # otherwise always recorded turns=0 in meta.json).
+        turn_count = turns if turns is not None else (
+            st.turn_log[-1].get("turn", 0) if st.turn_log else 0
+        )
         try:
             from squishy.session import finish_session
             finish_session(
                 self.session_id, status=status,
-                turns=st.turn_log[-1].get("turn", 0) if st.turn_log else 0,
+                turns=turn_count,
                 tokens=st.total_prompt_tokens + st.completion_tokens,
                 root=getattr(self.config, "session_dir", None),
             )
@@ -775,8 +789,15 @@ class Agent:
                 self._full_log.extend(new_msgs)
                 self._full_log_idx = len(self.messages)
 
+            # Persist new messages (the user turn + any nudges/assistant/tool
+            # messages) to the session log BEFORE trim reindexes the list and
+            # the blind index reset below. Without this the just-appended user
+            # message is marked persisted-but-never-written, and every code
+            # path that `continue`s (nudges, quality skips, gates) drops its
+            # whole turn from the session log / --resume / training export.
+            self._persist_new_messages()
+
             # Compaction + trim.
-            msg_count_before = len(self.messages)
             did_compact = False
             if getattr(self.client, "context_window", 0) > 0:
                 compacted_msgs = await compact_messages(
@@ -1006,6 +1027,7 @@ class Agent:
             # --- Dispatch tools ---
             plan_task_called_this_turn = False
             local_read_without_recall = 0
+            local_recall_ok = False
             dispatched_pairs: list[tuple[ToolCall, dict[str, Any]]] = []
 
             for tc in completion.tool_calls:
@@ -1034,13 +1056,13 @@ class Agent:
                 if tc.name in ("read_file", "list_directory", "search_files") and outcome["success"]:
                     local_read_without_recall += 1
 
-                # A recall that matched nothing means the index can't guide
-                # this task — stop pushing the model toward recall so it can
-                # fall back to plain exploration.
-                if tc.name == "recall" and outcome.get("success") and not (
-                    outcome.get("data", {}) or {}
-                ).get("total_matched"):
-                    self.recall_missed = True
+                if tc.name == "recall" and outcome.get("success"):
+                    local_recall_ok = True
+                    # A recall that matched nothing means the index can't guide
+                    # this task — stop pushing the model toward recall so it can
+                    # fall back to plain exploration.
+                    if not (outcome.get("data", {}) or {}).get("total_matched"):
+                        self.recall_missed = True
 
                 # Plan-approved terminal event (interactive plan mode).
                 if outcome.get("plan_approved") and self.config.permission_mode == "plan":
@@ -1066,7 +1088,11 @@ class Agent:
             # Recall-first enforcement (plan mode only).
             if self.config.permission_mode == "plan" and not is_bench:
                 recall_skip_budget = self.config.max_recall_skip_turns
-                self.consecutive_reads_without_recall += local_read_without_recall
+                # Don't count this turn's reads against the budget when the
+                # model DID call recall this turn (the recommended
+                # recall→read→read pattern must not trip the "use recall" nudge).
+                if not local_recall_ok:
+                    self.consecutive_reads_without_recall += local_read_without_recall
                 if (
                     self.has_index
                     and not self.recall_missed

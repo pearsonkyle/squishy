@@ -144,7 +144,9 @@ async def handle_plan_approval(
     """Handle plan_task approval flow. Returns (outcome, plan_approved)."""
     if agent.display:
         agent.display.plan_panel(outcome.data)
-    result: bool | str = True  # auto-approve when non-interactive
+    # prompt_fn returns True/False, or a ("feedback", text) tuple to decline
+    # with revision feedback (see cli.py prompt_fn).
+    result: bool | str | tuple[str, str] = True  # auto-approve when non-interactive
     if agent.prompt_fn is not None:
         try:
             from squishy.tools.base import Tool
@@ -179,8 +181,15 @@ async def handle_plan_approval(
         )
         return outcome, True
 
-    # Declined — include user feedback if provided.
-    feedback = result if isinstance(result, str) else ""
+    # Declined — include user feedback if provided. The interactive prompt
+    # returns a ("feedback", text) tuple for "type feedback to revise"; unpack
+    # it so the revision guidance actually reaches the model (was dropped).
+    if isinstance(result, tuple) and len(result) == 2 and result[0] == "feedback":
+        feedback = str(result[1])
+    elif isinstance(result, str):
+        feedback = result
+    else:
+        feedback = ""
     agent.tool_ctx.plan = None
     agent.tool_ctx.pending_plan_evidence.clear()
     agent.tool_ctx.plan_switch_prompted = False
@@ -235,7 +244,9 @@ def _invalidate_superseded_recall(agent: Agent, read_path: str) -> None:
     """
     if not read_path:
         return
-    norm = read_path.replace("\\", "/").lstrip("./")
+    # removeprefix, not lstrip: lstrip("./") strips ANY leading '.'/'/' chars,
+    # so ".github/x.py" → "github/x.py" and "../x.py" → "x.py" (wrong file).
+    norm = read_path.replace("\\", "/").removeprefix("./")
     for m in agent.messages[:-1]:
         if m.get("role") != "tool" or m.get("name") != "recall":
             continue

@@ -16,11 +16,14 @@ Storage layout::
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("squishy.session")
 
 _DEFAULT_DIR = os.path.expanduser("~/.squishy/sessions")
 
@@ -86,6 +89,46 @@ def _normalize_message(msg: dict[str, Any]) -> dict[str, Any]:
         new_calls.append(tc)
     out["tool_calls"] = new_calls
     return out
+
+
+def _restore_message(msg: dict[str, Any]) -> dict[str, Any]:
+    """Inverse of ``_normalize_message`` for replay.
+
+    Sessions store ``tool_calls[].function.arguments`` as a dict (trainer
+    format); the OpenAI wire format requires a JSON *string*. Re-serialize so a
+    resumed transcript is valid to send back to the endpoint.
+    """
+    tool_calls = msg.get("tool_calls")
+    if not tool_calls:
+        return msg
+    needs_copy = any(
+        isinstance((tc.get("function") or {}).get("arguments"), (dict, list))
+        for tc in tool_calls
+    )
+    if not needs_copy:
+        return msg
+    out = dict(msg)
+    new_calls = []
+    for tc in tool_calls:
+        func = tc.get("function")
+        if isinstance(func, dict) and isinstance(func.get("arguments"), (dict, list)):
+            tc = dict(tc)
+            func = dict(func)
+            func["arguments"] = json.dumps(func["arguments"], ensure_ascii=False)
+            tc["function"] = func
+        new_calls.append(tc)
+    out["tool_calls"] = new_calls
+    return out
+
+
+def restore_for_replay(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert stored (dict-args) messages back to OpenAI wire format.
+
+    Session storage keeps ``tool_calls[].function.arguments`` as a dict for the
+    trainer/export format; resuming a conversation must send them as JSON
+    strings. Apply this to ``load_messages`` output before replaying.
+    """
+    return [_restore_message(m) for m in messages]
 
 
 def create_session(
@@ -178,8 +221,16 @@ def load_messages(session_id: str, *, root: str | None = None) -> list[dict[str,
         return []
     messages = []
     for line in msgs_path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            messages.append(json.loads(line))
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+        except json.JSONDecodeError:
+            # A crash mid-append can leave a partial final line; skip it
+            # rather than failing the whole resume/export.
+            log.warning("skipping malformed message line in session %s", session_id)
+            continue
+        messages.append(raw)
     return messages
 
 

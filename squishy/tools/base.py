@@ -67,9 +67,13 @@ def _short_json(d: dict[str, Any], limit: int = 32000) -> str:
     import json
  
     s = json.dumps(d, ensure_ascii=False)
+    # limit <= 0 must not grow the payload: s[-0:] is the whole string, so the
+    # head+tail path below would return the full content with a bogus banner.
+    if limit <= 0:
+        return ""
     if len(s) <= limit:
         return s
     head = int(limit * 0.6)
-    tail = int(limit * 0.3)
+    tail = max(1, int(limit * 0.3))
     snipped = len(s) - head - tail
     return f"{s[:head]}\n[... {snipped} chars snipped ...]\n{s[-tail:]}"

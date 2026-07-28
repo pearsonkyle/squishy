@@ -1229,3 +1229,77 @@ async def test_alias_tool_call_dispatches_canonically(tmp_path):
     ]
     assert "write_file" in tool_names
     assert "create" not in tool_names
+
+
+async def test_user_message_is_persisted_to_session(tmp_path):
+    """#1: the user turn must reach the session log even when the run ends via
+    a nudge/continue path (previously silently dropped)."""
+    from squishy.session import create_session, load_messages
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.session_dir = str(tmp_path / "sessions")
+    cfg.max_turns = 4
+    sess = create_session(model="fake", working_dir=str(tmp_path), mode="yolo",
+                          tools=[], root=cfg.session_dir)
+    fake = FakeClient(script=[CompletionResult(text="done", tool_calls=[])])
+    agent = Agent(cfg, fake, display=None, session_id=sess.id)  # type: ignore[arg-type]
+    await agent.run("REMEMBER-THIS-PROMPT")
+
+    persisted = load_messages(sess.id, root=cfg.session_dir)
+    user_msgs = [m for m in persisted if m.get("role") == "user"]
+    assert any("REMEMBER-THIS-PROMPT" in (m.get("content") or "") for m in user_msgs)
+
+
+async def test_result_messages_exclude_live_context_pair(tmp_path):
+    """#11: the synthetic live-context pair must not leak into TaskResult."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 4
+    fake = FakeClient(
+        script=[
+            CompletionResult(tool_calls=[_tc("save_note", {"key": "k", "content": "v"})]),
+            CompletionResult(text="done", tool_calls=[]),
+        ]
+    )
+    agent = Agent(cfg, fake, display=None)  # type: ignore[arg-type]
+    result = await agent.run("note something")
+    assert not any(m.get("_squishy_live_ctx") for m in result.messages)
+    assert not any(m.get("name") == "_squishy_context" for m in result.messages)
+    assert not any(m.get("name") == "_squishy_context" for m in result.full_log)
+
+
+async def test_recall_then_reads_does_not_trip_enforcement(tmp_path):
+    """#10: the recommended recall→read→read pattern must not trigger the
+    'too many reads without recall' nudge."""
+    from squishy.index import build_index, save_index
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+    cfg.max_turns = 6
+    cfg.max_recall_skip_turns = 2
+    (tmp_path / "foo.py").write_text('"""Foo."""\ndef widget(): return 1\n')
+    save_index(str(tmp_path), build_index(str(tmp_path)))
+    fake = FakeClient(
+        script=[
+            CompletionResult(tool_calls=[
+                _tc("recall", {"query": "widget"}, "c1"),
+                _tc("read_file", {"path": "foo.py"}, "c2"),
+                _tc("read_file", {"path": "foo.py", "offset": 1}, "c3"),
+            ]),
+            CompletionResult(tool_calls=[_tc("plan_task", {"problem": "p", "solution": "s", "steps": ["a"]})]),
+        ]
+    )
+
+    async def auto_approve(_t, _a):
+        return True
+
+    agent = Agent(cfg, fake, Display(), prompt_fn=auto_approve)  # type: ignore[arg-type]
+    result = await agent.run("find widget")
+    assert not any(
+        "Too many read calls without `recall`" in (m.get("content") or "")
+        for m in result.messages
+    )

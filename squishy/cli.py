@@ -30,6 +30,7 @@ from squishy.session import (
     export_training_to_file,
     list_sessions,
     load_messages,
+    restore_for_replay,
 )
 from squishy.tools.base import Tool
 
@@ -541,11 +542,20 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     current_agent = None
     if resume_id:
         try:
-            prev_messages = load_messages(resume_id, root=cfg.session_dir)
-            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=resume_id)
-            # Replace the fresh messages with the loaded ones.
+            # Restore stored dict-args tool_calls back to the OpenAI wire
+            # format (JSON-string arguments) so the resumed transcript is valid
+            # to send to the endpoint.
+            prev_messages = restore_for_replay(
+                load_messages(resume_id, root=cfg.session_dir)
+            )
+            # Build WITHOUT the session id so __post_init__ doesn't append a
+            # fresh system prompt into the resumed session's on-disk log; wire
+            # the id up only after the loaded transcript replaces messages.
+            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=None)
             current_agent.messages = prev_messages
+            current_agent.session_id = resume_id
             current_agent._last_persisted_idx = len(prev_messages)
+            current_agent._full_log_idx = len(prev_messages)
             display.info(f"[session] resumed {resume_id[:12]}… ({len(prev_messages)} messages)")
         except Exception as e:  # noqa: BLE001
             display.error(f"failed to resume session {resume_id}: {e}")

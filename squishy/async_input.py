@@ -151,8 +151,13 @@ class ModeCycler:
             data = os.read(self._fd, 32)
         except OSError:
             return
-        if data:
-            self.feed(data)
+        if not data:
+            # EOF (e.g. Ctrl-D while a tool runs). Without removing the reader
+            # the fd stays permanently ready and asyncio re-invokes _on_read on
+            # every loop iteration — a 100% CPU spin for the rest of the turn.
+            self.stop()
+            return
+        self.feed(data)
 
     def feed(self, data: bytes) -> int:
         """Append ``data`` to the buffer, fire ``on_cycle`` for each
