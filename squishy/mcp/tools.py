@@ -5,6 +5,8 @@ MCP tool qualified names follow the pattern: mcp__<server_name>__<tool_name>
 from __future__ import annotations
 
 import asyncio
+import atexit
+import contextlib
 import logging
 import threading
 from typing import Any
@@ -18,6 +20,7 @@ from .types import MCPTool
 log = logging.getLogger("squishy.mcp")
 
 _initialized = False
+_atexit_registered = False
 _init_lock = threading.Lock()
 _connect_errors: dict[str, str | None] = {}
 _mcp_tools: list[Tool] = []
@@ -92,8 +95,19 @@ def initialize_mcp(verbose: bool = False) -> dict[str, str | None]:
                     log.info("%s: %d tool(s)", client.config.name, len(client._tools))
 
         _register_tools_into_squishy(new_tools)
+        # Ensure stdio MCP subprocesses are terminated on interpreter exit —
+        # disconnect_all() otherwise has no caller, so servers orphan on /quit.
+        global _atexit_registered
+        if not _atexit_registered:
+            atexit.register(_shutdown_mcp)
+            _atexit_registered = True
         _initialized = True
         return errors
+
+
+def _shutdown_mcp() -> None:
+    with contextlib.suppress(Exception):
+        get_mcp_manager().disconnect_all()
 
 
 def reload_mcp() -> dict[str, str | None]:

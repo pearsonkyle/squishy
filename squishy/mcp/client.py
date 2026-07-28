@@ -1,6 +1,7 @@
 """MCP client: stdio and HTTP/SSE transports, JSON-RPC 2.0 protocol."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -125,7 +126,16 @@ class StdioTransport:
                 self._process.terminate()
                 self._process.wait(timeout=3)
             except Exception:
-                pass
+                # terminate() may not stop a wedged child — force-kill so it
+                # doesn't survive as an orphan.
+                with contextlib.suppress(Exception):
+                    self._process.kill()
+                    self._process.wait(timeout=3)
+            # Close the pipes so their fds don't leak on every reload.
+            for stream in (self._process.stdin, self._process.stdout, self._process.stderr):
+                if stream is not None:
+                    with contextlib.suppress(Exception):
+                        stream.close()
             self._process = None
 
     @property
@@ -300,6 +310,13 @@ class MCPClient:
         except Exception as e:
             self.state = MCPServerState.ERROR
             self._error = str(e)
+            # Tear down the half-open transport so a server that started but
+            # never completed the handshake doesn't leak its subprocess and
+            # reader threads (each /mcp reload would otherwise spawn another).
+            if self._transport is not None:
+                with contextlib.suppress(Exception):
+                    self._transport.stop()
+                self._transport = None
             raise
 
     def _make_transport(self):
@@ -461,31 +478,30 @@ class MCPManager:
         return tools
 
     def call_tool(self, qualified_name: str, arguments: dict) -> str:
-        """Dispatch a tool call by qualified name (mcp__server__tool)."""
-        parts = qualified_name.split("__", 2)
-        if len(parts) != 3 or parts[0] != "mcp":
+        """Dispatch a tool call by qualified name (mcp__server__tool).
+
+        Resolves the owning client by matching the FULL qualified name against
+        each server's advertised tools rather than splitting on ``__`` — the
+        latter is ambiguous when a server name itself contains ``__``
+        (e.g. ``mcp__my__srv__tool``), which made every tool on such a server
+        permanently uncallable.
+        """
+        if not qualified_name.startswith("mcp__"):
             raise ValueError(f"Invalid MCP tool name: {qualified_name}")
-        sanitized_server = parts[1]
-        tool_name = parts[2]
 
-        # Map the sanitized server name back to the original name used as key.
-        original_server = self._name_map.get(sanitized_server, sanitized_server)
-        client = self._clients.get(original_server)
-        if client is None:
-            raise RuntimeError(f"MCP server '{sanitized_server}' not configured")
+        for client in self._clients.values():
+            match = next(
+                (t for t in client._tools if t.qualified_name == qualified_name), None,
+            )
+            if match is None:
+                continue
+            tool_name = match.tool_name
+            if not client.alive:
+                client.reconnect()
+                client.list_tools()
+            return client.call_tool(tool_name, arguments)
 
-        if not client.alive:
-            client.reconnect()
-            client.list_tools()
-
-        # Find the original tool name (un-sanitized)
-        original_name = tool_name
-        for t in client._tools:
-            if t.qualified_name == qualified_name:
-                original_name = t.tool_name
-                break
-
-        return client.call_tool(original_name, arguments)
+        raise RuntimeError(f"MCP tool not found: {qualified_name}")
 
     def list_servers(self) -> list[MCPClient]:
         return list(self._clients.values())

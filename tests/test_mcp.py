@@ -262,3 +262,47 @@ class TestDispatch:
             assert result.data["content"] == "dispatched ok"
         finally:
             _register_tools_into_squishy([])
+
+
+# ── #6/#18: name resolution + timeout coercion ──────────────────────────────
+
+class TestMCPRobustness:
+    def test_call_tool_resolves_server_name_with_double_underscore(self):
+        """A server named 'my__srv' yields mcp__my__srv__tool; the naive
+        split('__', 2) misrouted it. Direct qualified-name match must work."""
+        from squishy.mcp.client import MCPClient, MCPManager
+        from squishy.mcp.types import MCPServerState
+        mgr = MCPManager()
+        cfg = MCPServerConfig(name="my__srv", transport=MCPTransport.STDIO)
+        client = MCPClient(cfg)
+        client._tools = [MCPTool(
+            server_name="my__srv", tool_name="do_thing",
+            qualified_name="mcp__my__srv__do_thing",
+            description="d", input_schema={},
+        )]
+        client.call_tool = MagicMock(return_value="ok")
+        client.state = MCPServerState.CONNECTED
+        client._transport = MagicMock(alive=True)
+        mgr._clients["my__srv"] = client
+        result = mgr.call_tool("mcp__my__srv__do_thing", {"a": 1})
+        assert result == "ok"
+        client.call_tool.assert_called_once_with("do_thing", {"a": 1})
+
+    def test_call_tool_unknown_raises(self):
+        from squishy.mcp.client import MCPManager
+        mgr = MCPManager()
+        with pytest.raises(RuntimeError):
+            mgr.call_tool("mcp__nope__x", {})
+
+    def test_timeout_coercion_from_string(self):
+        from squishy.mcp.types import _coerce_timeout
+        assert _coerce_timeout("30s") == 30
+        assert _coerce_timeout("45") == 45
+        assert _coerce_timeout("nonsense") == 30
+        assert _coerce_timeout(0) == 30
+        assert _coerce_timeout(True) == 30
+        assert _coerce_timeout(60) == 60
+
+    def test_config_from_dict_bad_timeout_does_not_raise(self):
+        cfg = MCPServerConfig.from_dict("s", {"type": "stdio", "command": "x", "timeout": "30s"})
+        assert cfg.timeout == 30
