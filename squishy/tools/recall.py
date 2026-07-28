@@ -244,10 +244,9 @@ def recall_from_index(
 recall = Tool(
     name="recall",
     description=(
-        "Search the repo index for relevant files, dirs, or symbols. Returns ranked "
-        "entries with path, kind, line range, and summary. Use this before "
-        "read_file, list_directory, or search_files when you need to locate the "
-        "right module or function. Requires /init to have been run."
+        "Search the repo index for relevant files/symbols before reading. Returns "
+        "ranked path, kind, line range, and summary. Requires /init; if it misses, "
+        "fall back to search_files/read_file."
     ),
     parameters={
         "type": "object",

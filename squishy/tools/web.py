@@ -168,18 +168,11 @@ async def _fetch_url(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 fetch_url = Tool(
     name="fetch_url",
-    description=(
-        "Fetch content from a URL (documentation, API references, etc.). "
-        "HTML is converted to plain text. Use this to look up library docs, "
-        "error messages, or reference material."
-    ),
+    description="Fetch a URL and return its text (HTML stripped). For docs/reference lookups.",
     parameters={
         "type": "object",
         "properties": {
-            "url": {
-                "type": "string",
-                "description": "The URL to fetch (must start with http:// or https://)",
-            },
+            "url": {"type": "string", "description": "http(s) URL"},
         },
         "required": ["url"],
     },

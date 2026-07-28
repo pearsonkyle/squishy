@@ -158,7 +158,7 @@ class Agent:
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
             plan=load_plan(self.config.working_dir),
-            max_tool_output_chars=self.config.max_tool_output_chars,
+            max_tool_output_chars=self._effective_output_cap(),
         )
         self.has_index = has_index(self.config.working_dir)
         project = detect_project(self.config.working_dir)
@@ -181,6 +181,22 @@ class Agent:
             self.display.info(f"[plan] restored {self.tool_ctx.plan.id}")
         if self.display is not None and self.config.permission_mode == "plan" and not self.has_index:
             self.display.info("[plan] no index found; direct file exploration fallback is enabled")
+
+    def _effective_output_cap(self) -> int:
+        """Per-tool-result char cap, made window-aware for small models.
+
+        The configured ``max_tool_output_chars`` (default 32k chars ≈ 9k tokens)
+        can single-handedly blow an 8k–16k context window with one big
+        ``read_file`` / ``run_command`` result. When the endpoint reports a
+        context window, cap a single result at ~1/8 of it (chars ≈ tokens×3.5),
+        floored so it stays useful and never raised above the configured value.
+        """
+        configured = self.config.max_tool_output_chars
+        ctx_tokens = getattr(self.client, "context_window", 0) or 0
+        if ctx_tokens <= 0:
+            return configured
+        window_cap = int(ctx_tokens * 3.5 / 8)
+        return max(4000, min(configured, window_cap))
 
     def _check_index_staleness(self) -> None:
         if self.display is None:

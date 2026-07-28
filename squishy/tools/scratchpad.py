@@ -69,22 +69,14 @@ async def _save_note(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 save_note = Tool(
     name="save_note",
     description=(
-        "Persist a finding for future reference. Notes survive conversation "
-        "trimming so you do not lose important context. Use this to record: "
-        "key findings, relevant file paths, important data, decisions, "
-        "or any insight you want to remember across turns."
+        "Persist a short note (key + content) that survives context trimming. "
+        "Use for findings, file paths, or decisions to remember across turns."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "key": {
-                "type": "string",
-                "description": "Short label (e.g., 'bug_location', 'test_file', 'root_cause')",
-            },
-            "content": {
-                "type": "string",
-                "description": "The content to remember",
-            },
+            "key": {"type": "string", "description": "Short label, e.g. 'root_cause'"},
+            "content": {"type": "string"},
         },
         "required": ["key", "content"],
     },

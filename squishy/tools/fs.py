@@ -869,17 +869,11 @@ async def _show_diff(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 show_diff = Tool(
     name="show_diff",
-    description=(
-        "Show git diff of your changes. Call after editing files to verify "
-        "your changes look correct. Pass a specific path or omit for all changes."
-    ),
+    description="Show git diff of your uncommitted changes. Pass a path or omit for all.",
     parameters={
         "type": "object",
         "properties": {
-            "path": {
-                "type": "string",
-                "description": "File path to diff (omit for all changes)",
-            },
+            "path": {"type": "string", "description": "File to diff (omit for all)"},
         },
     },
     run=_show_diff,
@@ -972,11 +966,7 @@ async def _undo_edit(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 undo_edit = Tool(
     name="undo_edit",
-    description=(
-        "Revert the most recent edit_file change. Restores the file to its "
-        "content before the last successful edit. Can be called multiple times "
-        "to undo multiple edits (LIFO order)."
-    ),
+    description="Revert the most recent edit_file/write_file change (LIFO; repeatable).",
     parameters={"type": "object", "properties": {}},
     run=_undo_edit,
 )

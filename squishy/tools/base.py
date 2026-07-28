@@ -39,10 +39,10 @@ class ToolResult:
     error: str = ""
     display: str = ""
  
-    def to_message(self) -> str:
+    def to_message(self, limit: int = 32_000) -> str:
         if self.success:
-            return _short_json(self.data)
-        return _short_json({"error": self.error})
+            return _short_json(self.data, limit)
+        return _short_json({"error": self.error}, limit)
  
  
 @dataclass

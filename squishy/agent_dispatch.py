@@ -66,7 +66,10 @@ async def run_tool(agent: Agent, turn: int, tc: ToolCall) -> dict[str, Any]:
             elif tc.name == "run_command":
                 agent.display.stats.commands_run += 1
 
-    append_tool_result(agent, tc, message=outcome.to_message())
+    append_tool_result(
+        agent, tc,
+        message=outcome.to_message(agent.tool_ctx.max_tool_output_chars),
+    )
 
     # F1b: stamp the read path on the tool message so snip_old_tool_results
     # can build an accurate stub without scraping the (possibly truncated)

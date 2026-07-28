@@ -218,46 +218,22 @@ async def _update_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 plan_task = Tool(
     name="plan_task",
     description=(
-        "**For any non-trivial task, call this FIRST to present a structured plan.**\n\n"
-        "Present a structured plan to the user before taking action.\n"
-        "- Call this within your first 2 turns for complex tasks\n"
-        "- For simple tasks (e.g., reading one file), you may skip this\n"
-        "The plan includes: problem statement, solution approach, and ordered steps.\n"
-        "For file-editing tasks, optionally specify files_to_create/files_to_modify.\n"
-        "Steps should be concrete, ordered, and verifiable — for any kind of task "
-        "(coding, research, analysis, organization, etc.).\n"
-        "The user will be asked to approve before you proceed."
+        "Propose a structured plan for the user to approve before acting: "
+        "problem, solution, and ordered steps. Skip only for trivial one-file tasks."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "plan": {
-                "type": "string",
-                "description": "Short title/summary of the plan",
-            },
-            "problem": {
-                "type": "string",
-                "description": "What problem needs to be solved",
-            },
-            "solution": {
-                "type": "string",
-                "description": "High-level approach to solving the problem",
-            },
+            "plan": {"type": "string", "description": "Short title"},
+            "problem": {"type": "string"},
+            "solution": {"type": "string"},
             "steps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Ordered list of implementation steps",
+                "description": "Ordered, concrete steps",
             },
-            "files_to_create": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Files that need to be created",
-            },
-            "files_to_modify": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Existing files that need to be modified",
-            },
+            "files_to_create": {"type": "array", "items": {"type": "string"}},
+            "files_to_modify": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["problem", "solution", "steps"],
     },
@@ -267,36 +243,22 @@ plan_task = Tool(
 update_plan = Tool(
     name="update_plan",
     description=(
-        "Update the status of a step in the active plan. Call this after "
-        "completing each implementation step to track progress. "
-        "Use step_index (1-based), status, and an optional note. Any files edited "
-        "or commands run since the last update are attached as evidence. "
-        "Pass `add_steps=[...]` to append newly-discovered steps to the end of "
-        "the plan when the work is larger than originally scoped."
+        "Mark a plan step done/in-progress/skipped/blocked by 1-based index. "
+        "Pass add_steps=[...] to append newly-discovered steps."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "step_index": {
-                "type": "integer",
-                "description": "1-based index of the step to update",
-            },
+            "step_index": {"type": "integer", "description": "1-based step index"},
             "status": {
                 "type": "string",
                 "enum": ["done", "in-progress", "skipped", "blocked"],
-                "description": "New status for the step",
             },
-            "note": {
-                "type": "string",
-                "description": "Optional note or rationale for this status update",
-            },
+            "note": {"type": "string", "description": "Optional rationale (required if blocked)"},
             "add_steps": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": (
-                    "Optional list of new step descriptions to append to the plan. "
-                    "Use when you discover the work is larger than you originally scoped."
-                ),
+                "description": "New steps to append",
             },
         },
         "required": ["step_index", "status"],
@@ -329,11 +291,7 @@ async def _get_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 get_plan = Tool(
     name="get_plan",
-    description=(
-        "Return the active plan's current state (problem, solution, steps with "
-        "status, files, progress). Use this when you have lost track of where "
-        "you are in a long task. Returns {'plan': null} if no plan exists."
-    ),
+    description="Return the active plan and its step statuses (null if none).",
     parameters={"type": "object", "properties": {}},
     run=_get_plan,
 )
@@ -386,11 +344,8 @@ async def _finish_plan(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 finish_plan = Tool(
     name="finish_plan",
     description=(
-        "Mark every remaining (pending / in-progress / blocked) step in the "
-        "active plan as done or skipped, in a single call. Use this when you "
-        "have produced your final answer for an audit/research-style task and "
-        "the leftover steps would otherwise keep the agent in a nudge loop. "
-        "Pair this with a final text summary to end the turn cleanly."
+        "Resolve all remaining plan steps at once (done or skipped) and end the "
+        "task. Pair with a final text summary."
     ),
     parameters={
         "type": "object",
@@ -398,12 +353,9 @@ finish_plan = Tool(
             "status": {
                 "type": "string",
                 "enum": ["done", "skipped"],
-                "description": "Status to apply to all unresolved steps. Default: 'done'.",
+                "description": "Applied to all unresolved steps (default done)",
             },
-            "summary": {
-                "type": "string",
-                "description": "Optional note attached to each resolved step.",
-            },
+            "summary": {"type": "string"},
         },
         "required": [],
     },
