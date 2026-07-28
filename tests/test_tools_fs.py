@@ -351,3 +351,33 @@ async def test_edit_file_rejects_empty_old_str(ctx):
     # File is untouched.
     body = open(ctx.working_dir + "/app.py").read()
     assert body == "a = 1\nb = 2\n"
+
+
+async def test_undo_of_write_file_removes_created_file(ctx):
+    """#12: undo after write_file must remove the created file, not revert an
+    unrelated earlier edit."""
+    await write_file.run({"path": "a.py", "content": "aaa\n"}, ctx)
+    await edit_file.run({"path": "a.py", "old_str": "aaa", "new_str": "bbb"}, ctx)
+    await write_file.run({"path": "b.py", "content": "new\n"}, ctx)
+
+    # Undo the most recent mutation: creation of b.py -> b.py removed.
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    assert r.data.get("removed") is True
+    import os
+    assert not os.path.exists(ctx.working_dir + "/b.py")
+    # a.py (the earlier edit) is untouched by this undo.
+    assert open(ctx.working_dir + "/a.py").read() == "bbb\n"
+
+    # Next undo reverts the a.py edit.
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    assert open(ctx.working_dir + "/a.py").read() == "aaa\n"
+
+
+async def test_undo_stack_is_bounded(ctx):
+    """The undo stack must not grow without bound."""
+    from squishy.tools.fs import _UNDO_STACK_CAP
+    for i in range(_UNDO_STACK_CAP + 20):
+        await write_file.run({"path": f"f{i}.py", "content": "x\n"}, ctx)
+    assert len(ctx.undo_stack) <= _UNDO_STACK_CAP

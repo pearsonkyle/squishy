@@ -31,7 +31,9 @@ class ToolContext:
     files_read_count: dict[str, int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
-    undo_stack: list[tuple[str, str]] = field(default_factory=list)  # (abs_path, original_content)
+    # (abs_path, original_content); original_content is None when the entry
+    # records a newly-created file (undo deletes it).
+    undo_stack: list[tuple[str, str | None]] = field(default_factory=list)
     max_tool_output_chars: int = 32_000
  
  

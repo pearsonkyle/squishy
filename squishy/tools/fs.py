@@ -79,6 +79,20 @@ def _collapse_double_backslash(s: str) -> str:
     return s.replace("\\\\", "\\") if "\\\\" in s else s
 
 
+_UNDO_STACK_CAP = 50
+
+
+def _push_undo(ctx: ToolContext, abs_path: str, original: str | None) -> None:
+    """Record a reversible mutation, bounding the stack so full pre-edit file
+    contents don't accumulate for the whole process lifetime.
+
+    ``original=None`` marks a newly-created file (undo removes it).
+    """
+    ctx.undo_stack.append((abs_path, original))
+    if len(ctx.undo_stack) > _UNDO_STACK_CAP:
+        del ctx.undo_stack[: len(ctx.undo_stack) - _UNDO_STACK_CAP]
+
+
 def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
     """Drop any cached reads for *abs_path* after a mutating write/edit."""
     for key in [k for k in ctx.files_read_meta if k[0] == abs_path]:
@@ -260,6 +274,10 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(content)
 
+    # Record the creation so undo_edit can remove the new file (previously
+    # only edit_file was undoable, so an undo after write_file reverted the
+    # wrong file).
+    _push_undo(ctx, abs_path, None)
     _invalidate_read_cache(ctx, abs_path)
     encoded = content.encode("utf-8")
     return ToolResult(
@@ -337,7 +355,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         text = f.read()
 
     def _save_undo() -> None:
-        ctx.undo_stack.append((abs_path, text))
+        _push_undo(ctx, abs_path, text)
 
     count = text.count(old_str)
     if count == 0:
@@ -954,6 +972,20 @@ async def _undo_edit(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         return ToolResult(False, error="Nothing to undo. No edits have been made yet.")
     abs_path, original = ctx.undo_stack.pop()
     rel_path = os.path.relpath(abs_path, ctx.working_dir)
+    if original is None:
+        # The entry records a file created by write_file — undo removes it.
+        try:
+            os.remove(abs_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return ToolResult(False, error=f"could not remove {rel_path}: {e}")
+        _invalidate_read_cache(ctx, abs_path)
+        return ToolResult(
+            True,
+            data={"path": rel_path, "removed": True},
+            display=f"removed {rel_path} (undo of write_file)",
+        )
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(original)
     _invalidate_read_cache(ctx, abs_path)
