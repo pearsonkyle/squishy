@@ -766,6 +766,27 @@ class Agent:
                     turn=turn,
                 )
 
+            # Must-edit gate: once the agent has burned `max_turns_without_edit`
+            # turns without a single successful edit, force it into a position
+            # where the only useful move is to edit. Weak models otherwise loop
+            # on "run the tests" indefinitely and produce no patch at all
+            # (observed on SWE-rebench: 69 run_command calls, zero edits). A
+            # patch that fails tests is still far more useful than no patch.
+            #
+            # In bench mode the phase machine gates tools, and explore/verify
+            # don't expose edit_file — so the phase is forced to `execute` too,
+            # otherwise withdrawing run_command would leave nothing actionable.
+            edit_budget = self.config.max_turns_without_edit
+            must_edit = (
+                _is_constrained
+                and edit_budget > 0
+                and not st.files_edited
+                and turn > edit_budget
+            )
+            if must_edit and ps is not None and ps.phase != "execute":
+                ps.phase = "execute"
+                st.phase = ps.phase
+
             self.tool_ctx.permission_mode = self.config.permission_mode
             now_plan_active = _plan_active()
             now_phase = ps.phase if ps else None
@@ -784,6 +805,18 @@ class Agent:
                 if self.display is not None:
                     self.display.set_mode(self.config.permission_mode)
             schemas = _cached_schemas
+
+            if must_edit:
+                schemas = [
+                    s for s in schemas
+                    if s.get("function", {}).get("name") != "run_command"
+                ]
+                if turn == edit_budget + 1:
+                    inject_nudge(self, st, turn, (
+                        "[system] You have not edited anything yet. `run_command` "
+                        "is disabled until you do. Call `edit_file` now with your "
+                        "best fix — an imperfect patch beats no patch."
+                    ), min_gap=0, force=True)
 
             # Strip any prior live-context pair so it never appears in
             # full_log snapshots, persistence, trim_history, or

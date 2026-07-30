@@ -1304,3 +1304,90 @@ async def test_recall_then_reads_does_not_trip_enforcement(tmp_path):
         "Too many read calls without `recall`" in (m.get("content") or "")
         for m in result.messages
     )
+
+
+async def test_must_edit_gate_removes_run_command(tmp_path):
+    """After max_turns_without_edit turns with no edit, run_command is pulled
+    from the schema so the model can only read/edit (100% patch-rate goal)."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 8
+    cfg.max_turns_without_edit = 3
+    (tmp_path / "a.py").write_text("x = 1\n")
+
+    seen_schemas: list[list[str]] = []
+
+    class _Recorder(FakeClient):
+        async def complete(self, messages, tools, **kw):
+            seen_schemas.append([t["function"]["name"] for t in tools])
+            return await super().complete(messages, tools, **kw)
+
+    script = [
+        CompletionResult(tool_calls=[_tc("run_command", {"command": "ls"}, f"c{i}")])
+        for i in range(6)
+    ] + [CompletionResult(text="done", tool_calls=[])]
+    agent = Agent(cfg, _Recorder(script=script), display=None)  # type: ignore[arg-type]
+    await agent.run("fix it")
+
+    assert any("run_command" in s for s in seen_schemas), "should start available"
+    assert not seen_schemas[-1].count("run_command"), "should be withdrawn after the budget"
+    assert any("edit_file" in s for s in seen_schemas[-1:]), "editing stays available"
+
+
+async def test_must_edit_gate_not_applied_after_an_edit(tmp_path):
+    """A successful edit keeps run_command available for verification."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 8
+    cfg.max_turns_without_edit = 2
+    (tmp_path / "a.py").write_text("x = 1\n")
+
+    seen: list[list[str]] = []
+
+    class _Recorder(FakeClient):
+        async def complete(self, messages, tools, **kw):
+            seen.append([t["function"]["name"] for t in tools])
+            return await super().complete(messages, tools, **kw)
+
+    script = [
+        CompletionResult(tool_calls=[_tc("edit_file", {"path": "a.py", "old_str": "x = 1", "new_str": "x = 2"})]),
+        CompletionResult(tool_calls=[_tc("run_command", {"command": "ls"}, "c2")]),
+        CompletionResult(tool_calls=[_tc("run_command", {"command": "pwd"}, "c3")]),
+        CompletionResult(tool_calls=[_tc("run_command", {"command": "echo hi"}, "c4")]),
+        CompletionResult(text="done", tool_calls=[]),
+    ]
+    agent = Agent(cfg, _Recorder(script=script), display=None)  # type: ignore[arg-type]
+    await agent.run("fix it")
+    assert "run_command" in seen[-1], "run_command must remain after an edit landed"
+
+
+async def test_must_edit_gate_forces_execute_phase_in_bench(tmp_path):
+    """In bench mode the phase machine gates tools and explore/verify don't
+    expose edit_file, so the gate must also move the phase to execute —
+    otherwise withdrawing run_command leaves nothing actionable."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.max_turns = 8
+    cfg.max_turns_without_edit = 2
+    (tmp_path / "a.py").write_text("x = 1\n")
+
+    seen: list[list[str]] = []
+
+    class _Recorder(FakeClient):
+        async def complete(self, messages, tools, **kw):
+            seen.append([t["function"]["name"] for t in tools])
+            return await super().complete(messages, tools, **kw)
+
+    script = [
+        CompletionResult(tool_calls=[_tc("read_file", {"path": "a.py"}, f"c{i}")])
+        for i in range(6)
+    ] + [CompletionResult(text="done", tool_calls=[])]
+    agent = Agent(cfg, _Recorder(script=script), display=None)  # type: ignore[arg-type]
+    await agent.run("fix it")
+
+    late = seen[-1]
+    assert "edit_file" in late, f"edit_file must be reachable once forced: {late}"
+    assert "run_command" not in late, f"run_command should be withdrawn: {late}"

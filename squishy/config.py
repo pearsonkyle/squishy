@@ -64,6 +64,11 @@ class Config:
     max_system_nudges: int = 8  # cap total nudges to avoid flooding context
     # Phase-budget thresholds (bench/yolo modes only).
     max_explore_turns: int = 8
+    # Turns allowed with no successful edit before `run_command` is removed
+    # from the schema, leaving only read/edit tools. Small models otherwise
+    # loop on "run the tests" forever and never attempt a fix — a patch that
+    # fails tests still beats no patch at all. bench/yolo only; 0 disables.
+    max_turns_without_edit: int = 12
     max_plan_turns: int = 3
     max_fix_verify_cycles: int = 6
     # v2 auto-pytest finish gate: cap on how many times the harness will

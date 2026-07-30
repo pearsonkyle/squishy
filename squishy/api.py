@@ -111,6 +111,7 @@ class Squishy:
     max_quality_retries: int = 3
     compaction_threshold: float = 0.7
     max_explore_turns: int = 8
+    max_turns_without_edit: int = 12
     max_plan_turns: int = 3
     max_fix_verify_cycles: int = 6
     # v2 auto-pytest finish gate (bench mode only).
