@@ -109,20 +109,14 @@ async def run_tool(agent: Agent, turn: int, tc: ToolCall) -> dict[str, Any]:
             if not read_source:
                 missing.append("a source file you plan to edit")
             agent.messages.append({"role": "user", "content": (
-                f"[system] Plan approved, but you have not yet read "
-                f"{' and '.join(missing)}. Before editing:\n"
-                "1. `read_file` on each failing-test file (path is in the test "
-                "ID before `::`) — the new tests follow these conventions.\n"
-                "2. `read_file` on the source file(s) you plan to edit.\n"
-                "Then call `edit_file` to implement your fix."
+                f"[system] Plan approved. Read {' and '.join(missing)} first, "
+                "then `edit_file` to implement the fix."
             )})
         else:
             agent.messages.append({"role": "user", "content": (
-                "[system] Plan approved. Now EXECUTE the plan:\n"
-                "1. `edit_file` to implement your fix.\n"
-                "2. `run_command` to verify the failing tests now pass.\n"
-                "3. `update_plan(step_index=N, status=\"done\")` AFTER each step is actually done.\n"
-                "Do NOT call update_plan before doing the actual work (edit/run)."
+                "[system] Plan approved. Execute it: `edit_file` to implement "
+                "the fix, `run_command` to verify, then `update_plan` for each "
+                "step you actually finished."
             )})
 
     # Semantic anchoring: tag important tool results so they survive trimming.
@@ -417,15 +411,10 @@ def track_tool_outcome(
                     # test expectations.  Warn the agent.
                     from squishy.agent_safety import inject_nudge
                     inject_nudge(agent, st, 0, (
-                        "[system] WARNING: The listed failing tests PASSED without "
-                        "any edits. This likely means the test file in the workspace "
-                        "does not yet contain the updated test expectations that will "
-                        "be applied during evaluation.\n"
-                        "1. Read the test file carefully — the test may need to call "
-                        "functions with different arguments or check different behavior.\n"
-                        "2. Read the problem statement again to understand what "
-                        "source code change is expected.\n"
-                        "3. Do NOT assume the bug is already fixed."
+                        "[system] The listed tests pass without any edit, so the "
+                        "workspace lacks the updated test expectations. Do not "
+                        "assume it's fixed — read the problem statement and make "
+                        "the described source change."
                     ), min_gap=0)
     elif tc.name == "run_command":
         st.commands_run += 1

@@ -26,8 +26,20 @@ def can_nudge(st: LoopState, turn: int, min_gap: int = 2, max_total: int = 12) -
 
 def record_nudge(st: LoopState, turn: int) -> None:
     """Mark that a nudge was injected this turn."""
+    if turn == st.last_nudge_turn:
+        st.nudges_this_turn += 1
+    else:
+        st.nudges_this_turn = 1
     st.last_nudge_turn = turn
     st.total_nudges += 1
+
+
+# Even control-flow nudges (force=True, min_gap=0) are capped per turn.
+# Non-forced nudges are already limited to one per turn by ``min_gap``; without
+# this, several forced gates could each append a [system] message in the same
+# turn, spending context and (on strict-alternation templates) stacking
+# consecutive user turns.
+MAX_NUDGES_PER_TURN = 2
 
 
 def inject_nudge(
@@ -44,6 +56,9 @@ def inject_nudge(
     # Hard ceiling: even forced nudges stop after 2x the normal cap.
     hard_cap = agent.config.max_system_nudges * 2
     if st.total_nudges >= hard_cap:
+        return False
+    # Per-turn ceiling applies to forced nudges too (see MAX_NUDGES_PER_TURN).
+    if turn == st.last_nudge_turn and st.nudges_this_turn >= MAX_NUDGES_PER_TURN:
         return False
     if not force and not can_nudge(st, turn, min_gap=min_gap):
         return False
@@ -213,22 +228,15 @@ def inject_test_failure_nudge(
         # remind it the source edit is what matters.
         if not install_ok:
             inject_nudge(agent, st, turn, (
-                "[system] Tests failed with ImportError, but the dependency install "
-                "was already degraded before you started — this is an ENVIRONMENT "
-                "issue, not your bug.\n"
-                "1. Do NOT try to fix imports or install packages.\n"
-                "2. Focus entirely on producing a correct source-code edit for the bug.\n"
-                "3. Your patch will be evaluated against a clean test environment, "
-                "so a syntactically valid edit is what matters."
+                "[system] ImportError is a broken test environment, not your bug. "
+                "Do not fix imports or install packages — edit the source to fix "
+                "the reported bug."
             ), min_gap=2)
             return
         inject_nudge(agent, st, turn, (
-            "[system] Tests failed due to an import/environment error, NOT a missing "
-            "test. This is likely a Python version or dependency issue in the test "
-            "environment — it is NOT the bug you need to fix.\n"
-            "1. Try running a more targeted test: `python -m pytest path/to/test.py::specific_test -x`\n"
-            "2. Focus on fixing the SOURCE code bug described in the problem statement.\n"
-            "3. Do NOT fix import compatibility issues — they are environment artifacts."
+            "[system] ImportError is an environment artifact, not your bug. Edit "
+            "the source to fix the reported bug; to re-test use "
+            "`python -m pytest path/to/test.py::specific_test -x`."
         ), min_gap=2)
         return
 
@@ -242,23 +250,15 @@ def inject_test_failure_nudge(
         is_bench = agent.config.permission_mode == "bench"
         if is_bench:
             inject_nudge(agent, st, turn, (
-                "[system] No tests were collected — the test function may not exist "
-                "in the workspace yet. In bench mode, the evaluation harness adds "
-                "new tests AFTER your fix is applied.\n"
-                "1. Run the FULL test file instead: `python -m pytest path/to/test.py -x`\n"
-                "2. Study the failing test NAME — it tells you what behavior is expected "
-                "(e.g. `test_spawn_this_typing_correct` means spawn should handle `_this` typing).\n"
-                "3. Re-read the problem statement for expected function signatures, "
-                "argument order, and return values — these are what the hidden tests check.\n"
-                "4. Focus on fixing the SOURCE code to match the described behavior."
+                "[system] No tests collected — the test is added by the harness "
+                "after your fix. Run the whole file (`python -m pytest "
+                "path/to/test.py -x`) and fix the source to match the behavior the "
+                "failing test name describes."
             ), min_gap=2)
         else:
             inject_nudge(agent, st, turn, (
-                "[system] No tests were collected — the test file or test function "
-                "may not exist yet, or the test path may be wrong.\n"
-                "1. Use `search_files` or `read_file` to find the correct test file.\n"
-                "2. If the test needs to be created as part of the fix, create it.\n"
-                "3. Check the failing test paths listed in the problem statement."
+                "[system] No tests collected — the path or test name is likely "
+                "wrong. Use `search_files` to locate the right test file."
             ), min_gap=2)
         return
 
@@ -401,12 +401,9 @@ def check_goal_drift(
         st.env_error_count = 0
         st.env_fix_files.clear()
         inject_nudge(agent, st, turn, (
-            "[system] Goal drift detected: recent edits target environmental/import "
-            "issues rather than the bug described in the problem statement. "
-            "These import errors are caused by Python version differences in the "
-            "test environment — they are not the bug you need to fix.\n"
-            "Focus on the bug described in the problem statement. "
-            "Try a more targeted test: `python -m pytest path/to/test.py::specific_test -x`"
+            "[system] You are fixing environment/import errors, not the reported "
+            "bug. Those are test-environment artifacts. Edit the source described "
+            "in the problem statement instead."
         ), min_gap=2, force=True)
 
 
@@ -455,15 +452,9 @@ def track_edit_failure(
         err_text = str(outcome.get("error") or "")
         if failures >= 2 and "old_str not found" in err_text:
             inject_nudge(agent, st, turn, (
-                f"[system] {failures} `old_str not found` failures on "
-                f"`{path}`. Your old_str does not match the current "
-                f"file content. STOP guessing — call:\n\n"
-                f"    read_file(path=\"{path}\")\n\n"
-                f"…then copy the EXACT lines (including whitespace) "
-                f"into old_str. The error message above shows the "
-                f"actual content at the line where your old_str's "
-                f"first line appears — use that to write a correct "
-                f"old_str."
+                f"[system] old_str still doesn't match `{path}`. Stop guessing: "
+                f"call read_file(path=\"{path}\") and copy the exact lines "
+                f"(including whitespace) into old_str."
             ), min_gap=1)
 
         # Force-finish after 5 identical-old_str failures to the same path.
@@ -494,11 +485,9 @@ def track_edit_failure(
 
         if failures >= 3:
             inject_nudge(agent, st, turn, (
-                f"[system] {failures} failed edits to `{path}`. "
-                "Your old_str is not matching the file content.\n"
-                "1. Call `read_file` on the exact line range you want to edit.\n"
-                "2. Copy the EXACT text from the read output into old_str.\n"
-                "3. Include 2-3 lines of surrounding context for uniqueness."
+                f"[system] {failures} failed edits to `{path}`. Read the exact "
+                "line range, then copy that text verbatim into old_str with 2-3 "
+                "lines of surrounding context."
             ), min_gap=2)
     else:
         st.edit_failures_per_file[path] = 0
@@ -523,9 +512,8 @@ def detect_shell_file_read(
     command = str(tc.args.get("command", ""))
     if _FILE_READ_CMD.search(command):
         inject_nudge(agent, st, turn, (
-            "[system] You used a shell command to read a file. Use the `read_file` "
-            "tool instead — it provides line numbers, caching, and is faster. "
-            "Use `run_command` only for running tests, build commands, or git operations."
+            "[system] Use the `read_file` tool to read files; keep `run_command` "
+            "for tests, builds, and git."
         ), min_gap=3)
 
 

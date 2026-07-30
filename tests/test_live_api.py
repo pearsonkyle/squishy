@@ -826,7 +826,15 @@ async def test_glob_files_tool():
 
 
 async def test_recall_tool():
-    """Test that the recall tool works with an existing index."""
+    """Test that the recall tool works with an existing index.
+
+    The index is built here in the fixture (as ``/init`` would): ``/init`` is a
+    REPL slash command with no tool behind it, so asking the agent to run it
+    made this test measure how gracefully the model improvises past an
+    impossible instruction rather than whether ``recall`` works.
+    """
+    from squishy.index import build_index, save_index
+
     print("\n=== Test: Recall Tool ===")
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
@@ -852,6 +860,9 @@ class UserService:
         return user
 """)
 
+        # Build the index up front, the way `/init` does.
+        save_index(str(working_dir), build_index(str(working_dir)))
+
         async with Squishy(
             model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
@@ -860,8 +871,8 @@ class UserService:
             max_turns=15,
         ) as sq:
             result = await sq.run(
-                "First build an index with /init, then use recall to find the User class definition, "
-                "and finally read the file containing it",
+                "Use the recall tool to find the User class definition, "
+                "then read the file containing it.",
                 working_dir=str(working_dir),
             )
         print(f"Success: {result.success}")

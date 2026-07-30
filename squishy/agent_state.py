@@ -93,6 +93,7 @@ class LoopState:
     unresolved_nudges: int = 0
     last_nudge_turn: int = -3
     total_nudges: int = 0
+    nudges_this_turn: int = 0
     # Test failure tracking across fix-verify cycles.
     last_test_failure_count: int = -1  # -1 = no test run yet
     last_test_failures: list[str] = field(default_factory=list)

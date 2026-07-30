@@ -87,7 +87,7 @@ class TestCheckGoalDrift:
 
         # env_error_count incremented to 3, then should_nudge fires
         assert len(agent.messages) >= 1
-        assert "drift" in agent.messages[-1]["content"].lower()
+        assert "environment" in agent.messages[-1]["content"].lower()
 
     def test_clears_env_fix_files_after_nudge(self):
         agent = _make_agent()
@@ -207,7 +207,7 @@ class TestTrackEditFailure:
         track_edit_failure(agent, st, tc, outcome, turn=3)
         assert len(agent.messages) == 1
         msg = agent.messages[0]["content"]
-        assert "STOP guessing" in msg
+        assert "stop guessing" in msg.lower()
         assert "foo/bar.py" in msg
         assert 'read_file(path="foo/bar.py")' in msg
 
@@ -224,7 +224,7 @@ class TestTrackEditFailure:
         track_edit_failure(agent, st, tc, outcome, turn=1)
         track_edit_failure(agent, st, tc, outcome, turn=3)
         # No escape-hatch nudge — only permission-style failures so far.
-        assert not any("STOP guessing" in m["content"] for m in agent.messages)
+        assert not any("stop guessing" in m["content"].lower() for m in agent.messages)
 
 
 # -- inject_test_failure_nudge -----------------------------------------------

@@ -205,7 +205,7 @@ async def test_agent_plan_mode_requires_plan_task(tmp_path):
         if m.get("role") == "user" and "[system]" in (m.get("content") or "")
     ]
     assert nudge_msgs, "expected at least one nudge injection"
-    assert any("partial or empty if uncertain" in (m.get("content") or "") for m in nudge_msgs)
+    assert any("call `plan_task` now" in (m.get("content") or "") for m in nudge_msgs)
 
 
 async def test_agent_plan_mode_gives_up_after_nudges(tmp_path):
@@ -249,7 +249,7 @@ async def test_json_plan_in_prose_triggers_pointed_nudge(tmp_path):
         m["content"] for m in agent.messages
         if m.get("role") == "user" and str(m.get("content", "")).startswith("[system]")
     ]
-    assert any("JSON plan inside your message" in n for n in nudges)
+    assert any("JSON in prose is not a plan" in n for n in nudges)
 
 
 async def test_ctrl_c_at_plan_approval_cancels_run(tmp_path):
@@ -737,7 +737,8 @@ async def test_goal_drift_detection(tmp_path):
 
     drift_msgs = [
         m for m in result.messages
-        if m.get("role") == "user" and "Goal drift detected" in (m.get("content") or "")
+        if m.get("role") == "user"
+        and "not the reported bug" in (m.get("content") or "")
     ]
     assert drift_msgs, "expected a goal drift nudge when editing unrelated files"
 

@@ -122,12 +122,13 @@ def test_assess_empty_tool_calls():
 def test_correction_unknown_tool():
     msg = build_correction("unknown_tool:find_file")
     assert "find_file" in msg
-    assert "does not exist" in msg
+    assert "No tool named" in msg
+    assert "read_file" in msg  # a real alternative is offered
 
 
 def test_correction_repeated():
     msg = build_correction("repeated_tool_call")
-    assert "stuck" in msg.lower() or "loop" in msg.lower()
+    assert "same tool call" in msg.lower()
 
 
 def test_correction_malformed():
@@ -139,7 +140,7 @@ def test_correction_malformed():
 def test_correction_excessive_reread():
     msg = build_correction("excessive_reread")
     assert "edit_file" in msg
-    assert "BLOCKED" in msg
+    assert "already read" in msg.lower()
 
 
 def test_correction_edit_verify_loop():

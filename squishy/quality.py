@@ -166,69 +166,60 @@ def assess_response(
     return True, "ok"
 
 
+# Listed when the model invents a tool name. Deliberately just the core set:
+# dumping the whole REGISTRY costs hundreds of tokens and grows unbounded once
+# MCP servers register their tools.
+_CORE_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "edit_file", "list_directory", "search_files",
+    "glob_files", "recall", "run_command", "save_note", "show_diff",
+    "plan_task", "update_plan", "finish_plan",
+})
+
+
 def build_correction(reason: str) -> str:
     """Build a corrective system message based on the failure reason."""
     if reason.startswith("unknown_tool:"):
         tool_name = reason.split(":", 1)[1]
-        available = ", ".join(REGISTRY.keys())
-        return (
-            f"Tool '{tool_name}' does not exist. Available tools are: "
-            f"{available}. "
-            "Use one of these instead."
-        )
+        # Only the core tools are listed: dumping the whole registry costs
+        # hundreds of tokens and grows without bound once MCP servers register.
+        available = ", ".join(sorted(_CORE_TOOL_NAMES & set(REGISTRY)))
+        return f"No tool named '{tool_name}'. Use one of: {available}."
 
     if reason.startswith("malformed_args:"):
         tool_name = reason.split(":", 1)[1]
-        return (
-            f"The arguments for tool '{tool_name}' were malformed (not valid JSON). "
-            "Please provide the arguments as a proper JSON object with correct syntax."
-        )
+        return f"Arguments for '{tool_name}' were not valid JSON. Resend as a JSON object."
 
     corrections = {
         "repeated_tool_call": (
-            "You just made the exact same tool call as a recent turn. "
-            "This suggests you are stuck in a loop. If you have already completed "
-            "your task, STOP calling tools and respond with a plain text summary. "
-            "If not, try a different approach: use a different tool, adjust your "
-            "arguments, or reconsider your strategy."
+            "Same tool call as a recent turn. Do something different, or reply with "
+            "a plain-text summary if the work is done."
         ),
         "excessive_reread": (
-            "BLOCKED: You have read this exact file multiple times. The content has "
-            "NOT changed. You MUST stop reading and take action NOW: call `edit_file` "
-            "to make your fix, or call `run_command` to test. Do NOT call `read_file` "
-            "on this file again."
+            "You already read this file and it hasn't changed. Act now: `edit_file` "
+            "to make the fix, or `run_command` to test."
         ),
         "repeated_command": (
-            "You have already run this exact command recently without changing any "
-            "code in between. If it failed, edit the code first, THEN re-run. "
-            "If it succeeded, you are DONE — respond with a plain text summary."
+            "You already ran this command with no code change in between. Edit the "
+            "code first, then re-run — or summarize if it passed."
         ),
         "edit_verify_loop": (
-            "You have been cycling between edit_file and run_command for many turns "
-            "without resolving the issue. STOP and try a completely different approach: "
-            "1. Re-read the requirements carefully. "
-            "2. Consider if you are editing the wrong file or section. "
-            "3. If the same check keeps failing, re-read it to understand expectations. "
-            "If your changes are working, respond with a plain text summary immediately."
+            "Many edit/test cycles without resolving it. Try a different approach — "
+            "you may be editing the wrong file or misreading what the check expects."
         ),
         "repeated_recall": (
-            "You have searched for the same query multiple times. The results will not "
-            "change. Use the results you already have, try a different query, or use "
-            "`save_note` to record important findings. Try a different approach."
+            "Same recall query as before; results won't change. Use what you have or "
+            "query something different."
         ),
         "repeated_search": (
-            "You have searched for the same pattern multiple times. The results will not "
-            "change. Use the results you already have or try a different search pattern."
+            "Same search pattern as before; results won't change. Use what you have or "
+            "search for something different."
         ),
         "plan_loop": (
-            "You have called update_plan/finish_plan multiple times without editing "
-            "code or running tests. Stop managing the plan and DO THE WORK: "
-            "1. Call `edit_file` to make your fix. "
-            "2. Call `run_command` to run the failing tests. "
-            "3. THEN update the plan with results."
+            "You keep updating the plan without doing work. Call `edit_file` to make "
+            "the fix and `run_command` to test, then update the plan."
         ),
     }
-    return corrections.get(reason, f"Quality issue detected: {reason}. Please try again.")
+    return corrections.get(reason, f"Quality issue: {reason}. Try a different approach.")
 
 
 

@@ -527,21 +527,15 @@ class Agent:
             looks_like_json_plan = _looks_like_json_plan(completion.text or "")
             if looks_like_json_plan:
                 content = (
-                    "[system] You wrote a JSON plan inside your message, but "
-                    "that does NOT count as planning. The user can only see "
-                    "and approve plans submitted via the `plan_task` tool. "
-                    "Take the same fields you just printed and pass them as "
-                    "tool arguments to `plan_task`. Do not paste JSON in prose "
-                    "again; call the tool now."
+                    "[system] JSON in prose is not a plan — only the "
+                    "`plan_task` tool is. Pass those same fields as tool "
+                    "arguments now."
                 )
             else:
                 content = (
-                    "[system] You are in plan mode. Stop explaining and call "
-                    "`plan_task` now with problem, solution, and steps. "
-                    "Use your best current understanding instead of waiting "
-                    "for exhaustive research. `files_to_modify` and "
-                    "`files_to_create` may be partial or empty if uncertain. "
-                    "Do not respond with prose until the plan is approved."
+                    "[system] Plan mode: call `plan_task` now with problem, "
+                    "solution, and steps. Use what you already know; the file "
+                    "lists may be partial."
                 )
             self.messages.append({"role": "user", "content": content})
             return "continue"
@@ -603,12 +597,9 @@ class Agent:
                 self.messages.append({
                     "role": "user",
                     "content": (
-                        "[system] CRITICAL: You have produced multiple empty responses. "
-                        "You MUST act NOW. Either:\n"
-                        "1. Call `read_file` on the file mentioned in the problem statement, OR\n"
-                        "2. Call `edit_file` with your best fix attempt, OR\n"
-                        "3. Respond with a plain text summary if you already fixed the bug.\n"
-                        "Do NOT produce another empty response."
+                        "[system] Empty responses repeated. Act now: call "
+                        "`edit_file` with your best fix, or summarize in plain "
+                        "text if the bug is already fixed."
                     ),
                 })
             else:
