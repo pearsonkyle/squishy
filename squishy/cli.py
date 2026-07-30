@@ -32,6 +32,7 @@ from squishy.session import (
     load_messages,
     restore_for_replay,
 )
+from squishy.tool_restrictions import TOOL_PROFILES
 from squishy.tools.base import Tool
 
 EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
@@ -81,6 +82,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--plan", action="store_true", help="Start in plan mode (default, read-only)")
     p.add_argument("--edits", action="store_true", help="Start in edits mode")
     p.add_argument("--yolo", action="store_true", help="Start in yolo mode (no prompts)")
+    p.add_argument(
+        "--tools", dest="tool_profile", choices=sorted(TOOL_PROFILES), default="standard",
+        help="Tool profile: standard (all tools the mode allows) or minimal "
+             "(shell + file primitives only, no phase machine)",
+    )
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
     p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
     p.add_argument("--thinking", action="store_true", help="Allow <think> blocks")
@@ -130,6 +136,7 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.permission_mode = "yolo"
     elif args.edits:
         cfg.permission_mode = "edits"
+    cfg.tool_profile = getattr(args, "tool_profile", "standard")
     if args.no_sandbox:
         cfg.use_sandbox = False
     if args.sandbox:
@@ -357,7 +364,7 @@ async def _run_direct_command(cmd: str, timeout: float = 120.0) -> int:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(Exception):

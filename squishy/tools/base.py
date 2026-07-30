@@ -35,6 +35,11 @@ class ToolContext:
     read_cache_hits: dict[tuple[str, int, Any], int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Tools the agent loop has temporarily withdrawn, mapped to the message
+    # explaining what to do instead. Dropping a tool from the schema is only a
+    # hint — a model that has been calling it for a dozen turns keeps calling
+    # it from history. Enforcement has to happen at dispatch.
+    blocked_tools: dict[str, str] = field(default_factory=dict)
     # (abs_path, original_content); original_content is None when the entry
     # records a newly-created file (undo deletes it).
     undo_stack: list[tuple[str, str | None]] = field(default_factory=list)

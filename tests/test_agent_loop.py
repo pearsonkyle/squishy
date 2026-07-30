@@ -744,7 +744,15 @@ async def test_goal_drift_detection(tmp_path):
 
 
 async def test_edit_failure_nudge_at_3(tmp_path):
-    """After 3 failed edits to the same file, a nudge should appear."""
+    """Repeated failed edits to one file must produce actionable guidance.
+
+    Asserted on intent, not wording: two nudges cover this case (a targeted
+    "old_str doesn't match — go re-read the file" at 2 failures, and a generic
+    one at 3), and which fires depends on the error text. Pinning the generic
+    phrasing previously hid the fact that the targeted nudge was dead code —
+    it reads `outcome["error"]`, which the dispatcher didn't populate until
+    that key was added.
+    """
     cfg = Config()
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "bench"
@@ -777,9 +785,13 @@ async def test_edit_failure_nudge_at_3(tmp_path):
     nudge_msgs = [
         m for m in result.messages
         if m.get("role") == "user"
-        and "failed edits" in (m.get("content") or "")
+        and str(m.get("content", "")).startswith("[system]")
+        and "old_str" in str(m.get("content", ""))
     ]
-    assert nudge_msgs, "expected a nudge after 3 failed edits to the same file"
+    assert nudge_msgs, "expected guidance after repeated failed edits to one file"
+    # Whichever nudge fires must tell the model to re-read the file.
+    assert any("read_file" in str(m["content"]) or "Read the exact" in str(m["content"])
+               for m in nudge_msgs)
 
 
 async def test_problem_reanchor_at_turn_15(tmp_path):

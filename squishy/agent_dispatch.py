@@ -135,6 +135,10 @@ async def run_tool(agent: Agent, turn: int, tc: ToolCall) -> dict[str, Any]:
         "success": outcome.success,
         "plan_approved": plan_approved,
         "data": outcome.data if isinstance(outcome.data, dict) else {},
+        # Carried so the loop can report *why* a call failed, not just that
+        # it did — a harness needs that to tell "model is confused" from
+        # "tool is broken".
+        "error": outcome.error or "",
     }
 
 

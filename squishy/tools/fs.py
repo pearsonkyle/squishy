@@ -46,6 +46,89 @@ def _safe_resolve(path: str, cwd: str) -> tuple[str, str | None]:
     return abs_path, None
 
 
+# Directories never worth walking when hunting for a mistyped path.
+_MISS_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".squishy", "node_modules", "__pycache__",
+    "venv", ".venv", "target", "build", "dist", ".tox", ".mypy_cache",
+    ".pytest_cache", "vendor", ".idea", ".gradle",
+})
+_MISS_MAX_CANDIDATES = 5
+
+
+def _path_candidates(path: str, cwd: str) -> list[str]:
+    """Plausible cwd-relative paths the model *meant* by *path*.
+
+    A bare "file not found" is a dead end: observed live, a model that wanted
+    `vyper/ast/natspec.py` asked for `vyper/vyper/ast/natspec.py` (the repo
+    directory and the package share a name) and burned ~20 turns never
+    recovering, because nothing in the error told it what was wrong.
+
+    Two cheap, high-yield repairs, then a bounded basename search:
+      * strip a leading component that duplicates the repo directory name;
+      * reinterpret a rooted path as repo-relative (`/vyper/x` -> `x`).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(rel: str) -> None:
+        rel = rel.strip("/")
+        if not rel or rel in seen:
+            return
+        if os.path.isfile(os.path.join(cwd, rel)):
+            seen.add(rel)
+            out.append(rel)
+
+    root = os.path.basename(os.path.realpath(cwd))
+    parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
+
+    # `<root>/rest` and `/<root>/rest` -> `rest`
+    if parts and parts[0] == root:
+        add("/".join(parts[1:]))
+    # A rooted path that is really repo-relative.
+    if os.path.isabs(path):
+        add("/".join(parts))
+        for i in range(1, len(parts)):
+            add("/".join(parts[i:]))
+    # Any doubled component (`a/a/b` -> `a/b`).
+    for i in range(len(parts) - 1):
+        if parts[i] == parts[i + 1]:
+            add("/".join(parts[:i] + parts[i + 1:]))
+
+    if out:
+        return out[:_MISS_MAX_CANDIDATES]
+
+    # Fall back to finding the basename anywhere in the tree.
+    target = parts[-1] if parts else ""
+    if not target:
+        return []
+    for dirpath, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _MISS_SKIP_DIRS and not d.startswith(".")]
+        if target in filenames:
+            add(os.path.relpath(os.path.join(dirpath, target), cwd))
+            if len(out) >= _MISS_MAX_CANDIDATES:
+                break
+    return out[:_MISS_MAX_CANDIDATES]
+
+
+def _not_found_error(path: str, cwd: str, abs_path: str) -> str:
+    """A 'file not found' the model can actually act on."""
+    if os.path.isdir(abs_path):
+        try:
+            entries = sorted(os.listdir(abs_path))[:20]
+        except OSError:
+            entries = []
+        listing = f" Contains: {', '.join(entries)}" if entries else ""
+        return (f"{path} is a directory, not a file. Pass a file path, or use "
+                f"`list_directory` to browse it.{listing}")
+    candidates = _path_candidates(path, cwd)
+    if candidates:
+        return (f"file not found: {path}. Did you mean: "
+                f"{', '.join(candidates)}?")
+    return (f"file not found: {path}. Paths are relative to the working "
+            f"directory ({cwd}) — don't prefix them with the repo name.")
+
+
 def _unescape_str(s: str) -> str:
     """Unescape over-escaped characters in model-generated strings.
 
@@ -139,8 +222,23 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     abs_path, err = _safe_resolve(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
+    corrected = ""
     if not os.path.isfile(abs_path):
-        return ToolResult(False, error=f"file not found: {path}")
+        # Reading is side-effect-free, so when exactly one candidate matches we
+        # serve it and say so, rather than spending a turn on a correction
+        # round-trip. Ambiguous or hopeless cases still error, with candidates.
+        cands = (
+            [] if os.path.isdir(abs_path)
+            else _path_candidates(path, ctx.working_dir)
+        )
+        if len(cands) == 1:
+            corrected = cands[0]
+            abs_path, err = _safe_resolve(corrected, ctx.working_dir)
+            if err:
+                return ToolResult(False, error=err)
+        else:
+            return ToolResult(
+                False, error=_not_found_error(path, ctx.working_dir, abs_path))
 
     try:
         offset = int(float(args.get("offset") or 0))
@@ -234,6 +332,14 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         "returned_lines": len(sliced),
         "offset": offset,
     }
+    if corrected:
+        # Say what was actually read, so the model uses the right path next
+        # time instead of repeating the miss on its edit call.
+        data["path"] = corrected
+        data["note"] = (
+            f"'{path}' does not exist; read '{corrected}' instead. "
+            f"Use '{corrected}' in your next call."
+        )
     if path_reads >= 3:
         data["warning"] = (
             f"This is read #{path_reads} of '{path}'. You are reading this file "
@@ -287,11 +393,27 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             return ToolResult(
                 False,
                 error=(
-                    f"write_file refused — creating test/reproduction files is not "
-                    f"allowed in bench mode. Fix the SOURCE code instead.\n"
-                    f"Use `edit_file` on the existing source file to apply your fix."
+                    "write_file refused — creating test/reproduction files is not "
+                    "allowed in bench mode. Fix the SOURCE code instead.\n"
+                    "Use `edit_file` on the existing source file to apply your fix."
                 ),
             )
+
+    # A mistyped path here doesn't error — it silently creates a stray file
+    # (e.g. `vyper/pyproject.toml` beside the real one) and the intended file
+    # is never touched. If the name exists elsewhere, that's almost certainly
+    # the target.
+    misplaced = _path_candidates(path, ctx.working_dir)
+    if misplaced:
+        return ToolResult(
+            False,
+            error=(
+                f"write_file refused — {path} does not exist, but "
+                f"{', '.join(misplaced)} does. You probably meant that file; "
+                f"use `edit_file` on it. If you really do want a new file at "
+                f"{path}, say so by creating its directory first."
+            ),
+        )
 
     os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
@@ -372,7 +494,10 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if err:
         return ToolResult(False, error=err)
     if not os.path.isfile(abs_path):
-        return ToolResult(False, error=f"file not found: {path}")
+        # Unlike read_file, never auto-correct here: guessing wrong would
+        # silently edit a file the model didn't ask for.
+        return ToolResult(
+            False, error=_not_found_error(path, ctx.working_dir, abs_path))
 
     with open(abs_path, encoding="utf-8", errors="replace") as f:
         text = f.read()

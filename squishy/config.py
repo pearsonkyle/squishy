@@ -35,6 +35,11 @@ class Config:
     max_tokens: int = 8192
     max_turns: int = 30
     permission_mode: PermissionMode = "plan"
+    # "standard" = every tool the mode permits. "minimal" = a shell plus the
+    # file primitives (the mini-swe-agent shape), and no phase machine. Small
+    # models generalize better to a tool set they were trained on, and the
+    # narrower schema is ~1.2k fewer tokens on every request.
+    tool_profile: str = "standard"
     working_dir: str = field(default_factory=os.getcwd)
     sandbox_image: str = field(
         default_factory=lambda: os.environ.get("SQUISHY_SANDBOX_IMAGE", "python:3.11-slim")
@@ -88,6 +93,14 @@ class Config:
         )
     )
     save_sessions: bool = True
+
+    def __post_init__(self) -> None:
+        from squishy.tool_restrictions import TOOL_PROFILES
+        if self.tool_profile not in TOOL_PROFILES:
+            raise ValueError(
+                f"tool_profile must be one of {sorted(TOOL_PROFILES)}, "
+                f"got {self.tool_profile!r}"
+            )
 
     def cycle_mode(self) -> PermissionMode:
         """Advance to the next interactive permission mode (skipping bench).

@@ -101,6 +101,7 @@ def build_system_prompt(
     project: ProjectInfo,
     thinking: bool = False,
     mode: str = "edits",
+    profile: str = "standard",
 ) -> str:
     """Assemble the system prompt.
 
@@ -118,8 +119,8 @@ def build_system_prompt(
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
 
     has_idx = has_index(cwd)
-    rules = _rules_block(has_idx)
-    mode_block = _mode_block(mode, cwd)
+    rules = _rules_block(has_idx, profile)
+    mode_block = _mode_block(mode, cwd, profile)
     project_line = _project_line(project)
     index_block = _index_header(cwd)
     top_files_block = "" if has_idx else _top_level_files_block(cwd)
@@ -145,9 +146,11 @@ def build_system_prompt(
     return body + index_block + top_files_block + instructions_block
 
 
-def _rules_block(has_idx: bool) -> str:
+def _rules_block(has_idx: bool, profile: str = "standard") -> str:
     """Core rules. Recall guidance is folded in here so it's not
     repeated inside every mode block."""
+    if profile == "minimal":
+        return _minimal_rules_block(has_idx)
     recall_line = (
         "- Use `recall(query=...)` to navigate the codebase before reading files; an index lives at `.squishy/index.json`."
         if has_idx
@@ -167,6 +170,33 @@ def _rules_block(has_idx: bool) -> str:
         "- When the task is done, reply with a plain-text summary and no tool call.\n"
         f"{recall_line}\n"
         f"{plan_line}"
+    )
+
+
+def _minimal_rules_block(has_idx: bool) -> str:
+    """Rules for the `minimal` tool profile.
+
+    Deliberately short. The profile exposes `run_command`, `read_file`,
+    `edit_file`, `write_file` (plus `recall` when an index exists), so there
+    is nothing to say about planning, phases, or the browsing tools — the
+    shell covers listing, globbing, and grepping. Everything a tool schema
+    already documents is omitted rather than restated.
+    """
+    recall_line = (
+        "- `recall(query=...)` searches a prebuilt index of this repo — use it "
+        "to locate code before reading files.\n"
+        if has_idx else ""
+    )
+    return (
+        "## Rules\n"
+        "- Read a file before you edit it.\n"
+        "- `edit_file` for existing files, `write_file` only for new ones.\n"
+        "- Use relative paths; the shell already runs in the working dir.\n"
+        "- `run_command` covers listing, globbing, and grepping — use it for "
+        "anything there isn't a dedicated tool for.\n"
+        f"{recall_line}"
+        "- Verify your change by running the relevant tests.\n"
+        "- When the task is done, reply with a plain-text summary and no tool call."
     )
 
 
@@ -224,7 +254,7 @@ def load_agent_instructions(cwd: str) -> str:
     return "".join(parts)
 
 
-def _mode_block(mode: str, cwd: str = "") -> str:
+def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
     """Per-mode rules.
 
     Each block is the *delta* on top of `## Rules` — anything already
@@ -232,6 +262,22 @@ def _mode_block(mode: str, cwd: str = "") -> str:
     repeated. Workflow examples and JSON shape blocks were dropped
     because the tool schemas already document them.
     """
+    if profile == "minimal":
+        # The standard bench block narrates the phase machine, which the
+        # minimal profile doesn't run, and names tools it doesn't expose.
+        # What's left is only the task framing that actually moves patch rate.
+        if mode == "bench":
+            return (
+                "## Task\n"
+                "- Change the SOURCE code that implements the behavior. Editing "
+                "tests is never a fix.\n"
+                "- Don't write reproduction scripts or new test files; run the "
+                "failing tests you were given.\n"
+                "- Import and environment errors are not the bug — don't chase them.\n"
+                "- Do not stop until you have actually edited a non-test source "
+                "file. Ending with no edit is a failed run."
+            )
+        return ""
     if mode == "plan":
         return (
             "## Mode: plan (read-only)\n"

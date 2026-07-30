@@ -25,6 +25,9 @@ class FakeClient:
 
     script: list[CompletionResult]
     calls_seen: list[list[dict[str, Any]]] = field(default_factory=list)
+    # Schemas offered per request — lets tests assert on what the model was
+    # actually shown, not just what it was asked.
+    tools_seen: list[list[dict[str, Any]]] = field(default_factory=list)
     _i: int = 0
 
     async def health(self) -> bool:
@@ -40,6 +43,7 @@ class FakeClient:
         on_retry: Any = None,
     ) -> CompletionResult:
         self.calls_seen.append(list(messages))
+        self.tools_seen.append(list(tools or []))
         if self._i >= len(self.script):
             return CompletionResult(text="done.", tool_calls=[])
         result = self.script[self._i]

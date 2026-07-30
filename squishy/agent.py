@@ -45,8 +45,6 @@ from squishy.agent_state import (
     extract_problem_files,
     prose_msg,
 )
-from squishy.phase_machine import PhaseState, advance, check_finish_plan_gate, check_transition
-from squishy.tool_aliases import normalize_call
 from squishy.client import Client, CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.context import (
@@ -59,7 +57,9 @@ from squishy.context import (
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.index.store import has_index
+from squishy.phase_machine import PhaseState, advance, check_finish_plan_gate, check_transition
 from squishy.plan_state import load_plan, render_plan_status
+from squishy.tool_aliases import normalize_call
 from squishy.tools import PromptFn, ToolContext, openai_schemas
 from squishy.tools.scratchpad import render_notes
 
@@ -167,6 +167,7 @@ class Agent:
             project,
             self.config.thinking,
             self.config.permission_mode,
+            self.config.tool_profile,
         )
         self.messages.append({"role": "system", "content": system_prompt})
 
@@ -705,8 +706,11 @@ class Agent:
             cache_problem_text(self, st)
 
         # Phase machine (bench mode only — interactive modes are unaffected).
+        # The minimal profile deliberately opts out: its whole premise is that
+        # a small tool set plus a directive prompt beats structural gating, and
+        # phase-gated schemas would fight the profile's own tool filter.
         ps: PhaseState | None = None
-        if is_bench:
+        if is_bench and self.config.tool_profile != "minimal":
             ps = PhaseState(
                 max_explore_turns=self.config.max_explore_turns,
                 max_plan_turns=self.config.max_plan_turns,
@@ -721,12 +725,21 @@ class Agent:
             p = self.tool_ctx.plan
             return p is not None and p.approved
 
+        # Under a narrowed profile, advertise `recall` only when there is an
+        # index behind it — otherwise the model spends a call to be told the
+        # tool it was offered doesn't work here.
+        _profile = self.config.tool_profile
+        _extra = (
+            frozenset({"recall"})
+            if has_index(self.config.working_dir) else frozenset()
+        )
+
         _cached_perm_mode = self.config.permission_mode
         _cached_plan_active = _plan_active()
         _cached_phase = ps.phase if ps else None
         _cached_schemas = openai_schemas(
             _cached_perm_mode, plan_active=_cached_plan_active,
-            phase=_cached_phase,
+            phase=_cached_phase, profile=_profile, extra_tools=_extra,
         )
 
         for turn in range(1, self.config.max_turns + 1):
@@ -787,6 +800,19 @@ class Agent:
                 ps.phase = "execute"
                 st.phase = ps.phase
 
+            # Removing run_command from the schema is not enough on its own:
+            # observed live, a model with a dozen turns of run_command in its
+            # history kept calling it for 13 more turns after the withdrawal.
+            # Refusing at dispatch is what actually closes the loop.
+            if must_edit:
+                self.tool_ctx.blocked_tools["run_command"] = (
+                    "refused: you have not edited any file yet, so shell access "
+                    "is disabled until you do. Use `edit_file` to apply your best "
+                    "fix now — an imperfect patch beats no patch."
+                )
+            else:
+                self.tool_ctx.blocked_tools.pop("run_command", None)
+
             self.tool_ctx.permission_mode = self.config.permission_mode
             now_plan_active = _plan_active()
             now_phase = ps.phase if ps else None
@@ -800,7 +826,7 @@ class Agent:
                 _cached_phase = now_phase
                 _cached_schemas = openai_schemas(
                     _cached_perm_mode, plan_active=_cached_plan_active,
-                    phase=_cached_phase,
+                    phase=_cached_phase, profile=_profile, extra_tools=_extra,
                 )
                 if self.display is not None:
                     self.display.set_mode(self.config.permission_mode)
@@ -1005,6 +1031,17 @@ class Agent:
 
             st.total_prompt_tokens += completion.prompt_tokens
             st.completion_tokens += completion.completion_tokens
+            # Emitted per-turn so a harness can accumulate usage as it happens.
+            # Sourcing metrics from TaskResult alone loses them on the common
+            # weak-model paths (turn cap, timeout, upstream error).
+            self._emit({
+                "type": "usage", "turn": turn,
+                "prompt_tokens": completion.prompt_tokens,
+                "completion_tokens": completion.completion_tokens,
+                "total_prompt_tokens": st.total_prompt_tokens,
+                "total_completion_tokens": st.completion_tokens,
+                "tool_calls": len(completion.tool_calls or []),
+            })
 
             # --- No tool calls: prose-only completion ---
             if not completion.tool_calls:
@@ -1083,6 +1120,9 @@ class Agent:
                     "type": "tool", "name": tc.name,
                     "args": dict(tc.args) if isinstance(tc.args, dict) else tc.args,
                     "success": bool(outcome.get("success")),
+                    # Truncated: enough for a harness to bucket failures by
+                    # cause without carrying whole tool outputs.
+                    "error": str(outcome.get("error") or "")[:300],
                 })
 
                 # Informational feedback.

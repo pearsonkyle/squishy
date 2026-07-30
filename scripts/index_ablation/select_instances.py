@@ -59,6 +59,10 @@ def _rows_for_language(lang: str, want: int, pool: int) -> list[dict]:
                 "problem_statement": row["problem_statement"],
                 "test_cmd": ic.get("test_cmd", ""), "install": ic.get("install") or [],
                 "FAIL_TO_PASS": row.get("FAIL_TO_PASS") or [],
+                "PASS_TO_PASS": row.get("PASS_TO_PASS") or [],
+                # Required for grading: the gold *test* patch is applied on top
+                # of the model's patch so F2P/P2P tests actually exist to run.
+                "test_patch": row.get("test_patch") or "",
                 "gold_patch": row.get("patch") or "",
             })
             if len(out) >= want:

@@ -12,6 +12,7 @@ from typing import Any
 
 from squishy.tool_restrictions import check_permission as _check_permission
 from squishy.tool_restrictions import get_allowed_tools as _get_allowed_tools
+from squishy.tool_restrictions import get_profile_tools as _get_profile_tools
 from squishy.tools.base import Tool, ToolContext, ToolResult
 from squishy.tools.fs import FS_TOOLS
 from squishy.tools.plan import PLAN_TOOLS
@@ -57,6 +58,10 @@ async def dispatch(
     if isinstance(tool_arg_error, str):
         return ToolResult(False, error=tool_arg_error)
 
+    blocked = ctx.blocked_tools.get(name)
+    if blocked:
+        return ToolResult(False, error=blocked)
+
     allowed, reason = check_permission(tool, ctx.permission_mode, args)
     if not allowed:
         if reason == "prompt":
@@ -81,6 +86,8 @@ def openai_schemas(
     *,
     plan_active: bool = False,
     phase: str | None = None,
+    profile: str = "standard",
+    extra_tools: frozenset[str] | set[str] | None = None,
 ) -> list[dict[str, object]]:
     """Return OpenAI-format tool schemas, optionally filtered by mode and phase.
 
@@ -98,9 +105,24 @@ def openai_schemas(
     planning instead of executing — it must use ``update_plan`` /
     ``finish_plan`` instead. ``update_plan`` itself supports
     ``add_steps`` for genuine scope changes.
+
+    ``profile`` narrows the result further (see ``tool_restrictions``):
+    ``"minimal"`` exposes only a shell plus the file primitives, which is the
+    shape most small models have actually been trained on. ``extra_tools``
+    adds names back on top of a profile — used to surface ``recall`` only when
+    an index exists, rather than advertising a tool that would immediately
+    error. A profile only shapes the *schema*; it adds no refusal path, so a
+    model that calls an unlisted tool from memory is still served.
     """
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
+
+    narrow = _get_profile_tools(profile)
+    if narrow is not None and extra_tools:
+        narrow = narrow | frozenset(extra_tools)
+
+    def _keep(name: str) -> bool:
+        return narrow is None or name in narrow
 
     # Phase-gated filtering for bench mode.
     if phase is not None and mode == "bench":
@@ -110,6 +132,7 @@ def openai_schemas(
             t.openai_schema()
             for t in ALL_TOOLS
             if t.name in phase_tools
+            and _keep(t.name)
             and not (plan_active and t.name == "plan_task")
         ]
 
@@ -119,6 +142,7 @@ def openai_schemas(
         t.openai_schema()
         for t in ALL_TOOLS
         if (t.name in allowed or (t.name.startswith("mcp__") and mode != "plan"))
+        and _keep(t.name)
         and not (plan_active and t.name == "plan_task")
     ]
 

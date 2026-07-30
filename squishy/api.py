@@ -23,6 +23,7 @@ from squishy.agent import Agent, TaskResult
 from squishy.client import Client
 from squishy.config import MODES, Config, PermissionMode
 from squishy.display import Stats
+from squishy.tool_restrictions import TOOL_PROFILES
 
 log = logging.getLogger("squishy.api")
 
@@ -94,6 +95,9 @@ class Squishy:
     max_tokens: int = 8192
     max_turns: int = 30
     permission_mode: PermissionMode = "yolo"
+    # "standard" = every tool the mode allows; "minimal" = shell + file
+    # primitives only, and no phase machine. See squishy.tool_restrictions.
+    tool_profile: str = "standard"
     request_timeout: float = 120.0
     max_retries: int = 8
     use_sandbox: bool = False
@@ -136,6 +140,11 @@ class Squishy:
     def __post_init__(self) -> None:
         if self.permission_mode not in MODES:
             raise ValueError(f"permission_mode must be one of {MODES}")
+        if self.tool_profile not in TOOL_PROFILES:
+            raise ValueError(
+                f"tool_profile must be one of {sorted(TOOL_PROFILES)}, "
+                f"got {self.tool_profile!r}"
+            )
         self._client = Client(
             base_url=self.base_url,
             api_key=self.api_key,
@@ -200,7 +209,7 @@ class Squishy:
         session_id: str | None = None,
         extra_env: dict[str, str] | None = None,
         notes: dict[str, str] | None = None,
-    ) -> "ChatSession":
+    ) -> ChatSession:
         """Create a multi-turn chat session with persistent agent state.
 
         Usage::
@@ -282,7 +291,7 @@ class ChatSession:
         """Send a user message and run the agent to completion."""
         return await self._agent.run(message, timeout=timeout)
 
-    async def __aenter__(self) -> "ChatSession":
+    async def __aenter__(self) -> ChatSession:
         return self
 
     async def __aexit__(self, *_: Any) -> None:

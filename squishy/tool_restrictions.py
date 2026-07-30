@@ -44,6 +44,35 @@ ALL_TOOLS = READ_ONLY_TOOLS | MUTATING_TOOLS | SHELL_TOOL_NAMES | WEB_TOOLS
 # tool schema (~150 tokens × every bench call).  Drop it.
 BENCH_TOOLS = ALL_TOOLS - WEB_TOOLS
 
+# --- Tool profiles --------------------------------------------------------
+#
+# A profile narrows what the model *sees* in its schema; it never widens what
+# permission mode allows, and it does not add a refusal path. If a model calls
+# something outside its profile (many are trained on Claude Code / mini-swe /
+# pi tool vocabularies), the call still dispatches normally — `tool_aliases`
+# already maps the common alternate spellings onto our canonical names.
+#
+# `minimal` is the mini-swe-agent shape: a shell plus the file primitives a
+# small model actually needs. Everything else (planning, scratchpad, diffing,
+# directory listing, globbing, grepping) is reachable through `run_command`,
+# so exposing dedicated tools for them buys little and costs schema tokens on
+# every single request.
+MINIMAL_TOOLS = frozenset({
+    "run_command", "read_file", "edit_file", "write_file",
+})
+
+TOOL_PROFILES: dict[str, frozenset[str] | None] = {
+    # None = no narrowing; the permission mode alone decides.
+    "standard": None,
+    "minimal": MINIMAL_TOOLS,
+}
+
+
+def get_profile_tools(profile: str) -> frozenset[str] | None:
+    """Return the tool-name filter for *profile*, or None for no narrowing."""
+    return TOOL_PROFILES.get(profile)
+
+
 # Shell commands allowed in plan mode. Single-word binaries are matched on the
 # first token; two-word entries (e.g. "git log") match on the first two.
 READONLY_SHELL_BINARIES = frozenset({
