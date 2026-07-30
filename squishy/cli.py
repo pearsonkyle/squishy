@@ -84,6 +84,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
     p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
     p.add_argument("--thinking", action="store_true", help="Allow <think> blocks")
+    p.add_argument(
+        "--context-window", type=int, default=None,
+        help="Context window in tokens (default: auto-detect, else assume 32768). "
+             "Set this when your endpoint doesn't advertise context_length.",
+    )
     p.add_argument("--message", "-m", help="Non-interactive: send one message, print result, exit")
     p.add_argument("--init", action="store_true", help="Build .squishy/index.json before the REPL")
     p.add_argument("--no-summaries", action="store_true", help="When indexing, skip LLM summaries")
@@ -131,6 +136,8 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.use_sandbox = True
     if args.thinking:
         cfg.thinking = True
+    if args.context_window is not None:
+        cfg.context_window = args.context_window
     if args.init:
         cfg.auto_init = True
     if args.no_summaries:
@@ -215,9 +222,13 @@ async def _amain() -> None:
             cfg.model = discovered_model
             client.model = discovered_model
         display.banner(cfg.base_url, cfg.model)
-        # Use the discovered context window so the % usage display is meaningful.
-        # Falls back to 0 (no % shown) for endpoints that don't expose it.
-        display.stats.context_window = client.context_window
+        # Show % usage against the window the agent actually budgets against:
+        # explicit override → endpoint-advertised → assumed default.
+        display.stats.context_window = (
+            cfg.context_window
+            or client.context_window
+            or cfg.assumed_context_window
+        )
 
         if cfg.auto_init:
             # A failed --init build must not abort startup — the REPL/one-shot
@@ -420,7 +431,14 @@ async def _prompt_switch_to_edits(
 
 
 async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeout: float | None) -> None:
-    """If a plan was just approved, auto-switch to edits mode and execute it."""
+    """If a plan was just approved BY A HUMAN, switch to edits mode and execute it.
+
+    Without a human in the loop (pipe / non-TTY ``-m``) the plan is
+    auto-approved, so auto-switching plan→edits would silently escalate a
+    read-only run into one that writes files and runs commands — with nobody
+    having reviewed the plan. In that case we stop after planning and tell the
+    user how to execute deliberately.
+    """
     plan = agent.tool_ctx.plan
     if not (
         cfg.permission_mode == "plan"
@@ -428,6 +446,13 @@ async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeou
         and plan.approved
         and not agent.tool_ctx.plan_switch_prompted
     ):
+        return
+    if agent.prompt_fn is None:
+        agent.tool_ctx.plan_switch_prompted = True
+        display.info(
+            "plan ready — not executing automatically because nothing was "
+            "approved interactively. Re-run with --edits or --yolo to execute it."
+        )
         return
     agent.tool_ctx.plan_switch_prompted = True
     cfg.permission_mode = "edits"

@@ -20,8 +20,15 @@ def _cap(context_window: int, configured: int = 32_000, tmp="/tmp") -> int:
     return agent.tool_ctx.max_tool_output_chars
 
 
-def test_unknown_window_keeps_configured_cap(tmp_path):
-    assert _cap(0, 32_000, str(tmp_path)) == 32_000
+def test_unknown_window_uses_assumed_window(tmp_path):
+    """An endpoint that doesn't advertise context_length still gets a bounded
+    cap, derived from assumed_context_window (32768*3.5/8 = 14336) rather than
+    leaving results effectively uncapped."""
+    assert _cap(0, 32_000, str(tmp_path)) == 14_336
+
+
+def test_configured_cap_still_bounds_a_large_assumed_window(tmp_path):
+    assert _cap(0, 5_000, str(tmp_path)) == 5_000
 
 
 def test_small_window_reduces_cap(tmp_path):
@@ -44,3 +51,36 @@ def test_to_message_respects_limit():
     # Default limit leaves small payloads intact.
     small = ToolResult(True, data={"content": "hi"}).to_message()
     assert "hi" in small
+
+
+# --- effective context window (live-testing finding) ----------------------
+
+def _agent(tmp, *, reported=0, override=0, assumed=32_768):
+    cfg = Config()
+    cfg.working_dir = str(tmp)
+    cfg.context_window = override
+    cfg.assumed_context_window = assumed
+    return Agent(cfg, _Client(reported), display=None)  # type: ignore[arg-type]
+
+
+def test_context_window_falls_back_to_assumed(tmp_path):
+    """Endpoints that don't advertise context_length (LM Studio, llama.cpp)
+    must still get compaction + history sizing, not silently disabled."""
+    a = _agent(tmp_path, reported=0)
+    assert a._context_window() == 32_768
+
+
+def test_context_window_prefers_endpoint_value(tmp_path):
+    a = _agent(tmp_path, reported=8192)
+    assert a._context_window() == 8192
+
+
+def test_context_window_explicit_override_wins(tmp_path):
+    a = _agent(tmp_path, reported=8192, override=65536)
+    assert a._context_window() == 65536
+
+
+def test_output_cap_uses_assumed_window(tmp_path):
+    """With no advertised window the cap now derives from the assumed one."""
+    a = _agent(tmp_path, reported=0, assumed=8192)
+    assert a.tool_ctx.max_tool_output_chars == 4000

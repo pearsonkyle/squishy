@@ -102,3 +102,42 @@ async def test_save_note_caps_key_length(tmp_path):
     r = await _save_note({"key": "k" * 5000, "content": "v"}, ctx)
     assert r.success
     assert all(len(k) <= MAX_NOTE_KEY_CHARS for k in ctx.notes)
+
+
+# --- read_file cache-hit loop (found in live testing) ---------------------
+
+async def test_read_file_refuses_after_repeated_identical_reads(tmp_path):
+    """Serving unlimited successful cache hits let weak models spin on the
+    identical read until the generic loop detector killed the run."""
+    from squishy.tools.base import ToolContext
+    from squishy.tools.fs import read_file
+    (tmp_path / "m.py").write_text("x = 1\n")
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="yolo", use_sandbox=False)
+
+    r1 = await read_file.run({"path": "m.py"}, ctx)
+    assert r1.success and not r1.data.get("cache_hit")
+
+    r2 = await read_file.run({"path": "m.py"}, ctx)
+    assert r2.success and r2.data.get("cache_hit") is True  # first repeat tolerated
+
+    r3 = await read_file.run({"path": "m.py"}, ctx)
+    assert not r3.success
+    assert "STOP reading" in r3.error
+
+
+async def test_read_cache_counter_resets_after_edit(tmp_path):
+    """A re-read after a real change must not be refused."""
+    from squishy.tools.base import ToolContext
+    from squishy.tools.fs import edit_file, read_file
+    (tmp_path / "m.py").write_text("x = 1\n")
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="yolo", use_sandbox=False)
+
+    await read_file.run({"path": "m.py"}, ctx)
+    await read_file.run({"path": "m.py"}, ctx)
+    r = await read_file.run({"path": "m.py"}, ctx)
+    assert not r.success  # looping
+
+    await edit_file.run({"path": "m.py", "old_str": "x = 1", "new_str": "x = 2"}, ctx)
+    r = await read_file.run({"path": "m.py"}, ctx)
+    assert r.success, "re-read after an edit must be allowed"
+    assert "x = 2" in r.data["content"]

@@ -505,3 +505,52 @@ async def test_compact_messages_pulls_tool_results_with_anchored_assistant():
     # The matching tool result should also be present
     tool_results = [m for m in result if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
     assert tool_results, "tool result paired with anchored assistant should also survive compaction"
+
+
+def test_normalize_merges_consecutive_user_nudges():
+    """Stacked [system] nudges (sent as role=user) must be coalesced —
+    strict-alternation templates (Mistral) reject consecutive user turns."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "do the thing"},
+        {"role": "user", "content": "[system] nudge A"},
+        {"role": "user", "content": "[system] nudge B"},
+    ]
+    out = normalize_messages(msgs)
+    roles = [m["role"] for m in out]
+    assert roles == ["system", "user"]
+    body = out[-1]["content"]
+    assert "do the thing" in body and "nudge A" in body and "nudge B" in body
+
+
+def test_normalize_does_not_merge_across_assistant():
+    msgs = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "b"},
+    ]
+    assert [m["role"] for m in normalize_messages(msgs)] == ["user", "assistant", "user"]
+
+
+def test_normalize_never_merges_assistant_tool_calls():
+    """Merging assistant messages that carry tool_calls would break pairing."""
+    msgs = [
+        _asst_tc("c1"),
+        {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": "ok"},
+        _asst_tc("c2"),
+        {"role": "tool", "tool_call_id": "c2", "name": "run_command", "content": "ok"},
+    ]
+    out = normalize_messages(msgs)
+    assert len(out) == 4
+    assert sum(1 for m in out if m.get("tool_calls")) == 2
+
+
+def test_normalize_merges_consecutive_prose_assistants():
+    msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "part 1"},
+        {"role": "assistant", "content": "part 2"},
+    ]
+    out = normalize_messages(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert "part 1" in out[-1]["content"] and "part 2" in out[-1]["content"]

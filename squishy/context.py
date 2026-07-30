@@ -511,6 +511,46 @@ def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             # else: reverse orphan — drop it.
         else:
             out.append(m)
+    return _merge_adjacent_same_role(out)
+
+
+def _merge_adjacent_same_role(
+    msgs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Coalesce directly-adjacent same-role user/assistant messages.
+
+    Several gates can each append a ``[system]`` nudge (they are sent as
+    ``role="user"``) within one turn, producing consecutive user messages.
+    Templates that require strict alternation — Mistral/Ministral among them —
+    reject the whole request with "conversation roles must alternate user and
+    assistant roles", which surfaced live as an APIError mid-run. Merging is
+    also a small token win.
+
+    Assistant messages are merged only when neither carries ``tool_calls``, so
+    tool-call pairing is never disturbed. Tool messages are left untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for m in msgs:
+        role = m.get("role")
+        if role not in ("user", "assistant") or not out:
+            out.append(m)
+            continue
+        prev = out[-1]
+        if prev.get("role") != role:
+            out.append(m)
+            continue
+        if role == "assistant" and (prev.get("tool_calls") or m.get("tool_calls")):
+            out.append(m)
+            continue
+        prev_content = prev.get("content")
+        cur_content = m.get("content")
+        if not isinstance(prev_content, str) or not isinstance(cur_content, str):
+            out.append(m)
+            continue
+        merged = dict(prev)
+        joined = "\n\n".join(p for p in (prev_content, cur_content) if p)
+        merged["content"] = joined
+        out[-1] = merged
     return out
 
 

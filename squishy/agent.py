@@ -182,17 +182,33 @@ class Agent:
         if self.display is not None and self.config.permission_mode == "plan" and not self.has_index:
             self.display.info("[plan] no index found; direct file exploration fallback is enabled")
 
+    def _context_window(self) -> int:
+        """Effective context window in tokens.
+
+        Priority: explicit config override → value advertised by the endpoint →
+        ``assumed_context_window``. The fallback matters: many local servers
+        (LM Studio, llama.cpp) don't report ``context_length``, and without a
+        value the compaction safety valve and dynamic history sizing were
+        silently disabled — context then grew unbounded until the server errored.
+        """
+        if self.config.context_window > 0:
+            return self.config.context_window
+        reported = getattr(self.client, "context_window", 0) or 0
+        if reported > 0:
+            return reported
+        return max(0, self.config.assumed_context_window)
+
     def _effective_output_cap(self) -> int:
         """Per-tool-result char cap, made window-aware for small models.
 
         The configured ``max_tool_output_chars`` (default 32k chars ≈ 9k tokens)
         can single-handedly blow an 8k–16k context window with one big
-        ``read_file`` / ``run_command`` result. When the endpoint reports a
-        context window, cap a single result at ~1/8 of it (chars ≈ tokens×3.5),
-        floored so it stays useful and never raised above the configured value.
+        ``read_file`` / ``run_command`` result. Cap a single result at ~1/8 of
+        the effective window (chars ≈ tokens×3.5), floored so it stays useful
+        and never raised above the configured value.
         """
         configured = self.config.max_tool_output_chars
-        ctx_tokens = getattr(self.client, "context_window", 0) or 0
+        ctx_tokens = self._context_window()
         if ctx_tokens <= 0:
             return configured
         window_cap = int(ctx_tokens * 3.5 / 8)
@@ -797,12 +813,15 @@ class Agent:
             # whole turn from the session log / --resume / training export.
             self._persist_new_messages()
 
-            # Compaction + trim.
+            # Compaction + trim. Uses the *effective* window so endpoints that
+            # don't advertise context_length still get compaction and dynamic
+            # history sizing (previously both were silently disabled).
+            ctx = self._context_window()
             did_compact = False
-            if getattr(self.client, "context_window", 0) > 0:
+            if ctx > 0:
                 compacted_msgs = await compact_messages(
                     self.messages, self.client,
-                    context_limit=self.client.context_window,
+                    context_limit=ctx,
                     threshold=self.config.compaction_threshold,
                 )
                 if len(compacted_msgs) < len(self.messages):
@@ -812,7 +831,6 @@ class Agent:
             # so 128k models keep more history than 32k models.  Bounded so
             # we don't blow up on absurdly long contexts.  Compaction at
             # 70% remains the second safety valve.
-            ctx = getattr(self.client, "context_window", 0) or 0
             if ctx > 0:
                 dyn_max = max(10, min(60, ctx // 4096))
                 hist_cap = max(self.config.max_history_messages, dyn_max)

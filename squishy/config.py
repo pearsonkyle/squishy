@@ -52,6 +52,12 @@ class Config:
     max_plan_investigation_turns: int = 4
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
+    # Context window in tokens. 0 = auto-detect from the endpoint. Many local
+    # servers (LM Studio, llama.cpp) do NOT advertise `context_length`; without
+    # a value the compaction safety valve and dynamic history sizing are
+    # silently disabled, so `assumed_context_window` is used as the fallback.
+    context_window: int = 0
+    assumed_context_window: int = 32_768
     max_tool_output_chars: int = 32_000
     max_quality_retries: int = 3
     compaction_threshold: float = 0.7

@@ -80,6 +80,9 @@ def _collapse_double_backslash(s: str) -> str:
 
 
 _UNDO_STACK_CAP = 50
+# Identical cached reads tolerated before read_file refuses (1 = the first
+# repeat is served from cache, the next one errors).
+_MAX_CACHE_HITS = 2
 
 
 def _push_undo(ctx: ToolContext, abs_path: str, original: str | None) -> None:
@@ -97,6 +100,9 @@ def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
     """Drop any cached reads for *abs_path* after a mutating write/edit."""
     for key in [k for k in ctx.files_read_meta if k[0] == abs_path]:
         del ctx.files_read_meta[key]
+    # Drop repeat counters too: after a real change, re-reading is legitimate.
+    for key in [k for k in ctx.read_cache_hits if k[0] == abs_path]:
+        del ctx.read_cache_hits[key]
     ctx.files_read.pop(abs_path, None)
     # files_read is keyed by relative path, so also pop relative form.
     rel_path = os.path.relpath(abs_path, ctx.working_dir)
@@ -152,6 +158,23 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     cache_key = (abs_path, offset, limit)
     prior = ctx.files_read_meta.get(cache_key)
     if prior is not None:
+        # Escalate on a loop: the first repeat is answered from cache, but
+        # further identical reads return an ERROR. Serving unlimited successful
+        # cache hits let weak models spin on the same call until the generic
+        # loop detector killed the run (observed live: 8 identical reads).
+        hits = ctx.read_cache_hits.get(cache_key, 0) + 1
+        ctx.read_cache_hits[cache_key] = hits
+        if hits >= _MAX_CACHE_HITS:
+            return ToolResult(
+                False,
+                error=(
+                    f"Refused: you have already read this exact range of '{path}' "
+                    f"{hits + 1} times and the content has not changed. STOP reading. "
+                    "Use what you already have: call `edit_file` to make your change, "
+                    "`run_command` to test, `save_note` to record findings, or reply "
+                    "with a plain-text summary if the task is done."
+                ),
+            )
         return ToolResult(
             True,
             data={

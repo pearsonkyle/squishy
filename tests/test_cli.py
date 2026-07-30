@@ -39,7 +39,8 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
     class FakeAgent:
 
         def __init__(self, *args, **kwargs) -> None:
-            del args, kwargs
+            del args
+            self.prompt_fn = kwargs.get("prompt_fn")
             self.tool_ctx = SimpleNamespace(plan=None, plan_switch_prompted=False)
             self.calls: list[str] = []
             seen_agents.append(self)
@@ -55,11 +56,17 @@ async def test_run_one_continues_after_plan_approval(monkeypatch):
     monkeypatch.setattr(cli, "Agent", FakeAgent)
     display = FakeDisplay()
 
+    async def _approve(*_a, **_k):
+        return True
+
+    # An interactive prompt_fn means a human approved the plan, so the
+    # approve -> switch-to-edits -> execute flow is expected. (The
+    # non-interactive case is covered by the escalation tests below.)
     await cli._run_one(
         cfg,
         client=FakeClient(),
         display=display,
-        prompt_fn=None,
+        prompt_fn=_approve,
         message="do task",
         timeout=None,
     )
@@ -126,3 +133,69 @@ async def test_run_one_clears_stale_plan(monkeypatch, tmp_path):
 
     # The stale plan file should have been cleared before the agent started.
     assert not plan_path(tmp_path).exists()
+
+
+async def test_auto_execute_plan_skipped_without_human_approval(monkeypatch, tmp_path):
+    """Non-interactive runs (pipe / non-TTY -m) auto-approve the plan, so
+    auto-switching plan->edits would grant unreviewed write access."""
+    from squishy import cli
+    from squishy.config import Config
+    from squishy.display import Display
+    from squishy.plan_state import PlanState
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+
+    class _Agent:
+        def __init__(self):
+            self.prompt_fn = None  # no human in the loop
+            self.tool_ctx = type("C", (), {
+                "plan": PlanState.create(problem="p", solution="s", steps=["a"]),
+                "plan_switch_prompted": False,
+            })()
+            self.ran = False
+
+        async def run(self, *_a, **_k):
+            self.ran = True
+
+    agent = _Agent()
+    agent.tool_ctx.plan.mark_approved()
+    await cli._auto_execute_plan(agent, cfg, Display(), None)
+
+    assert cfg.permission_mode == "plan", "must not escalate to edits"
+    assert agent.ran is False, "must not execute the plan unreviewed"
+
+
+async def test_auto_execute_plan_runs_when_human_approved(tmp_path):
+    """With an interactive prompt_fn the existing approve->execute UX stands."""
+    from squishy import cli
+    from squishy.config import Config
+    from squishy.display import Display
+    from squishy.plan_state import PlanState
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "plan"
+
+    async def _prompt(*_a, **_k):
+        return True
+
+    class _Agent:
+        def __init__(self):
+            self.prompt_fn = _prompt
+            self.tool_ctx = type("C", (), {
+                "plan": PlanState.create(problem="p", solution="s", steps=["a"]),
+                "plan_switch_prompted": False,
+            })()
+            self.ran = False
+
+        async def run(self, *_a, **_k):
+            self.ran = True
+
+    agent = _Agent()
+    agent.tool_ctx.plan.mark_approved()
+    await cli._auto_execute_plan(agent, cfg, Display(), None)
+
+    assert cfg.permission_mode == "edits"
+    assert agent.ran is True

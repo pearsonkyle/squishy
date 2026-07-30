@@ -29,6 +29,10 @@ class ToolContext:
     _cached_index: Any = field(default=None, repr=False)
     _cached_index_mtime: float = field(default=-1.0, repr=False)
     files_read_count: dict[str, int] = field(default_factory=dict)
+    # Repeat count per (abs_path, offset, limit) for reads served from cache.
+    # Lets read_file escalate from "here it is again" to a hard refusal when a
+    # model loops on the identical read.
+    read_cache_hits: dict[tuple[str, int, Any], int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
     # (abs_path, original_content); original_content is None when the entry

@@ -104,6 +104,10 @@ class Squishy:
     max_plan_investigation_turns: int = 4
     max_recall_skip_turns: int = 2
     max_history_messages: int = 10
+    # 0 = auto-detect from the endpoint, falling back to assumed_context_window
+    # (many local servers don't advertise context_length).
+    context_window: int = 0
+    assumed_context_window: int = 32_768
     max_quality_retries: int = 3
     compaction_threshold: float = 0.7
     max_explore_turns: int = 8
