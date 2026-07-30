@@ -172,3 +172,40 @@ def test_canonical_names_are_never_remapped():
     from squishy.tool_aliases import normalize_call
     for name in MINIMAL_TOOLS:
         assert normalize_call(name, {})[0] == name
+
+
+async def test_must_edit_gate_yields_rather_than_livelocking(tmp_path):
+    """A refused shell call the model ignores must not loop forever.
+
+    Observed live under the minimal profile: the gate refused run_command 25
+    consecutive times and the model answered every refusal by calling it
+    again, never trying edit_file. 25 turns burned, no patch. After a few
+    refusals the gate lifts so the run can at least make progress.
+    """
+    from squishy.agent import _MAX_SHELL_REFUSALS, Agent
+    from squishy.client import CompletionResult, ToolCall
+    from squishy.display import Display
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.tool_profile = "minimal"
+    cfg.max_turns = 20
+    cfg.max_turns_without_edit = 2
+
+    # A model that only ever calls run_command, exactly as seen live.
+    script = [
+        CompletionResult(tool_calls=[ToolCall(
+            id=f"c{i}", name="run_command", args={"command": f"echo {i}"})])
+        for i in range(15)
+    ]
+    fake = FakeClient(script=script)
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    await agent.run("fix it")
+
+    assert agent._active_st is not None
+    refusals = agent._active_st.shell_refusals
+    assert refusals == _MAX_SHELL_REFUSALS, (
+        f"gate should stop refusing after {_MAX_SHELL_REFUSALS}, got {refusals}")
+    # Once lifted, it stays lifted for the rest of the run.
+    assert "run_command" not in agent.tool_ctx.blocked_tools

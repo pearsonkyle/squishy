@@ -72,6 +72,10 @@ class LoopState:
     # Failed edit tracking.
     edit_failures_per_file: dict[str, int] = field(default_factory=dict)
     total_edit_failures: int = 0
+    # Times the must-edit gate has refused a shell call. Bounded: a model that
+    # answers the refusal by retrying the same call is not going to be argued
+    # into editing, and looping on it is worse than lifting the gate.
+    shell_refusals: int = 0
     recent_edit_fail_files: set[str] = field(default_factory=set)
     # Identical-old_str-per-path tracking (catches edit loops that bypass
     # repeated_tool_call detection because args.new_str varies). Maps

@@ -65,6 +65,15 @@ from squishy.tools.scratchpad import render_notes
 
 log = logging.getLogger("squishy.agent")
 
+# Message the must-edit gate returns when it refuses a shell call, and how
+# many such refusals to spend before giving up on the gate entirely.
+_SHELL_BLOCKED_MSG = (
+    "refused: you have not edited any file yet, so shell access is disabled "
+    "until you do. Use `edit_file` to apply your best fix now — an imperfect "
+    "patch beats no patch."
+)
+_MAX_SHELL_REFUSALS = 3
+
 
 # F3: heuristics for "the agent observed a test failure but did not edit
 # anything afterwards."  Strings/regexes are deliberately broad — false
@@ -795,6 +804,13 @@ class Agent:
                 and edit_budget > 0
                 and not st.files_edited
                 and turn > edit_budget
+                # Bounded on purpose. Observed live under the minimal profile:
+                # the gate refused run_command 25 times and the model answered
+                # every refusal by calling it again, never once trying
+                # edit_file — 25 turns burned and still no patch. A model that
+                # won't take the hint won't take it on the 26th try either, so
+                # the gate yields and lets the run make whatever progress it can.
+                and st.shell_refusals < _MAX_SHELL_REFUSALS
             )
             if must_edit and ps is not None and ps.phase != "execute":
                 ps.phase = "execute"
@@ -805,11 +821,7 @@ class Agent:
             # history kept calling it for 13 more turns after the withdrawal.
             # Refusing at dispatch is what actually closes the loop.
             if must_edit:
-                self.tool_ctx.blocked_tools["run_command"] = (
-                    "refused: you have not edited any file yet, so shell access "
-                    "is disabled until you do. Use `edit_file` to apply your best "
-                    "fix now — an imperfect patch beats no patch."
-                )
+                self.tool_ctx.blocked_tools["run_command"] = _SHELL_BLOCKED_MSG
             else:
                 self.tool_ctx.blocked_tools.pop("run_command", None)
 
@@ -1116,6 +1128,16 @@ class Agent:
 
                 outcome = await run_tool(self, turn, tc)
                 dispatched_pairs.append((tc, outcome))
+                if str(outcome.get("error") or "") == _SHELL_BLOCKED_MSG:
+                    st.shell_refusals += 1
+                    if st.shell_refusals == _MAX_SHELL_REFUSALS:
+                        # The gate is about to lift. Say so, rather than
+                        # silently letting the shell start working again.
+                        inject_nudge(self, st, turn, (
+                            "[system] Re-enabling `run_command`, but you still "
+                            "have not changed any file. A run with no edit "
+                            "scores zero. Make your best edit_file change now."
+                        ), min_gap=0, force=True)
                 self._emit({
                     "type": "tool", "name": tc.name,
                     "args": dict(tc.args) if isinstance(tc.args, dict) else tc.args,
