@@ -147,3 +147,28 @@ async def test_minimal_bench_still_offers_edit_file_on_turn_one(tmp_path):
 
     offered = {s["function"]["name"] for s in fake.tools_seen[0]}
     assert offered == set(MINIMAL_TOOLS)
+
+
+@pytest.mark.parametrize("alias,canonical", [
+    # Claude Code
+    ("Bash", "run_command"), ("Read", "read_file"), ("Edit", "edit_file"),
+    ("Write", "write_file"), ("Glob", "glob_files"), ("Grep", "search_files"),
+    # Anthropic text-editor / SWE-agent / mini-swe-agent
+    ("str_replace_based_edit_tool", "edit_file"), ("view", "read_file"),
+    ("create", "write_file"), ("execute_bash", "run_command"),
+])
+def test_common_harness_vocabularies_normalize(alias, canonical):
+    """A narrow tool set is only safe if the names models know still land.
+
+    The minimal profile advertises four tools; models trained on Claude Code,
+    mini-swe-agent or the Anthropic text-editor tool will reach for their own
+    names regardless, and a rejected call costs a whole turn.
+    """
+    from squishy.tool_aliases import normalize_call
+    assert normalize_call(alias, {})[0] == canonical
+
+
+def test_canonical_names_are_never_remapped():
+    from squishy.tool_aliases import normalize_call
+    for name in MINIMAL_TOOLS:
+        assert normalize_call(name, {})[0] == name

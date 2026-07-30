@@ -36,15 +36,22 @@ TOOL_NAME_ALIASES: dict[str, str] = {
     "run_bash": "run_command",
     "terminal": "run_command",
     # read
+    # `read`/`edit`/`write` are Claude Code's tool names (matched
+    # case-insensitively, so `Read` lands here too). They were missing while
+    # its `Bash`/`Glob`/`Grep`/`LS` were covered, so a Claude-Code-trained
+    # model got its shell call forgiven and its file calls rejected.
+    "read": "read_file",
     "view": "read_file",
     "cat": "read_file",
     "open_file": "read_file",
     "view_file": "read_file",
     # write / create
+    "write": "write_file",
     "create": "write_file",
     "create_file": "write_file",
     "new_file": "write_file",
     # edit (Anthropic text-editor + common synonyms)
+    "edit": "edit_file",
     "str_replace": "edit_file",
     "str_replace_editor": "edit_file",
     "str_replace_based_edit_tool": "edit_file",
