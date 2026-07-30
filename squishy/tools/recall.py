@@ -7,6 +7,7 @@ Enough for the model to decide what to `read_file` next.
  
 from __future__ import annotations
  
+import json
 import re
 from typing import Any
  
@@ -17,6 +18,9 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 MAX_RESULTS = 25
 DEFAULT_LIMIT = 10
 DEFAULT_DEPTH = 2
+# Results are capped by token budget as well as count, so a recall over big
+# classes can't quietly cost thousands of tokens.
+DEFAULT_TOKEN_BUDGET = 1200
  
 _TOKEN_RX = re.compile(r"[A-Za-z0-9_]+")
 # Split camelCase/PascalCase: "JSONQuery" → ["JSON", "Query"]
@@ -66,7 +70,7 @@ def _score(node: Node, q_lower: str, q_tokens: set[str]) -> float:
     name_l = node.name.lower()
     path_l = node.path.lower()
     summary_l = node.summary.lower()
- 
+
     score = 0.0
     if q_lower and q_lower in name_l:
         score += 10.0 if name_l == q_lower else 6.0
@@ -74,7 +78,7 @@ def _score(node: Node, q_lower: str, q_tokens: set[str]) -> float:
         score += 3.0
     if q_lower and q_lower in summary_l:
         score += 2.0
- 
+
     name_tokens = _tokens(node.name)
     path_tokens = _tokens(node.path)
     summary_tokens = _tokens(node.summary)
@@ -82,7 +86,7 @@ def _score(node: Node, q_lower: str, q_tokens: set[str]) -> float:
     score += 4.0 * len(q_tokens & name_tokens)
     score += 1.5 * len(q_tokens & path_tokens)
     score += 1.0 * len(q_tokens & summary_tokens)
- 
+
     # Small bonus for leaf symbols — only when the node matched at all.
     if score > 0 and node.kind in ("class", "function", "method"):
         score += 0.5
@@ -148,7 +152,7 @@ async def _recall(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     q_tokens = _tokens(query)
     if not q_tokens and not q_lower:
         return ToolResult(False, error="query contains no searchable tokens")
- 
+
     scored: list[tuple[float, Node]] = []
     for node in idx.root.walk():
         if node.kind == "repo":
@@ -157,16 +161,36 @@ async def _recall(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if s > 0:
             scored.append((s, node))
     scored.sort(key=lambda t: (-t[0], t[1].path, t[1].name))
- 
-    results = [_trim(n, depth, q_lower, q_tokens) for _, n in scored[:limit]]
+
+    budget = int(args.get("token_budget", DEFAULT_TOKEN_BUDGET))
+    results: list[dict[str, Any]] = []
+    used = 0
+    for _s, node in scored[:limit]:
+        entry = _trim(node, depth, q_lower, q_tokens)
+        cost = len(json.dumps(entry, ensure_ascii=False)) // 3.5
+        # Always emit the top hit: the whole point is to name the best file.
+        if results and used + cost > budget:
+            break
+        results.append(entry)
+        used += cost
+
+    data: dict[str, Any] = {
+        "query": query,
+        "results": results,
+        "total_matched": len(scored),
+        "returned": len(results),
+    }
+    if len(results) < len(scored):
+        # Announce truncation explicitly: silence reads to the model as
+        # "there is nothing else", which is exactly when it stops looking.
+        data["truncated"] = (
+            f"showing {len(results)} of {len(scored)} matches (~{budget}-token "
+            "budget). Narrow the query, raise token_budget, or use search_files "
+            "for exhaustive matching."
+        )
     return ToolResult(
         True,
-        data={
-            "query": query,
-            "results": results,
-            "total_matched": len(scored),
-            "returned": len(results),
-        },
+        data=data,
         display=f"{len(results)} of {len(scored)} matches",
     )
  
@@ -256,6 +280,11 @@ recall = Tool(
                 "description": "Natural-language phrase or symbol name",
             },
             "limit": {"type": "integer", "default": DEFAULT_LIMIT},
+            "token_budget": {
+                "type": "integer",
+                "default": DEFAULT_TOKEN_BUDGET,
+                "description": "Max tokens of results; raise if truncated",
+            },
             "depth": {
                 "type": "integer",
                 "default": DEFAULT_DEPTH,
