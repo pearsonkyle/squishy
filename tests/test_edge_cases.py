@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
-import pytest
-import pytest_asyncio
-
-from squishy.tools.base import ToolContext
 from squishy.plan_state import PlanState, load_plan, plan_path
+from squishy.tools.base import ToolContext
 
 
 def _tc(name: str, args: dict, call_id: str = "c1"):
@@ -19,6 +15,7 @@ def _tc(name: str, args: dict, call_id: str = "c1"):
 
 
 from squishy.client import CompletionResult
+
 
 class TestPlanEdgeCases:
     """Test edge cases in plan operations."""
@@ -241,7 +238,7 @@ class TestEditEdgeCases:
 
     async def test_edit_file_no_match(self, ctx):
         """Edit with no match should fail."""
-        from squishy.tools.fs import write_file, edit_file
+        from squishy.tools.fs import edit_file, write_file
 
         await write_file.run({"path": "app.py", "content": "hello\n"}, ctx)
 
@@ -254,7 +251,7 @@ class TestEditEdgeCases:
 
     async def test_edit_file_ambiguous_multiple_matches(self, ctx):
         """Edit with multiple matches without replace_all should fail."""
-        from squishy.tools.fs import write_file, edit_file
+        from squishy.tools.fs import edit_file, write_file
 
         await write_file.run({"path": "app.py", "content": "x\nx\nx\n"}, ctx)
 
@@ -268,7 +265,7 @@ class TestEditEdgeCases:
 
     async def test_edit_file_replace_all_with_no_matches(self, ctx):
         """replace_all=True with no matches should still fail."""
-        from squishy.tools.fs import write_file, edit_file
+        from squishy.tools.fs import edit_file, write_file
 
         await write_file.run({"path": "app.py", "content": "hello\n"}, ctx)
 
@@ -281,7 +278,7 @@ class TestEditEdgeCases:
 
     async def test_edit_file_empty_old_str(self, ctx):
         """Empty old_str should be rejected or handled."""
-        from squishy.tools.fs import write_file, edit_file
+        from squishy.tools.fs import edit_file, write_file
 
         await write_file.run({"path": "app.py", "content": "hello\n"}, ctx)
 
@@ -458,7 +455,6 @@ class TestConsecutiveReadsTracking:
     async def test_read_tool_tracking_increments_counter(self, tmp_path):
         """Each read should increment the counter."""
         from squishy.agent import Agent
-        from dataclasses import dataclass
 
         @dataclass
         class FakeClient:

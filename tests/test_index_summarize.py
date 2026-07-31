@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import pytest
-
-from squishy.index import _build_index_async, build_index
+from squishy.index import build_index
 from squishy.index.summarize import Summarizer
 
 

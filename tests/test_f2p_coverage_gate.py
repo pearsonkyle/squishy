@@ -26,7 +26,6 @@ from squishy.phase_machine import (
     check_transition,
 )
 
-
 F2P = [
     "scico/test/linop/xray/test_xray_2d.py::test_matched_adjoint",
     "scico/test/linop/xray/test_xray_3d.py::test_matched_adjoint",

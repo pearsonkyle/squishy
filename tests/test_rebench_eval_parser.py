@@ -8,8 +8,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 # Load the script as a module (it lives outside the package).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT_PATH = _REPO_ROOT / "scripts" / "rebench_eval" / "run_eval.py"

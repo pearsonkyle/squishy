@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from squishy.plan_state import PlanState
 from squishy.tools.base import ToolContext
-from squishy.plan_state import PlanState, PlanStep
 
 
 class TestToolContextInitialization:

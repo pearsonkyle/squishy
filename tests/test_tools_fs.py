@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from squishy.tools.fs import (
     edit_file,
     list_directory,
@@ -9,7 +8,6 @@ from squishy.tools.fs import (
     undo_edit,
     write_file,
 )
-
 
 
 async def test_write_and_read_roundtrip(ctx):

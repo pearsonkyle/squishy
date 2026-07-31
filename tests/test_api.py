@@ -1,17 +1,16 @@
 """Tests for the programmatic Squishy facade."""
  
 from __future__ import annotations
- 
+
 from typing import Any
 from unittest.mock import patch
- 
+
 import pytest
- 
+
 from squishy.api import Squishy
 from squishy.client import CompletionResult, ToolCall
- 
- 
- 
+
+
 class _ScriptedClient:
     """Drop-in replacement for Client; ignores real network."""
  
@@ -221,6 +220,7 @@ def test_squishy_api_fields_cover_config():
     public API silently drops it (the v25 audit found 4 such fields).
     """
     from dataclasses import fields as dc_fields
+
     from squishy.api import Squishy
     from squishy.config import Config
 

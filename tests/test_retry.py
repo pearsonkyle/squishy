@@ -1,19 +1,18 @@
 """Retry and error-translation tests for the async client."""
  
 from __future__ import annotations
- 
+
 from typing import Any
- 
+
 import httpx
 import pytest
 from tenacity import wait_none
- 
+
 import squishy.client as client_mod
 from squishy.client import Client
 from squishy.errors import LLMError
- 
- 
- 
+
+
 class _FlakyCompletions:
     """Fake ``chat.completions.create`` that fails the first N calls then succeeds."""
  

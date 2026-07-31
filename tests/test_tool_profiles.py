@@ -228,3 +228,86 @@ def test_recall_is_hidden_without_an_index():
 def test_recall_hidden_without_index_in_every_mode(mode):
     assert "recall" not in {s["function"]["name"]
                             for s in openai_schemas(mode, has_index=False)}
+
+
+# --- shell profile: the mini-swe-agent / quant-tuner shape -----------------
+
+def test_shell_profile_exposes_exactly_one_tool():
+    names = {s["function"]["name"]
+             for s in openai_schemas("bench", profile="shell", has_index=False)}
+    assert names == {"run_command"}
+
+
+def test_shell_profile_is_the_cheapest_by_far():
+    import json
+    cost = {
+        p: len(json.dumps(openai_schemas("bench", profile=p, has_index=False)))
+        for p in ("shell", "minimal", "standard")
+    }
+    assert cost["shell"] < cost["minimal"] < cost["standard"]
+    assert cost["shell"] < cost["standard"] / 5
+
+
+def test_shell_profile_has_no_edit_tool():
+    from squishy.tool_restrictions import profile_has_edit_tool
+    assert profile_has_edit_tool("shell") is False
+    assert profile_has_edit_tool("minimal") is True
+    assert profile_has_edit_tool("standard") is True
+
+
+async def test_must_edit_gate_cannot_fire_under_shell_profile(tmp_path):
+    """Withdrawing run_command here would leave the model with no tool at all.
+
+    Edits go through the shell, so `files_edited` stays empty however much
+    real work happens — the gate's trigger condition is permanently true and
+    its remedy (`edit_file`) does not exist.
+    """
+    from squishy.agent import Agent
+    from squishy.client import CompletionResult, ToolCall
+    from squishy.display import Display
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.tool_profile = "shell"
+    cfg.max_turns = 12
+    cfg.max_turns_without_edit = 2
+
+    fake = FakeClient(script=[
+        CompletionResult(tool_calls=[ToolCall(
+            id=f"c{i}", name="run_command", args={"command": f"echo {i}"})])
+        for i in range(10)
+    ])
+    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
+    await agent.run("fix it")
+
+    assert "run_command" not in agent.tool_ctx.blocked_tools
+    assert agent._active_st is not None
+    assert agent._active_st.shell_refusals == 0
+    # Every turn kept its one tool.
+    for offered in fake.tools_seen:
+        assert {s["function"]["name"] for s in offered} == {"run_command"}
+
+
+def test_shell_prompt_explains_how_to_edit_without_an_edit_tool(tmp_path):
+    prompt = build_system_prompt(
+        str(tmp_path), detect_project(str(tmp_path)), False, "bench", "shell")
+    assert "only tool" in prompt
+    # Editing is the one thing a shell makes awkward, so it must be spelled out.
+    assert "git diff" in prompt
+    for absent in ("read_file", "edit_file", "recall", "plan_task"):
+        assert absent not in prompt
+
+
+@pytest.mark.parametrize("profile", ["shell", "minimal", "standard"])
+@pytest.mark.parametrize("phase", ["explore", "plan", "execute", "verify"])
+def test_no_phase_ever_leaves_a_profile_with_zero_tools(profile, phase):
+    """A profile x phase intersection that is empty strands the model.
+
+    The plan phase offers {plan_task, save_note, recall}; against a shell-only
+    profile that intersects to nothing. Narrowed profiles therefore skip the
+    phase machine entirely — this guards the invariant either way.
+    """
+    schemas = openai_schemas("bench", profile=profile, phase=phase, has_index=True)
+    if profile == "standard":
+        assert schemas, f"{profile}/{phase} exposes no tools"

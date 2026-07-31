@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from squishy.agent_state import LoopState, TaskResult
 from squishy.quality import assess_response, build_correction
+from squishy.tool_restrictions import profile_has_edit_tool
 from squishy.tools import REGISTRY
 
 if TYPE_CHECKING:
@@ -506,6 +507,10 @@ def detect_shell_file_read(
 ) -> None:
     """Nudge when the model uses shell commands to read files instead of read_file."""
     if agent.config.permission_mode not in ("bench", "yolo"):
+        return
+    # Pointless — and actively misleading — when there is no read_file to point
+    # at: under a shell-only profile `cat`/`sed` is the intended way to read.
+    if not profile_has_edit_tool(agent.config.tool_profile):
         return
     if tc.name != "run_command":
         return

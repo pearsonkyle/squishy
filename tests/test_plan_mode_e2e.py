@@ -2,17 +2,13 @@
 
 from __future__ import annotations
 
-import json
-
-import pytest
+from conftest import FakeClient
 
 from squishy.agent import Agent
 from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.display import Display
-from squishy.plan_state import load_plan, plan_path
-
-from conftest import FakeClient
+from squishy.plan_state import load_plan
 
 
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:

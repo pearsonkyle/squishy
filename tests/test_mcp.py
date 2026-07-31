@@ -1,17 +1,19 @@
 """Tests for squishy.mcp — MCP integration."""
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from squishy.mcp.tools import (
+    _build_tool,
+    _make_mcp_runner,
+    _register_tools_into_squishy,
+)
 from squishy.mcp.types import MCPServerConfig, MCPTool, MCPTransport
-from squishy.mcp.tools import _build_tool, _make_mcp_runner, _register_tools_into_squishy, _mcp_tools
 from squishy.tools.base import Tool, ToolContext
-
 
 # ── types.py ──────────────────────────────────────────────────────────────────
 
@@ -171,7 +173,7 @@ class TestMCPPermissions:
 
 class TestSchemaInclusion:
     def test_mcp_tools_in_schemas_all_modes(self):
-        from squishy.tools import ALL_TOOLS, REGISTRY, openai_schemas
+        from squishy.tools import openai_schemas
 
         mcp_tool = MCPTool(
             server_name="test",

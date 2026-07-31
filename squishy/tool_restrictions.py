@@ -61,11 +61,27 @@ MINIMAL_TOOLS = frozenset({
     "run_command", "read_file", "edit_file", "write_file",
 })
 
+# The mini-swe-agent / quant-tuner shape: a shell and nothing else. Reading,
+# editing, searching and testing all go through the same command interface,
+# which is the tool vocabulary these models have seen most. Costs ~170 schema
+# tokens against minimal's ~640 and standard's ~1850.
+SHELL_ONLY_TOOLS = frozenset({"run_command"})
+
 TOOL_PROFILES: dict[str, frozenset[str] | None] = {
     # None = no narrowing; the permission mode alone decides.
     "standard": None,
     "minimal": MINIMAL_TOOLS,
+    "shell": SHELL_ONLY_TOOLS,
 }
+
+# Profiles with no dedicated edit tool: file changes necessarily go through
+# the shell, so anything that gates the shell on "have you edited yet" would
+# leave the model with no way to act at all.
+PROFILES_WITHOUT_EDIT_TOOL = frozenset({"shell"})
+
+
+def profile_has_edit_tool(profile: str) -> bool:
+    return profile not in PROFILES_WITHOUT_EDIT_TOOL
 
 
 def get_profile_tools(profile: str) -> frozenset[str] | None:

@@ -60,6 +60,7 @@ from squishy.index.store import has_index
 from squishy.phase_machine import PhaseState, advance, check_finish_plan_gate, check_transition
 from squishy.plan_state import load_plan, render_plan_status
 from squishy.tool_aliases import normalize_call
+from squishy.tool_restrictions import profile_has_edit_tool
 from squishy.tools import PromptFn, ToolContext, openai_schemas
 from squishy.tools.scratchpad import render_notes
 
@@ -714,12 +715,15 @@ class Agent:
                     break
             cache_problem_text(self, st)
 
-        # Phase machine (bench mode only — interactive modes are unaffected).
-        # The minimal profile deliberately opts out: its whole premise is that
-        # a small tool set plus a directive prompt beats structural gating, and
-        # phase-gated schemas would fight the profile's own tool filter.
+        # Phase machine (bench mode + the standard profile only).
+        #
+        # Narrowed profiles opt out by design: their premise is that a small
+        # tool set plus a directive prompt beats structural gating. They also
+        # cannot survive it — phase tool sets are intersected with the
+        # profile's, and e.g. the plan phase ({plan_task, save_note, recall})
+        # against a shell-only profile leaves the model with *no tools at all*.
         ps: PhaseState | None = None
-        if is_bench and self.config.tool_profile != "minimal":
+        if is_bench and self.config.tool_profile == "standard":
             ps = PhaseState(
                 max_explore_turns=self.config.max_explore_turns,
                 max_plan_turns=self.config.max_plan_turns,
@@ -801,6 +805,11 @@ class Agent:
             must_edit = (
                 _is_constrained
                 and edit_budget > 0
+                # Under a shell-only profile there is no edit_file to fall back
+                # on — edits happen through the shell, and `files_edited` never
+                # records them. Withdrawing run_command would leave the model
+                # with no tool at all, so the gate cannot apply.
+                and profile_has_edit_tool(self.config.tool_profile)
                 and not st.files_edited
                 and turn > edit_budget
                 # Bounded on purpose. Observed live under the minimal profile:

@@ -1,10 +1,8 @@
 from __future__ import annotations
- 
- 
+
 from squishy.tools.shell import _extract_test_failures, run_command
- 
- 
- 
+
+
 async def test_run_command_success(ctx):
     r = await run_command.run({"command": "echo hello"}, ctx)
     assert r.success

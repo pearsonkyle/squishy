@@ -1,7 +1,6 @@
 """Live integration tests for the squishy API."""
 
 import asyncio
-import json
 import os
 import shutil
 import tempfile
@@ -721,8 +720,8 @@ async def test_token_usage_tracking():
             )
         print(f"Success: {result.success}")
         print(f"Tokens used: {result.tokens_used}")
-        print(f"Prompt tokens: tracked via display")
-        print(f"Completion tokens: tracked via display")
+        print("Prompt tokens: tracked via display")
+        print("Completion tokens: tracked via display")
         assert result.tokens_used > 0, "Token usage should be tracked"
         assert result.turns_used > 0, "Should have used at least one turn"
     print("✅ token_usage_tracking passed")

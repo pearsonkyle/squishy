@@ -4,11 +4,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from squishy.phase_machine import (
-    DONE_PHASE_TOOLS,
-    EXECUTE_PHASE_TOOLS,
-    EXPLORE_PHASE_TOOLS,
-    PLAN_PHASE_TOOLS,
-    VERIFY_PHASE_TOOLS,
     PhaseState,
     advance,
     check_transition,

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import pytest
+from conftest import FakeClient
 
 from squishy.agent import Agent
 from squishy.client import CompletionResult, ToolCall
@@ -15,9 +16,7 @@ from squishy.config import Config
 from squishy.display import Display
 from squishy.plan_state import plan_path
 
-from conftest import FakeClient
- 
- 
+
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
     return ToolCall(id=call_id, name=name, args=args)
  
@@ -712,7 +711,9 @@ async def test_goal_drift_detection(tmp_path):
 
     # Patch run_tool as seen by agent.py (imported by name into its namespace).
     from unittest.mock import patch
-    from squishy.agent_dispatch import run_tool as _original_run_tool, append_tool_result
+
+    from squishy.agent_dispatch import append_tool_result
+    from squishy.agent_dispatch import run_tool as _original_run_tool
 
     async def _mock_run_tool(agent_obj, turn, tc):
         if tc.name == "run_command":

@@ -5,8 +5,6 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-import pytest
-
 from squishy.quality import assess_response, build_correction
 
 

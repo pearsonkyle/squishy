@@ -16,7 +16,6 @@ import pytest
 
 import squishy.cli as cli
 
-
 # -- _run_direct_command ------------------------------------------------------
 
 

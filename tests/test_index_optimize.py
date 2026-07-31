@@ -5,8 +5,6 @@ import tempfile
 import time
 from pathlib import Path
 
-import pytest
-
 from squishy.index import (
     _build_index_async,
     build_index,
@@ -14,8 +12,6 @@ from squishy.index import (
     get_index_size,
     needs_pruning,
     optimize_for_size,
-    prune_empty_dirs,
-    prune_stale_summaries,
 )
 from squishy.index.store import save_index
 

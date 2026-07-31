@@ -2,18 +2,13 @@
 
 from __future__ import annotations
 
-import json
-
-import pytest
+from conftest import FakeClient
 
 from squishy.agent import Agent
 from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.display import Display
-from squishy.plan_state import load_plan, plan_path
-from squishy.tools.base import ToolContext
-
-from conftest import FakeClient
+from squishy.plan_state import load_plan
 
 
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
@@ -22,7 +17,7 @@ def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
 
 async def test_file_operations_tracking_created(ctx):
     """Verify files_read dict is populated for read operations after write."""
-    from squishy.tools.fs import write_file, read_file
+    from squishy.tools.fs import read_file, write_file
 
     result = await write_file.run(
         {"path": "new.py", "content": "# New file\n"}, ctx
@@ -39,7 +34,7 @@ async def test_file_operations_tracking_created(ctx):
 
 async def test_file_operations_tracking_edited(ctx):
     """Verify files_read dict is populated after edit operations."""
-    from squishy.tools.fs import write_file, edit_file, read_file
+    from squishy.tools.fs import edit_file, read_file, write_file
 
     # Create file first
     await write_file.run({"path": "app.py", "content": "x = 1\n"}, ctx)
@@ -152,7 +147,7 @@ async def test_read_cache_invalidation_on_write(ctx, tmp_path):
 
 async def test_read_cache_invalidation_on_edit(ctx, tmp_path):
     """Verify cache is cleared after edit_file operation."""
-    from squishy.tools.fs import read_file, write_file, edit_file
+    from squishy.tools.fs import edit_file, read_file, write_file
 
     # Create file
     await write_file.run({"path": "code.py", "content": "x = 1\n"}, ctx)
@@ -177,7 +172,7 @@ async def test_read_cache_invalidation_on_edit(ctx, tmp_path):
 
 async def test_multiple_edits_same_file_tracking(ctx, tmp_path):
     """Verify multiple edits to same file are tracked correctly."""
-    from squishy.tools.fs import write_file, edit_file, read_file
+    from squishy.tools.fs import edit_file, read_file, write_file
 
     # Create initial file
     await write_file.run({"path": "app.py", "content": "a = 1\nb = 2\nc = 3\n"}, ctx)

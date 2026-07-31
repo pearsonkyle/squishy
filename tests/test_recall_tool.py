@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-
-import pytest
 
 from squishy.index import build_index, save_index
 from squishy.tools.base import ToolContext

@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
-
 from squishy.file_browser import parse_references_with_missing
 from squishy.tools.base import ToolResult, _short_json
-
 
 # --- #15: _short_json must never grow the payload -------------------------
 

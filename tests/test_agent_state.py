@@ -5,9 +5,10 @@ from squishy.agent_state import (
     extract_problem_files,
     is_test_command,
     path_matches_problem,
+)
+from squishy.agent_state import (
     test_covers_fail_to_pass as _test_covers_fail_to_pass,
 )
-
 
 # -- _test_covers_fail_to_pass ------------------------------------------------
 

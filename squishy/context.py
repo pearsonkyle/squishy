@@ -149,6 +149,8 @@ def build_system_prompt(
 def _rules_block(has_idx: bool, profile: str = "standard") -> str:
     """Core rules. Recall guidance is folded in here so it's not
     repeated inside every mode block."""
+    if profile == "shell":
+        return _shell_rules_block()
     if profile == "minimal":
         return _minimal_rules_block(has_idx)
     recall_line = (
@@ -170,6 +172,27 @@ def _rules_block(has_idx: bool, profile: str = "standard") -> str:
         "- When the task is done, reply with a plain-text summary and no tool call.\n"
         f"{recall_line}\n"
         f"{plan_line}"
+    )
+
+
+def _shell_rules_block() -> str:
+    """Rules for the `shell` profile — one tool, so almost nothing to say.
+
+    Everything happens through `run_command`, which is the interface these
+    models have seen most. The only thing worth stating is how to edit a file
+    without an edit tool, since that is the one operation a shell makes
+    awkward.
+    """
+    return (
+        "## Rules\n"
+        "- `run_command` is your only tool. Use it to read, search, edit, and "
+        "run tests.\n"
+        "- Inspect code with `cat`, `sed -n '10,40p' file`, `grep -rn`, `ls`.\n"
+        "- To change a file, apply a patch or rewrite it — e.g. "
+        "`python - <<'EOF'` with a small script, or `cat > file <<'EOF'`. "
+        "Verify the change with `git diff` afterwards.\n"
+        "- Commands run in the project root; no `cd` prefix needed.\n"
+        "- When the task is done, reply with a plain-text summary and no tool call."
     )
 
 
@@ -262,7 +285,7 @@ def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
     repeated. Workflow examples and JSON shape blocks were dropped
     because the tool schemas already document them.
     """
-    if profile == "minimal":
+    if profile in ("minimal", "shell"):
         # The standard bench block narrates the phase machine, which the
         # minimal profile doesn't run, and names tools it doesn't expose.
         # What's left is only the task framing that actually moves patch rate.

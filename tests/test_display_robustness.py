@@ -107,4 +107,4 @@ def test_flush_streaming_text_skips_truly_empty_buffer():
     d.flush_streaming_text()
     assert d._stream_buffer == ""
     # No live ever started, no print ever happened.
-    assert "" == buf.getvalue() or buf.getvalue().strip() == ""
+    assert buf.getvalue() == "" or buf.getvalue().strip() == ""

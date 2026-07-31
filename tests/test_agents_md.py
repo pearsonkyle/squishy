@@ -148,9 +148,11 @@ def test_sessions_dir_is_skipped(tmp_path):
 def test_agents_md_permits_fallback_exploration():
     """Generated AGENTS.md must prefer recall but NOT forbid fallback tools —
     the never-block-exploration contract."""
+    import os
+    import tempfile
+
     from squishy.index import build_index
     from squishy.index.agents_md import generate_agents_md
-    import tempfile, os
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, "m.py"), "w") as f:
             f.write('"""M."""\ndef f(): return 1\n')

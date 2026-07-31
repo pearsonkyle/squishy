@@ -5,13 +5,9 @@ import time
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
-
 from squishy.agent_safety import (
-    apply_quality_gate,
     can_nudge,
     check_goal_drift,
-    inject_nudge,
     inject_test_failure_nudge,
     record_nudge,
     track_edit_failure,

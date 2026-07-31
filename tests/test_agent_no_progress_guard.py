@@ -11,12 +11,12 @@ would loop forever).
 """
 from __future__ import annotations
 
+from conftest import FakeClient
+
 from squishy.agent import Agent, _has_unaddressed_test_failure
 from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.display import Display
-
-from conftest import FakeClient
 
 
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:

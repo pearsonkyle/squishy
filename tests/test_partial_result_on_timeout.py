@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import asyncio
 
+from conftest import FakeClient
+
 from squishy.agent import Agent
 from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.errors import AgentTimeout
-
-from conftest import FakeClient
 
 
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
