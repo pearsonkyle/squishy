@@ -44,7 +44,7 @@ VENV = "/opt/squishy-venv"
 PROMPT = """Fix the bug described below in this repository.
 
 {problem}
-
+{tests}
 Your job is to CHANGE THE SOURCE CODE — the modules that implement the
 behavior, not the test suite. Find the function or class responsible and edit
 its implementation. Writing or editing tests is never a valid fix on its own.
@@ -53,6 +53,43 @@ Understanding the bug is not the goal; editing the code is. Do not stop until
 you have actually edited a non-test source file — a run that ends with no edit
 is scored as a failure. When the fix is in place, give a short summary.
 """
+
+# The evaluation target, stated where the model cannot miss it.
+#
+# These identifiers were already reaching the model — as raw JSON under a
+# "Saved Notes" heading next to install_status, which reads like harness
+# bookkeeping rather than the goal. Observed on wtforms-614: both arms spent
+# all 30 turns hunting for a `TestHTML5Fields` class and an `html5.py` module
+# that do not exist in the checkout, while the actual targets (TestLabel,
+# TestDefaults) sat unread in the notes block. Neither arm ever edited a file.
+#
+# The last paragraph matters as much as the list. SWE-bench applies the test
+# patch *after* the model's patch, so a named test may genuinely be absent.
+# Without saying so, "run the failing tests" sends the model looking for
+# something that isn't there — the harness instructing an action it has made
+# impossible.
+TESTS_BLOCK = """
+The evaluation runs these tests against your patch:
+
+{ids}
+Run them now to see how they currently fail. If one does not exist in this
+checkout yet, that is expected — the evaluation adds it after your patch is
+applied. In that case do not go looking for it: implement the behavior its
+name and the description above imply, and run the surrounding test file to
+check you have not broken anything.
+"""
+
+
+def _tests_block(fail_to_pass: list, limit: int = 12) -> str:
+    """Render the FAIL_TO_PASS ids, or nothing when the harness supplied none."""
+    ids = [str(t) for t in (fail_to_pass or []) if str(t).strip()]
+    if not ids:
+        return ""
+    shown = ids[:limit]
+    lines = "".join(f"  {t}\n" for t in shown)
+    if len(ids) > limit:
+        lines += f"  ... and {len(ids) - limit} more\n"
+    return TESTS_BLOCK.format(ids=lines)
 
 EMPTY_PATCH_NUDGE = """STOP — you have not edited any file, so there is nothing
 to grade. You said you understand the bug; now act on it. Edit the responsible
@@ -211,7 +248,10 @@ def run_tests(cid: str, repo: str, test_cmd: str, timeout: int) -> dict:
 def run_agent(cid: str, repo: str, inst: dict, args, cache: Path) -> dict:
     task = {
         "repo": repo,
-        "prompt": PROMPT.format(problem=inst["problem_statement"][:6000]),
+        "prompt": PROMPT.format(
+            problem=inst["problem_statement"][:6000],
+            tests=_tests_block(inst.get("FAIL_TO_PASS") or []),
+        ),
         "empty_patch_nudge": EMPTY_PATCH_NUDGE,
         "empty_patch_retries": args.empty_patch_retries,
         "model": args.model,
