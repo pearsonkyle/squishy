@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -251,16 +252,115 @@ def apply_patch(cid: str, repo: str, patch: str, label: str) -> tuple[bool, str]
     return p.returncode == 0, ("" if p.returncode == 0 else p.stdout[-400:])
 
 
+# Per-test outcome lines. Every Python instance runs pytest with `-rA`, which
+# prints a `PASSED <nodeid>` / `FAILED <nodeid>` short-summary line per test;
+# `go test -v` prints `--- PASS: TestName`. Both are parsed so grading can ask
+# the question SWE-bench actually asks — did THESE tests flip — instead of
+# whether the whole suite came back green.
+_PYTEST_STATUS_RE = re.compile(
+    r"^(PASSED|FAILED|ERROR|XFAIL|XPASS|SKIPPED)\s+(\S+)", re.M)
+_GO_STATUS_RE = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
+_GO_STATUS_MAP = {"PASS": "PASSED", "FAIL": "FAILED", "SKIP": "SKIPPED"}
+
+
+def _parse_statuses(output: str) -> dict:
+    """Map test id -> outcome, for whichever runner produced *output*."""
+    statuses: dict[str, str] = {}
+    for m in _PYTEST_STATUS_RE.finditer(output):
+        statuses[m.group(2)] = m.group(1)
+    for m in _GO_STATUS_RE.finditer(output):
+        statuses.setdefault(m.group(2), _GO_STATUS_MAP[m.group(1)])
+    return statuses
+
+
 def run_tests(cid: str, repo: str, test_cmd: str, timeout: int) -> dict:
     t0 = time.time()
     try:
         p = dexec(cid, test_cmd, workdir=repo, timeout=timeout)
+        output = p.stdout + p.stderr
         return {"exit_code": p.returncode, "timed_out": False,
                 "elapsed_s": round(time.time() - t0, 1),
-                "tail": (p.stdout + p.stderr)[-3000:]}
+                "statuses": _parse_statuses(output),
+                "tail": output[-3000:]}
     except subprocess.TimeoutExpired:
         return {"exit_code": None, "timed_out": True,
-                "elapsed_s": round(time.time() - t0, 1), "tail": ""}
+                "elapsed_s": round(time.time() - t0, 1),
+                "statuses": {}, "tail": ""}
+
+
+def _lookup(statuses: dict, test_id: str) -> str | None:
+    """Outcome for *test_id*, tolerating node-id spelling differences.
+
+    Parametrized tests are the reason: FAIL_TO_PASS may name the base
+    `test_foo` where the runner reports `test_foo[case-3]`, or vice versa.
+    """
+    if test_id in statuses:
+        return statuses[test_id]
+    bare = test_id.split("[", 1)[0]
+    if bare in statuses:
+        return statuses[bare]
+    for k, v in statuses.items():
+        if k.split("[", 1)[0] == bare:
+            return v
+    # Go reports the function name only; F2P may carry a package path.
+    leaf = test_id.rsplit("/", 1)[-1].rsplit("::", 1)[-1]
+    return statuses.get(leaf)
+
+
+def _already_green_at_base(pre: dict, f2p: list) -> bool:
+    """True when the FAIL_TO_PASS tests already pass before any fix.
+
+    Asked per-test where possible. The old whole-suite version ("exit_code ==
+    0") called an instance ungradable whenever ANY test in the file was red,
+    and called it gradable whenever any test was red even if the actual
+    targets were green — wrong in both directions.
+    """
+    targets = [str(t) for t in (f2p or []) if str(t).strip()]
+    statuses = pre.get("statuses") or {}
+    seen = [_lookup(statuses, t) for t in targets] if targets else []
+    seen = [s for s in seen if s]
+    if seen:
+        return all(s in ("PASSED", "XFAIL") for s in seen)
+    return pre.get("exit_code") == 0 and not pre.get("timed_out")
+
+
+def _grade_by_test(pre: dict, post: dict, f2p: list, p2p: list) -> dict | None:
+    """SWE-bench's real criterion, when we can see per-test outcomes.
+
+    resolved = every FAIL_TO_PASS test passes after the patch, AND no
+    PASS_TO_PASS test that passed before it now fails.
+
+    Returns None when the runner's output could not be parsed (Java/Maven/
+    Gradle), leaving the caller on the exit-code path.
+
+    This matters more than it looks. Grading on the suite's exit code makes any
+    instance with an unrelated pre-existing failure permanently unresolvable —
+    on the 5-instance validation set, two of five gold patches were scored as
+    failures purely because other tests in the same file were already red.
+    """
+    pre_st, post_st = pre.get("statuses") or {}, post.get("statuses") or {}
+    if not post_st:
+        return None
+    targets = [str(t) for t in (f2p or []) if str(t).strip()]
+    if not targets or not any(_lookup(post_st, t) for t in targets):
+        return None
+
+    f2p_fail = [t for t in targets if _lookup(post_st, t) not in ("PASSED", "XFAIL")]
+    # Only hold the patch responsible for P2P tests that were actually green
+    # beforehand; anything already red is the environment's problem, not the
+    # model's.
+    regressed = [
+        t for t in (str(x) for x in (p2p or []))
+        if _lookup(pre_st, t) == "PASSED"
+        and _lookup(post_st, t) not in ("PASSED", "XFAIL")
+    ]
+    return {
+        "resolved": not f2p_fail and not regressed,
+        "grade_method": "per-test",
+        "f2p_total": len(targets),
+        "f2p_failing": f2p_fail[:10],
+        "p2p_regressed": regressed[:10],
+    }
 
 
 # -- the run ----------------------------------------------------------------
@@ -364,16 +464,31 @@ def grade(cid: str, repo: str, inst: dict, patch: str, args) -> dict:
     if _no_tests_ran(pre):
         out.update({"resolved": False,
                     "eval_error": "no tests ran at base — instance not gradable here"})
-    elif pre["exit_code"] == 0 and not pre["timed_out"]:
-        # Tests pass without any fix: this instance can't discriminate.
+    elif _already_green_at_base(pre, inst.get("FAIL_TO_PASS") or []):
+        # The target tests pass without any fix: this instance can't
+        # discriminate, so a "resolved" here would mean nothing.
         out.update({"resolved": False,
-                    "eval_error": "tests already pass at base — instance not gradable here"})
+                    "eval_error": "target tests already pass at base — instance not gradable here"})
     elif pre["timed_out"]:
         out.update({"resolved": False, "eval_error": "baseline test run timed out"})
     elif not applied:
         out.update({"resolved": False, "eval_error": f"model patch did not apply: {apply_err}"})
+    elif post["timed_out"]:
+        out.update({"resolved": False, "eval_error": "post-patch test run timed out"})
     else:
-        out["resolved"] = post["exit_code"] == 0 and not post["timed_out"]
+        per_test = _grade_by_test(
+            pre, post,
+            inst.get("FAIL_TO_PASS") or [],
+            inst.get("PASS_TO_PASS") or [],
+        )
+        if per_test is not None:
+            out.update(per_test)
+        else:
+            # Java/Maven/Gradle: no per-test lines to parse, so the suite's
+            # exit code is all we have. Recorded so a summary can separate
+            # these from properly-graded instances.
+            out.update({"resolved": post["exit_code"] == 0,
+                        "grade_method": "exit-code"})
     return out
 
 
