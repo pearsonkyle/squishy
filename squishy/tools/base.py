@@ -6,8 +6,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from squishy.plan_state import PlanState
-
 ToolRun = Callable[[dict[str, Any], "ToolContext"], Awaitable["ToolResult"]]
  
  
@@ -19,9 +17,6 @@ class ToolContext:
     permission_mode: str = "edits"
     sandbox_image: str = "python:3.11-slim"
     use_sandbox: bool = True
-    plan: PlanState | None = None
-    pending_plan_evidence: list[dict[str, Any]] = field(default_factory=list)
-    plan_switch_prompted: bool = False
     notes: dict[str, str] = field(default_factory=dict)
     # Keys in `notes` seeded by the harness (e.g. FAIL_TO_PASS metadata) that
     # the model's save_note must not evict or overwrite.
@@ -44,11 +39,6 @@ class ToolContext:
     command_echoes: dict[str, int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
-    # Tools the agent loop has temporarily withdrawn, mapped to the message
-    # explaining what to do instead. Dropping a tool from the schema is only a
-    # hint — a model that has been calling it for a dozen turns keeps calling
-    # it from history. Enforcement has to happen at dispatch.
-    blocked_tools: dict[str, str] = field(default_factory=dict)
     # (abs_path, original_content); original_content is None when the entry
     # records a newly-created file (undo deletes it).
     undo_stack: list[tuple[str, str | None]] = field(default_factory=list)

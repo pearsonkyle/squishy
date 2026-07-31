@@ -1125,11 +1125,6 @@ def _extract_diagnostics(task_result: Any) -> dict[str, Any]:
         "empty_responses": getattr(task_result, "empty_responses", 0),
         "prose_responses": getattr(task_result, "prose_completions", 0),
         "system_nudges": system_nudges,
-        "quality_skips": getattr(task_result, "quality_skips", 0),
-        "final_phase": getattr(task_result, "final_phase", ""),
-        "explore_turns": getattr(task_result, "explore_turns", 0),
-        "fix_verify_cycles": getattr(task_result, "fix_verify_cycles", 0),
-        "quality_violations": getattr(task_result, "total_quality_violations", 0),
         "edit_failures": getattr(task_result, "edit_failures", 0),
     }
 

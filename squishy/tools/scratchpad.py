@@ -1,7 +1,7 @@
 """`save_note` tool — persist findings across conversation history trims.
 
 Notes are stored on ToolContext.notes and injected as a synthetic system
-message each turn, surviving history trimming the same way plan-status
+message each turn, surviving history trimming the same way live-context
 messages do.
 """
 

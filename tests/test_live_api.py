@@ -16,7 +16,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from squishy.api import Squishy
-from squishy.plan_state import load_plan
 
 pytestmark = pytest.mark.smoke
 
@@ -119,99 +118,10 @@ async def test_yolo_mode_file_edit():
     print("✅ yolo_mode_file_edit passed")
 
 
-async def test_plan_mode_read_only():
-    """Test plan mode requires plan approval before writes."""
-    print("\n=== Test: Plan Mode - Plan Approval Required ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        (working_dir / "app.py").write_text("x = 1\n")
-
-        async with Squishy(
-            model=_model(),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="plan",
-            max_turns=10,
-        ) as sq:
-            result = await sq.run(
-                "First create a plan to read app.py, then read it",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Final text: {result.final_text[:300]}")
-        # In plan mode, the agent should present a plan but not auto-execute it
-        # The result may fail if it can't produce a plan_task, which is expected
-        print(f"Error (if any): {result.error or 'none'}")
-        # Plan mode should not auto-edit files
-        assert len(result.files_edited) == 0
-    print("✅ plan_mode_read_only passed")
 
 
-async def test_edits_mode_with_plan():
-    """Test edits mode auto-approves plan_task and tracks steps."""
-    print("\n=== Test: Edits Mode - Plan Tracking ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        async with Squishy(
-            model=_model(),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="edits",
-            max_turns=15,
-        ) as sq:
-            result = await sq.run(
-                "Create a todo app with two files: todo.py and README.md",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Files created: {result.files_created}")
-        print(f"Files edited: {result.files_edited}")
-        if result.plan_state:
-            progress = result.plan_state.get("progress", {})
-            print(f"Plan progress: {progress}")
-        if result.plan_state:
-            plan = load_plan(working_dir)
-            if plan:
-                print(f"Plan problem: {plan.problem}")
-                print(f"Plan steps: {len(plan.steps)}")
-                for i, step in enumerate(plan.steps, 1):
-                    print(f"  Step {i}: [{step.status}] {step.description}")
-        assert result.success, f"Task should succeed: {result.error}"
-    print("✅ edits_mode_with_plan passed")
 
 
-async def test_plan_mode_step_tracking():
-    """Test that plan mode can create plans and track step progress."""
-    print("\n=== Test: Plan Mode - Step Progress Tracking ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        async with Squishy(
-            model=_model(),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="edits",
-            max_turns=15,
-        ) as sq:
-            result = await sq.run(
-                "Create a simple Python module called utils.py with a function called greet that takes a name and prints 'Hello, {name}!'",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Files created: {result.files_created}")
-        print(f"Files edited: {result.files_edited}")
-        if result.plan_state:
-            plan = load_plan(working_dir)
-            if plan:
-                print(f"Plan problem: {plan.problem}")
-                progress = plan.progress()
-                print(f"Progress: {progress}")
-                for i, step in enumerate(plan.steps, 1):
-                    print(f"  Step {i}: [{step.status}] {step.description}")
-        assert result.success, f"Task should succeed: {result.error}"
-    print("✅ plan_mode_step_tracking passed")
 
 
 async def test_error_handling():
@@ -429,49 +339,6 @@ async def test_timeout_handling():
     print("✅ timeout_handling passed")
 
 
-async def test_bench_mode():
-    """Test bench mode with phase tracking (explore → fix → verify)."""
-    print("\n=== Test: Bench Mode - Phase Tracking ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        # Create a buggy file for bench mode to fix
-        (working_dir / "calculator.py").write_text("""
-def add(a, b):
-    return a - b  # Bug: should be a + b
-
-def subtract(a, b):
-    return a - b
-
-def multiply(a, b):
-    return a * b
-
-def divide(a, b):
-    if b == 0:
-        raise ValueError("Cannot divide by zero")
-    return a / b
-""")
-        async with Squishy(
-            model=_model(),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="bench",
-            max_turns=15,
-        ) as sq:
-            result = await sq.run(
-                "## Problem\nThe add function in calculator.py is broken. It subtracts instead of adding.\n## Hints\nFix the add function to correctly add two numbers.",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Files edited: {result.files_edited}")
-        print(f"Final phase: {result.final_phase}")
-        print(f"Explore turns: {result.explore_turns}")
-        print(f"Fix-verify cycles: {result.fix_verify_cycles}")
-        if result.files_edited:
-            content = (working_dir / result.files_edited[0]).read_text()
-            print(f"Fixed content:\n{content[:500]}")
-            assert "+" in content or "a + b" in content
-    print("✅ bench_mode passed")
 
 
 async def test_context_compaction():
@@ -699,34 +566,6 @@ async def test_mcp_tool_integration():
     print("✅ mcp_tool_integration passed")
 
 
-async def test_quality_gate():
-    """Test that quality gates catch degenerate tool call patterns."""
-    print("\n=== Test: Quality Gate ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        async with Squishy(
-            model=_model(),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="yolo",
-            max_turns=10,
-            max_quality_retries=2,
-        ) as sq:
-            result = await sq.run(
-                "Create a file called quality_check.py with a function called validate that checks if a string is a valid email",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Quality skips: {result.quality_skips}")
-        print(f"Tool call counts: {result.tool_call_counts}")
-        if result.files_created:
-            qc_file = next((f for f in result.files_created if "quality" in f), None)
-            if qc_file:
-                content = (working_dir / qc_file).read_text()
-                print(f"Quality check file:\n{content[:500]}")
-                assert "validate" in content
-    print("✅ quality_gate passed")
 
 
 async def test_token_usage_tracking():
@@ -993,10 +832,6 @@ async def main():
         # Permission modes
         test_yolo_mode_simple_write,
         test_yolo_mode_file_edit,
-        test_plan_mode_read_only,
-        test_edits_mode_with_plan,
-        test_plan_mode_step_tracking,
-        test_bench_mode,
         # Agent features
         test_error_handling,
         test_streaming_callback,
@@ -1010,7 +845,6 @@ async def main():
         test_tool_call_loop_detection,
         test_sandbox_mode,
         test_mcp_tool_integration,
-        test_quality_gate,
         test_token_usage_tracking,
         test_file_change_detection,
         # Tool-specific tests

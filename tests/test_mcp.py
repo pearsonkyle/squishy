@@ -148,56 +148,10 @@ class TestDynamicRegistration:
 
 # ── tool_restrictions.py ─────────────────────────────────────────────────────
 
-class TestMCPPermissions:
-    def test_mcp_tools_mode_gated(self):
-        from squishy.tool_restrictions import check_permission
-
-        # MCP tools blocked in plan mode
-        allowed, reason = check_permission("mcp__ctx7__resolve", "plan")
-        assert allowed is False, "MCP tool should be blocked in plan mode"
-        assert "plan mode" in reason
-
-        # MCP tools require prompt in edits mode
-        allowed, reason = check_permission("mcp__ctx7__resolve", "edits")
-        assert allowed is False
-        assert reason == "prompt"
-
-        # MCP tools allowed in yolo and bench
-        for mode in ("yolo", "bench"):
-            allowed, reason = check_permission("mcp__ctx7__resolve", mode)
-            assert allowed is True, f"MCP tool rejected in {mode} mode"
-            assert reason == ""
 
 
 # ── tools/__init__.py schemas ────────────────────────────────────────────────
 
-class TestSchemaInclusion:
-    def test_mcp_tools_in_schemas_all_modes(self):
-        from squishy.tools import openai_schemas
-
-        mcp_tool = MCPTool(
-            server_name="test",
-            tool_name="schema_test",
-            qualified_name="mcp__test__schema_test",
-            description="schema inclusion test",
-            input_schema={"type": "object", "properties": {}},
-        )
-        tool = _build_tool(mcp_tool)
-        _register_tools_into_squishy([tool])
-
-        try:
-            # MCP tools excluded from plan mode schemas
-            plan_schemas = openai_schemas("plan")
-            plan_names = [s["function"]["name"] for s in plan_schemas]
-            assert "mcp__test__schema_test" not in plan_names, "MCP tool should not be in plan schemas"
-
-            # MCP tools included in other modes
-            for mode in ("edits", "yolo", "bench"):
-                schemas = openai_schemas(mode)
-                names = [s["function"]["name"] for s in schemas]
-                assert "mcp__test__schema_test" in names, f"MCP tool missing from {mode} schemas"
-        finally:
-            _register_tools_into_squishy([])
 
 
 # ── config.py ────────────────────────────────────────────────────────────────

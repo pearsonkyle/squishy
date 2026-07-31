@@ -21,11 +21,6 @@ async def test_dispatch_catches_exceptions(ctx):
     assert not r.success
  
  
-async def test_plan_mode_blocks_mutations():
-    ctx = ToolContext(working_dir=".", permission_mode="plan")
-    r = await dispatch("write_file", {"path": "x", "content": "y"}, ctx)
-    assert not r.success
-    assert "plan mode" in r.error
  
  
 async def test_edits_mode_prompts_run_command():

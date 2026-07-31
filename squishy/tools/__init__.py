@@ -15,13 +15,12 @@ from squishy.tool_restrictions import get_allowed_tools as _get_allowed_tools
 from squishy.tool_restrictions import get_profile_tools as _get_profile_tools
 from squishy.tools.base import Tool, ToolContext, ToolResult
 from squishy.tools.fs import FS_TOOLS
-from squishy.tools.plan import PLAN_TOOLS
 from squishy.tools.recall import RECALL_TOOLS
 from squishy.tools.scratchpad import SCRATCHPAD_TOOLS
 from squishy.tools.shell import SHELL_TOOLS
 from squishy.tools.web import WEB_TOOLS
 
-ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *PLAN_TOOLS, *SCRATCHPAD_TOOLS, *WEB_TOOLS]
+ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *SCRATCHPAD_TOOLS, *WEB_TOOLS]
 REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
 
 # PromptFn returns either a bool (approve/decline) or a ("feedback", str) tuple
@@ -58,18 +57,12 @@ async def dispatch(
     if isinstance(tool_arg_error, str):
         return ToolResult(False, error=tool_arg_error)
 
-    blocked = ctx.blocked_tools.get(name)
-    if blocked:
-        return ToolResult(False, error=blocked)
-
     allowed, reason = check_permission(tool, ctx.permission_mode, args)
     if not allowed:
         if reason == "prompt":
             if prompt_fn is None:
                 return ToolResult(False, error="refused: user approval required (no TTY)")
             reply = await prompt_fn(tool, args)
-            # prompt_fn may return a ("feedback", text) tuple for plan_task;
-            # for any non-plan tool we just treat that as a decline.
             if reply is not True:
                 return ToolResult(False, error="refused: user declined")
         else:
@@ -84,36 +77,29 @@ async def dispatch(
 def openai_schemas(
     mode: str | None = None,
     *,
-    plan_active: bool = False,
-    phase: str | None = None,
     profile: str = "standard",
     extra_tools: frozenset[str] | set[str] | None = None,
     has_index: bool = True,
 ) -> list[dict[str, object]]:
-    """Return OpenAI-format tool schemas, optionally filtered by mode and phase.
+    """Return OpenAI-format tool schemas, optionally filtered by mode.
 
     When ``mode`` is None, all tools are returned (backwards compatibility).
-    When ``mode`` is set, only tools permitted in that mode are exposed — so
-    the model never sees ``write_file``/``edit_file`` in plan mode, etc.
-
-    When ``phase`` is set and ``mode`` is ``"bench"``, tools are further
-    filtered to only those available in that phase.  This is the primary
-    mechanism for phase-gated behaviour — the model literally cannot call
-    tools that are not in its schema for the current phase.
-
-    ``plan_active`` should be True once a plan_task has been approved.
-    The schema then hides ``plan_task`` so the model can't restart
-    planning instead of executing — it must use ``update_plan`` /
-    ``finish_plan`` instead. ``update_plan`` itself supports
-    ``add_steps`` for genuine scope changes.
+    When ``mode`` is set, only tools permitted in that mode are exposed.
 
     ``profile`` narrows the result further (see ``tool_restrictions``):
     ``"minimal"`` exposes only a shell plus the file primitives, which is the
-    shape most small models have actually been trained on. ``extra_tools``
-    adds names back on top of a profile — used to surface ``recall`` only when
-    an index exists, rather than advertising a tool that would immediately
-    error. A profile only shapes the *schema*; it adds no refusal path, so a
-    model that calls an unlisted tool from memory is still served.
+    shape most small models have actually been trained on; ``"shell"`` exposes
+    the shell alone. ``extra_tools`` adds names back on top of a profile — used
+    to surface ``recall`` only when an index exists, rather than advertising a
+    tool that would immediately error. A profile only shapes the *schema*; it
+    adds no refusal path, so a model that calls an unlisted tool from memory is
+    still served.
+
+    The schema is stable for the whole run. It used to be recomputed per turn
+    so gates could withdraw tools mid-run; that never worked — a model with a
+    dozen turns of ``run_command`` in its history keeps calling it from history
+    regardless of what the schema says — and the withdrawals repeatedly left
+    narrow profiles with no callable tool at all.
     """
     if mode is None:
         return [t.openai_schema() for t in ALL_TOOLS]
@@ -130,26 +116,11 @@ def openai_schemas(
             return False
         return narrow is None or name in narrow
 
-    # Phase-gated filtering for bench mode.
-    if phase is not None and mode == "bench":
-        from squishy.phase_machine import tools_for_phase
-        phase_tools = tools_for_phase(phase)
-        return [
-            t.openai_schema()
-            for t in ALL_TOOLS
-            if t.name in phase_tools
-            and _keep(t.name)
-            and not (plan_active and t.name == "plan_task")
-        ]
-
-    # Standard mode-based filtering (all other modes, or bench without phase).
     allowed = _get_allowed_tools(mode)
     return [
         t.openai_schema()
         for t in ALL_TOOLS
-        if (t.name in allowed or (t.name.startswith("mcp__") and mode != "plan"))
-        and _keep(t.name)
-        and not (plan_active and t.name == "plan_task")
+        if (t.name in allowed or t.name.startswith("mcp__")) and _keep(t.name)
     ]
 
 

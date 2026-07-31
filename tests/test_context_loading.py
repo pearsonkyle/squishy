@@ -51,30 +51,10 @@ def test_load_agent_instructions_truncates_huge_files(tmp_path: Path) -> None:
     assert len(out) < 6_000
 
 
-def test_build_system_prompt_includes_instructions(tmp_path: Path) -> None:
-    (tmp_path / "AGENTS.md").write_text("KEY_RULE: never use sudo\n")
-    prompt = build_system_prompt(str(tmp_path), ProjectInfo(), mode="plan")
-    assert "KEY_RULE: never use sudo" in prompt
 
 
-def test_build_system_prompt_plan_mode_block(tmp_path: Path) -> None:
-    prompt = build_system_prompt(str(tmp_path), ProjectInfo(), mode="plan")
-    assert "Mode: plan" in prompt
-    assert "plan_task" in prompt
-    assert "write_file" in prompt  # mentioned as new-files-only in core rules
-    # Without an index the rules block points at /init.
-    assert "No repo index yet" in prompt
 
 
-def test_build_system_prompt_plan_mode_with_index_prefers_recall(tmp_path: Path) -> None:
-    squishy_dir = tmp_path / ".squishy"
-    squishy_dir.mkdir()
-    (squishy_dir / "index.json").write_text("{}")
-
-    prompt = build_system_prompt(str(tmp_path), ProjectInfo(), mode="plan")
-    assert "recall(query=" in prompt
-    # The "no index" hint must vanish once an index exists.
-    assert "No repo index yet" not in prompt
 
 
 def test_build_system_prompt_edits_mode_block(tmp_path: Path) -> None:

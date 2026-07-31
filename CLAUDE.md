@@ -16,7 +16,7 @@ pip install -e '.[dev]'
 pytest -q
 
 # Run a single test file or test
-pytest tests/test_quality.py -q
+pytest tests/test_agent_loop.py -q
 pytest tests/test_agent_loop.py::test_basic_loop -q
 
 # Run smoke tests (requires live LLM endpoint)
@@ -51,12 +51,33 @@ squishy-bench term --tasks tasks.jsonl --model m --output results.jsonl
 
 ### Agent loop
 
-`agent.py` is a slim orchestrator (~400 lines). The per-turn loop delegates to four submodules:
+`agent.py` is a slim orchestrator. The per-turn loop is deliberately thin --
+complete, dispatch, append, repeat -- and delegates to two submodules:
 
 - **`agent_state.py`** -- `TaskResult`, `LoopState`, message helpers, problem-file extraction.
-- **`agent_safety.py`** -- Loop/stuck detection, quality gates, nudge injection. All nudges flow through `inject_nudge()` which enforces soft cap (`max_system_nudges`), hard cap (2x soft), and minimum turn gap.
-- **`agent_dispatch.py`** -- Tool dispatch, plan approval flow, evidence recording.
-- **`agent_phases.py`** -- Phase tracking (explore/fix/verify), turn budget injection, problem re-anchoring.
+- **`agent_dispatch.py`** -- Tool dispatch, display rendering, outcome tracking.
+- **`agent_safety.py`** -- `inject_nudge()` only: soft cap (`max_system_nudges`), hard cap (2x soft), per-turn cap, minimum turn gap.
+
+**Feedback belongs in the tool result, not in an injected user message.** This is
+the load-bearing rule of the loop. A tool result is causally paired with the call
+that produced it, is what the model is trained to read, and cannot desynchronize
+the transcript. An out-of-band `[system]` user turn breaks assistant/tool pairing
+and forces `normalize_messages` to repair it -- which it can only do by deleting
+the assistant turn.
+
+A quality gate, a five-phase state machine, a plan protocol, goal-drift and
+edit-failure detectors, turn budgets and problem re-anchoring all used to live
+between the model and its tools. They were removed after measurement: on
+SWE-rebench, harness-generated refusals (`run_command: refused`, `read_file:
+refused`) were the largest single failure bucket, and the quality gate's
+"skip this turn" path erased the model's own tool call from its history before
+scolding it for making one. `tests/test_transcript_integrity.py` guards the
+regression. Loop-breaking now lives in the tools -- `read_file`'s span cache and
+`run_command`'s output-hash echo counter both answer inline.
+
+Only three things still inject: the periodic no-edit-yet reminder, the
+empty-response retry, and the post-compaction "your history was rewritten"
+notice. Nothing else may.
 
 ### Context management (two layers)
 
@@ -71,7 +92,17 @@ MCP tools are dynamically registered at startup as `mcp__servername__toolname`.
 
 ### Permission modes
 
-Four modes (`plan`, `edits`, `yolo`, `bench`) control what tools are allowed per turn. `plan` is the default. `bench` is for evaluation harnesses only (excludes plan tools). Mode restrictions enforced in `tool_restrictions.py`.
+Three modes (`edits`, `yolo`, `bench`) control what tools are allowed. `edits` is
+the default and prompts for `run_command` approval; `yolo` skips prompts; `bench`
+is for evaluation harnesses (drops the web tools, never prompts). Enforced in
+`tool_restrictions.py` at dispatch time.
+
+Orthogonal to mode, `tool_profile` narrows what the model *sees*: `standard`
+(everything the mode allows, ~1.5k tokens/request), `minimal` (shell + file
+primitives, ~870), `shell` (`run_command` alone, ~420). A profile shapes the
+schema only -- it adds no refusal path, and `tool_aliases.py` maps foreign tool
+vocabularies (bash, str_replace, file_path) onto the canonical names, so a model
+trained on another harness is never penalized.
 
 ### Config duality: `api.py` vs `config.py`
 

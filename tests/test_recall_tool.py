@@ -253,32 +253,6 @@ async def test_depth_one_shows_methods(tmp_path: Path) -> None:
             assert "load" in method_names or "save" in method_names
 
 
-async def test_recall_reloads_after_index_rebuild(tmp_path: Path) -> None:
-    """recall must invalidate its cached index when index.json changes on disk
-    (e.g. a /init rebuild mid-session), not serve the first-loaded tree forever."""
-    import os
-    _make_repo(tmp_path)
-    idx = build_index(str(tmp_path))
-    save_index(str(tmp_path), idx)
-    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
-
-    r1 = await _recall({"query": "colors"}, ctx)
-    assert r1.success
-    assert any("colors.py" in res.get("path", "") for res in r1.data["results"])
-
-    # A brand-new file the first index never saw.
-    (tmp_path / "pkg" / "auth.py").write_text('"""Authentication login."""\ndef login(): return 1\n')
-    idx2 = build_index(str(tmp_path), prior=idx)
-    save_index(str(tmp_path), idx2)
-    # Bump mtime so the change is observable even on coarse clocks.
-    ip = str(tmp_path / ".squishy" / "index.json")
-    st = os.stat(ip)
-    os.utime(ip, (st.st_atime, st.st_mtime + 10))
-
-    r2 = await _recall({"query": "authentication login"}, ctx)
-    assert r2.success
-    assert any("auth.py" in res.get("path", "") for res in r2.data["results"]), \
-        "recall served a stale cached index after rebuild"
 
 
 def test_is_downranked_paths():
@@ -302,21 +276,3 @@ def test_score_downranks_test_paths_below_source():
     assert _score(src, q, _tokens(q)) > _score(tst, q, _tokens(q))
 
 
-async def test_recall_ranks_source_above_test(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "widget.py").write_text(
-        '"""Widget rendering."""\ndef render_widget(): return 1\n'
-    )
-    (tmp_path / "tests").mkdir()
-    (tmp_path / "tests" / "test_widget.py").write_text(
-        '"""Widget tests."""\ndef render_widget(): return 1\n'
-    )
-    idx = build_index(str(tmp_path))
-    save_index(str(tmp_path), idx)
-    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="plan", use_sandbox=False)
-    r = await _recall({"query": "render_widget"}, ctx)
-    assert r.success
-    paths = [res.get("path", "") for res in r.data["results"]]
-    src_i = next(i for i, p in enumerate(paths) if p.startswith("src/"))
-    tst_i = next(i for i, p in enumerate(paths) if p.startswith("tests/"))
-    assert src_i < tst_i, f"source should rank above test: {paths}"

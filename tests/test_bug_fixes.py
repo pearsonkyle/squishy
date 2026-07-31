@@ -24,17 +24,6 @@ def test_to_message_zero_limit_does_not_grow():
 
 # --- #13: update_plan must reject bool step_index -------------------------
 
-async def test_update_plan_rejects_bool_step_index(tmp_path):
-    from squishy.tools.base import ToolContext
-    from squishy.tools.plan import _plan_task, _update_plan
-    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="yolo", use_sandbox=False)
-    await _plan_task({"problem": "p", "solution": "s", "steps": ["a", "b"]}, ctx)
-    ctx.plan.mark_approved()
-    r = await _update_plan({"step_index": True, "status": "done"}, ctx)
-    assert not r.success
-    assert "step_index" in r.error
-    # Neither step was mutated.
-    assert all(s.status == "pending" for s in ctx.plan.steps)
 
 
 # --- #9: @-reference regex ignores emails, strips trailing punctuation ----

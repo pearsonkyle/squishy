@@ -57,25 +57,6 @@ def test_write_preview_handles_brackets():
     assert "arr[0]" in out
 
 
-def test_plan_panel_handles_brackets_in_problem_and_steps():
-    d, buf = _capture_display()
-    d.plan_panel({
-        "plan": "Fix [bug-123]",
-        "problem": "list[int] confusion in foo[bar]",
-        "solution": "use dict[str, list[int]] instead",
-        "steps": [
-            {"description": "rewrite foo[0] handler", "status": "done"},
-            "patch bar[1] callsite",
-        ],
-        "files_to_create": ["new[file].py"],
-        "files_to_modify": ["mod[ule].py"],
-    })
-    out = buf.getvalue()
-    # All bracketed strings must survive.
-    assert "list[int]" in out
-    assert "foo[0]" in out
-    assert "mod[ule].py" in out
-    assert "[bug-123]" in out
 
 
 def test_turn_header_handles_brackets_in_brief():

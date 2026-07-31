@@ -24,18 +24,10 @@ class TaskResult:
     elapsed_s: float = 0.0
     error: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
-    plan_state: dict[str, Any] | None = None
     empty_responses: int = 0
-    quality_skips: int = 0
     prose_completions: int = 0
     tool_call_counts: dict[str, int] = field(default_factory=dict)
-    env_fix_files: list[str] = field(default_factory=list)
     edit_failures: int = 0
-    # Phase/budget diagnostics.
-    final_phase: str = ""
-    explore_turns: int = 0
-    fix_verify_cycles: int = 0
-    total_quality_violations: int = 0
     # Per-turn event log for post-hoc analysis.
     turn_log: list[dict[str, Any]] = field(default_factory=list)
     # Complete message log (pre-trim) for SFT training data export.
@@ -47,127 +39,41 @@ class LoopState:
     """Mutable counters shared across the agent loop and its sub-methods."""
     start: float
     consecutive_errors: int = 0
-    plan_nudges: int = 0
-    turns_without_plan_task: int = 0
     total_prompt_tokens: int = 0
     completion_tokens: int = 0
     files_created: set[str] = field(default_factory=set)
     files_edited: set[str] = field(default_factory=set)
     commands_run: int = 0
-    quality_retries: int = 0
-    total_quality_violations: int = 0
-    test_passed_after_edit: bool = False
     empty_responses: int = 0
-    quality_skips: int = 0
     total_tool_calls: dict[str, int] = field(default_factory=dict)
     prose_completions: int = 0
-    # Phase tracking (bench/yolo) — synced from PhaseState in bench mode.
-    phase: str = "explore"
-    explore_turns: int = 0
-    fix_verify_cycles: int = 0
-    # Goal-drift tracking (bench/yolo).
-    env_fix_files: set[str] = field(default_factory=set)
     problem_files: set[str] = field(default_factory=set)
-    env_error_count: int = 0
-    # Failed edit tracking.
-    edit_failures_per_file: dict[str, int] = field(default_factory=dict)
     total_edit_failures: int = 0
-    # Times the must-edit gate has refused a shell call. Bounded: a model that
-    # answers the refusal by retrying the same call is not going to be argued
-    # into editing, and looping on it is worse than lifting the gate.
-    shell_refusals: int = 0
-    # Shell commands that looked like they modified a file. Under a
-    # shell-only profile this is the only edit signal there is — `files_edited`
-    # only ever records edit_file/write_file.
+    # Shell commands that looked like they modified a file. Under a shell-only
+    # profile this is the only edit signal there is — `files_edited` only ever
+    # records edit_file/write_file.
     shell_writes: int = 0
     recent_edit_fail_files: set[str] = field(default_factory=set)
-    # Identical-old_str-per-path tracking (catches edit loops that bypass
-    # repeated_tool_call detection because args.new_str varies). Maps
-    # `path -> (last_old_str_hash, consecutive_count)`.
-    last_edit_old_str_per_file: dict[str, tuple[str, int]] = field(default_factory=dict)
-    # Re-anchoring.
-    last_reanchor_turn: int = 0
-    problem_text: str | None = None
-    # FAIL_TO_PASS test identifiers for verifying the right tests are run.
+    last_edit_turn: int = 0
+    # FAIL_TO_PASS identifiers, when a bench harness supplies them. Surfaced to
+    # the model through the prompt; the loop itself no longer gates on them.
     fail_to_pass_tests: list[str] = field(default_factory=list)
-    # v6e: harness-supplied test command (V2's install_config.test_cmd).
-    # Empty string when not provided (V1, terminal-bench, interactive REPL).
-    # Consumed by maybe_post_edit_pytest_nudge to suggest the right runner
-    # for non-pytest projects (npm/phpunit/cargo) instead of hardcoding pytest.
+    # Harness-supplied test command (SWE-rebench V2's install_config.test_cmd).
     test_cmd: str = ""
     # Compaction-resilient loop detection.
     last_call_key: str = ""
     consecutive_identical: int = 0
-    unresolved_nudges: int = 0
+    # Nudge budget.
     last_nudge_turn: int = -3
     total_nudges: int = 0
     nudges_this_turn: int = 0
-    # Test failure tracking across fix-verify cycles.
-    last_test_failure_count: int = -1  # -1 = no test run yet
-    last_test_failures: list[str] = field(default_factory=list)
     # Per-turn structured event log.
     turn_log: list[dict[str, Any]] = field(default_factory=list)
-    # Compaction count — used to detect loops that survive compaction.
     compaction_count: int = 0
     # LLM error count — used to retry transient failures in bench mode.
     llm_errors: int = 0
     # Cumulative tenacity retries across all completion calls in this loop.
-    # Read from `client.last_call_retries` after each completion.  When this
-    # crosses a threshold the agent injects a CRITICAL "wrap up now" nudge
-    # rather than letting upstream instability silently consume the budget.
     cumulative_retries: int = 0
-    # F2P finish-plan gate intercepts.  In bench mode, finish_plan is
-    # blocked once when the agent declares done without having actually
-    # passed the FAIL_TO_PASS tests.  After one intercept the gate releases
-    # so a degraded test environment cannot trap the agent forever.
-    f2p_finish_gate_intercepts: int = 0
-    # Last F2P-only failure count for cross-cycle progress tracking.
-    last_f2p_failure_count: int = -1
-    # Single-shot prose-completion gate.  When the agent prose-completes
-    # in bench/yolo mode after observing a test failure but without making
-    # any edits to fix it, the loop intercepts once and nudges the agent
-    # to either fix or call finish_plan(status="failure").  Released after
-    # one intercept so genuinely unfixable runs can still terminate.
-    no_progress_intercepts: int = 0
-    # F5: F2P file-coverage tracking.  ``f2p_files_covered`` records which
-    # FAIL_TO_PASS test files have been exercised by a passing test command
-    # (exit 0, no failures in test_summary).  ``test_passed_after_edit`` is
-    # only allowed to flip True when *every* distinct F2P file has been
-    # covered.  The gate intercepts ``finish_plan`` calls otherwise, with
-    # the same single-shot release as A5 so degraded environments don't
-    # trap the agent.  v27.2 fix for the scico-561 case where the agent
-    # ran the 2D test, saw it pass, and skipped the 3D test entirely.
-    f2p_files_covered: set[str] = field(default_factory=set)
-    f2p_coverage_intercepts: int = 0
-    # v2 auto-pytest finish gate.  ``last_edit_turn`` stamps the turn of the
-    # most recent successful edit_file/write_file; ``last_f2p_test_turn``
-    # stamps the turn of the most recent run_command pytest that hit any
-    # F2P file (regardless of pass/fail).  When the agent tries to finish
-    # in bench mode and ``last_edit_turn > last_f2p_test_turn``, the harness
-    # synthesizes a pytest run on the F2P tests so the model gets one more
-    # chance to react to real test output.  ``auto_pytest_runs`` caps the
-    # number of times the gate fires per instance.
-    last_edit_turn: int = 0
-    last_f2p_test_turn: int = 0
-    auto_pytest_runs: int = 0
-    # v5 pre-finish gate: failing F2P test details from the most recent
-    # F2P run.  Populated from ``test_summary`` when the agent's pytest
-    # output parses cleanly.  Empty list when the last F2P run didn't
-    # fail, the test runner isn't pytest, or no F2P run has happened yet.
-    # Each entry: ``{"test": "<nodeid>", "error": "<truncated assertion>"}``.
-    last_f2p_failures: list[dict[str, str]] = field(default_factory=list)
-    # v6b pre-finish gate: True when the most recent F2P-covering test
-    # command exited with collection / import errors but produced no
-    # parseable per-test failure lines.  Lets the gate emit a "fix
-    # collection before finishing" hint instead of falling silently
-    # through to legacy branches when ``last_f2p_failures`` is empty.
-    last_f2p_collection_error: bool = False
-    # v6c: True after the post-edit pytest nudge has fired once. The
-    # nudge surfaces the exact ``pytest <id1> <id2> ...`` invocation
-    # the moment the first successful edit lands in bench/yolo mode,
-    # so the model doesn't need to wait for a finish_plan intercept
-    # to learn what to run.
-    post_edit_pytest_nudge_sent: bool = False
 
 
 # ---------------------------------------------------------------------------

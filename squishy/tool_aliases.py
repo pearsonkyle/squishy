@@ -9,7 +9,7 @@ burn a turn. This module maps well-established alternate tool NAMES and
 parameter names onto squishy's canonical tools, so that fine-tuned knowledge
 transfers instead of fighting the harness.
 
-It is a *forgiveness* layer, applied once to each tool call before quality
+It is a *forgiveness* layer, applied once to each tool call before loop
 checks and dispatch:
   * a canonical name is never remapped;
   * an alias parameter is only applied when the canonical parameter is absent

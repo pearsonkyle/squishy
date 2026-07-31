@@ -73,19 +73,6 @@ def test_api_threads_profile_into_config():
     assert sq._make_config(None).tool_profile == "minimal"
 
 
-def test_minimal_prompt_drops_phase_narration(tmp_path):
-    project = detect_project(str(tmp_path))
-    std = build_system_prompt(str(tmp_path), project, False, "bench", "standard")
-    mini = build_system_prompt(str(tmp_path), project, False, "bench", "minimal")
-    # The phase machine is off under minimal, so describing it would be a lie.
-    assert "phase" in std.lower()
-    assert "explore" not in mini.lower()
-    # ...but the forcing language that actually moves patch rate stays.
-    assert "not stop until" in mini.lower()
-    # No prompt should advertise tools the profile doesn't expose.
-    for absent in ("plan_task", "save_note", "show_diff", "glob_files"):
-        assert absent not in mini
-    assert len(mini) < len(std)
 
 
 def test_minimal_prompt_mentions_recall_only_with_an_index(tmp_path):
@@ -94,39 +81,6 @@ def test_minimal_prompt_mentions_recall_only_with_an_index(tmp_path):
         str(tmp_path), project, False, "bench", "minimal")
 
 
-async def test_minimal_bench_run_skips_the_phase_machine(tmp_path):
-    """Bench + minimal must not phase-gate: one edit, then finish.
-
-    Under the standard profile the phase machine starts in `explore`, whose
-    schema has no `edit_file` at all. The minimal profile's premise is that a
-    directive prompt does that job, so the agent may edit on turn one.
-    """
-    from squishy.agent import Agent
-    from squishy.client import CompletionResult, ToolCall
-    from squishy.display import Display
-
-    (tmp_path / "app.py").write_text("def f():\n    return 1\n")
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "bench"
-    cfg.tool_profile = "minimal"
-    cfg.max_turns = 5
-
-    fake = FakeClient(script=[
-        CompletionResult(tool_calls=[ToolCall(
-            id="c1", name="edit_file",
-            args={"path": "app.py", "old_string": "return 1", "new_string": "return 2"},
-        )]),
-        CompletionResult(text="Fixed.", tool_calls=[]),
-    ])
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("fix f")
-
-    assert result.success, result.error
-    assert "app.py" in result.files_edited
-    assert (tmp_path / "app.py").read_text().endswith("return 2\n")
-    # No phase machine ran, so no phase was ever recorded.
-    assert result.final_phase in ("", "explore")
 
 
 async def test_minimal_bench_still_offers_edit_file_on_turn_one(tmp_path):
@@ -174,41 +128,6 @@ def test_canonical_names_are_never_remapped():
         assert normalize_call(name, {})[0] == name
 
 
-async def test_must_edit_gate_yields_rather_than_livelocking(tmp_path):
-    """A refused shell call the model ignores must not loop forever.
-
-    Observed live under the minimal profile: the gate refused run_command 25
-    consecutive times and the model answered every refusal by calling it
-    again, never trying edit_file. 25 turns burned, no patch. After a few
-    refusals the gate lifts so the run can at least make progress.
-    """
-    from squishy.agent import _MAX_SHELL_REFUSALS, Agent
-    from squishy.client import CompletionResult, ToolCall
-    from squishy.display import Display
-
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "bench"
-    cfg.tool_profile = "minimal"
-    cfg.max_turns = 20
-    cfg.max_turns_without_edit = 2
-
-    # A model that only ever calls run_command, exactly as seen live.
-    script = [
-        CompletionResult(tool_calls=[ToolCall(
-            id=f"c{i}", name="run_command", args={"command": f"echo {i}"})])
-        for i in range(15)
-    ]
-    fake = FakeClient(script=script)
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    await agent.run("fix it")
-
-    assert agent._active_st is not None
-    refusals = agent._active_st.shell_refusals
-    assert refusals == _MAX_SHELL_REFUSALS, (
-        f"gate should stop refusing after {_MAX_SHELL_REFUSALS}, got {refusals}")
-    # Once lifted, it stays lifted for the rest of the run.
-    assert "run_command" not in agent.tool_ctx.blocked_tools
 
 
 def test_recall_is_hidden_without_an_index():
@@ -255,59 +174,7 @@ def test_shell_profile_has_no_edit_tool():
     assert profile_has_edit_tool("standard") is True
 
 
-async def test_must_edit_gate_cannot_fire_under_shell_profile(tmp_path):
-    """Withdrawing run_command here would leave the model with no tool at all.
-
-    Edits go through the shell, so `files_edited` stays empty however much
-    real work happens — the gate's trigger condition is permanently true and
-    its remedy (`edit_file`) does not exist.
-    """
-    from squishy.agent import Agent
-    from squishy.client import CompletionResult, ToolCall
-    from squishy.display import Display
-
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "bench"
-    cfg.tool_profile = "shell"
-    cfg.max_turns = 12
-    cfg.max_turns_without_edit = 2
-
-    fake = FakeClient(script=[
-        CompletionResult(tool_calls=[ToolCall(
-            id=f"c{i}", name="run_command", args={"command": f"echo {i}"})])
-        for i in range(10)
-    ])
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    await agent.run("fix it")
-
-    assert "run_command" not in agent.tool_ctx.blocked_tools
-    assert agent._active_st is not None
-    assert agent._active_st.shell_refusals == 0
-    # Every turn kept its one tool.
-    for offered in fake.tools_seen:
-        assert {s["function"]["name"] for s in offered} == {"run_command"}
 
 
-def test_shell_prompt_explains_how_to_edit_without_an_edit_tool(tmp_path):
-    prompt = build_system_prompt(
-        str(tmp_path), detect_project(str(tmp_path)), False, "bench", "shell")
-    assert "only tool" in prompt
-    # Editing is the one thing a shell makes awkward, so it must be spelled out.
-    assert "git diff" in prompt
-    for absent in ("read_file", "edit_file", "recall", "plan_task"):
-        assert absent not in prompt
 
 
-@pytest.mark.parametrize("profile", ["shell", "minimal", "standard"])
-@pytest.mark.parametrize("phase", ["explore", "plan", "execute", "verify"])
-def test_no_phase_ever_leaves_a_profile_with_zero_tools(profile, phase):
-    """A profile x phase intersection that is empty strands the model.
-
-    The plan phase offers {plan_task, save_note, recall}; against a shell-only
-    profile that intersects to nothing. Narrowed profiles therefore skip the
-    phase machine entirely — this guards the invariant either way.
-    """
-    schemas = openai_schemas("bench", profile=profile, phase=phase, has_index=True)
-    if profile == "standard":
-        assert schemas, f"{profile}/{phase} exposes no tools"

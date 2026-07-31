@@ -56,11 +56,11 @@ def test_external_deps_section_is_deduped_one_line(tmp_path):
     assert deps_block.count("requests") == 1
 
 
-def test_planning_workflow_has_no_nested_bold(tmp_path):
+def test_navigation_section_has_no_nested_bold(tmp_path):
     out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
-    assert "## Planning workflow" in out
+    assert "## Navigation" in out
     # The block used to read "**Important**: ..." with bold mid-sentence.
-    block = out.split("## Planning workflow", 1)[1]
+    block = out.split("## Navigation", 1)[1]
     assert "**" not in block
 
 

@@ -6,12 +6,12 @@ import os
 from dataclasses import dataclass, field
 from typing import Literal
 
-PermissionMode = Literal["plan", "edits", "yolo", "bench"]
-MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo", "bench")
+PermissionMode = Literal["edits", "yolo", "bench"]
+MODES: tuple[PermissionMode, ...] = ("edits", "yolo", "bench")
 # Modes exposed to the interactive shift-tab cycle. "bench" is for the
-# benchmark runner only — it strips planning tools and enables aggressive
-# automation that's not useful at the REPL — so it's excluded here.
-INTERACTIVE_MODES: tuple[PermissionMode, ...] = ("plan", "edits", "yolo")
+# benchmark runner only — it drops the web tools and skips approval prompts —
+# so it's excluded here.
+INTERACTIVE_MODES: tuple[PermissionMode, ...] = ("edits", "yolo")
 
 
 @dataclass
@@ -34,11 +34,11 @@ class Config:
     temperature: float = 0.3
     max_tokens: int = 8192
     max_turns: int = 30
-    permission_mode: PermissionMode = "plan"
+    permission_mode: PermissionMode = "edits"
     # "standard" = every tool the mode permits. "minimal" = a shell plus the
-    # file primitives (the mini-swe-agent shape), and no phase machine. Small
-    # models generalize better to a tool set they were trained on, and the
-    # narrower schema is ~1.2k fewer tokens on every request.
+    # file primitives (the mini-swe-agent shape). "shell" = run_command alone.
+    # Small models generalize better to a tool set they were trained on, and
+    # the narrower schema is ~900 fewer tokens on every request.
     tool_profile: str = "standard"
     working_dir: str = field(default_factory=os.getcwd)
     sandbox_image: str = field(
@@ -53,9 +53,6 @@ class Config:
     # Agent-loop safety thresholds. Tunable so bench runs can trade off
     # reliability vs. autonomy without code changes.
     max_consecutive_errors: int = 8
-    max_plan_nudges: int = 4
-    max_plan_investigation_turns: int = 4
-    max_recall_skip_turns: int = 2
     max_history_messages: int = 10
     # Context window in tokens. 0 = auto-detect from the endpoint. Many local
     # servers (LM Studio, llama.cpp) do NOT advertise `context_length`; without
@@ -64,27 +61,13 @@ class Config:
     context_window: int = 0
     assumed_context_window: int = 32_768
     max_tool_output_chars: int = 32_000
-    max_quality_retries: int = 3
     compaction_threshold: float = 0.7
     max_system_nudges: int = 8  # cap total nudges to avoid flooding context
-    # Phase-budget thresholds (bench/yolo modes only).
-    max_explore_turns: int = 8
-    # Turns allowed with no successful edit before `run_command` is removed
-    # from the schema, leaving only read/edit tools. Small models otherwise
-    # loop on "run the tests" forever and never attempt a fix — a patch that
-    # fails tests still beats no patch at all. bench/yolo only; 0 disables.
+    # Turns allowed with no successful edit before the loop starts periodically
+    # reminding the model that a run ending with no diff scores zero. This is a
+    # nudge, not a gate: the blocking version of it withdrew `run_command` and
+    # measurably cost patches. bench/yolo only; 0 disables.
     max_turns_without_edit: int = 12
-    max_plan_turns: int = 3
-    max_fix_verify_cycles: int = 6
-    # v2 auto-pytest finish gate: cap on how many times the harness will
-    # synthesize a pytest run when the agent tries to finish without
-    # verifying the F2P tests. Bench mode only.
-    max_auto_pytest_runs: int = 2
-    # v5 pre-finish F2P partial-pass gate: how many times
-    # ``check_finish_plan_gate`` may intercept ``finish_plan`` before
-    # releasing.  Bounded so a structurally unrunnable test environment
-    # cannot trap the agent.  Bench mode only.
-    max_finish_gate_intercepts: int = 2
     # Session persistence.
     session_dir: str = field(
         default_factory=lambda: os.environ.get(

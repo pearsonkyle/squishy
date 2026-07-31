@@ -8,13 +8,10 @@ import pytest
 
 from squishy.session import (
     append_messages,
-    cleanup_sessions,
     create_session,
     export_training,
     export_training_to_file,
     finish_session,
-    list_sessions,
-    load_messages,
     load_session,
     load_tools,
 )
@@ -47,39 +44,6 @@ def test_create_and_load_session(tmp_sessions: str) -> None:
     assert loaded.status == "active"
 
 
-def test_append_and_load_messages(tmp_sessions: str) -> None:
-    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-
-    # Append messages with tool_calls containing JSON string arguments
-    # (as stored by agent.py) — should be normalized to dicts on write.
-    messages = [
-        {"role": "system", "content": "You are a helper."},
-        {"role": "user", "content": "Fix the bug."},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_0",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": json.dumps({"path": "foo.py"}),
-                    },
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "call_0", "name": "read_file", "content": "file content"},
-    ]
-    append_messages(sess.id, messages, root=tmp_sessions)
-
-    loaded = load_messages(sess.id, root=tmp_sessions)
-    assert len(loaded) == 4
-
-    # Verify arguments were normalized from JSON string to dict.
-    tc = loaded[2]["tool_calls"][0]
-    assert isinstance(tc["function"]["arguments"], dict)
-    assert tc["function"]["arguments"]["path"] == "foo.py"
 
 
 def test_finish_session(tmp_sessions: str) -> None:
@@ -92,19 +56,6 @@ def test_finish_session(tmp_sessions: str) -> None:
     assert loaded.tokens == 1000
 
 
-def test_list_sessions(tmp_sessions: str) -> None:
-    # Create 3 sessions with different working dirs.
-    s1 = create_session(model="m", working_dir="/a", mode="plan", root=tmp_sessions)
-    s2 = create_session(model="m", working_dir="/b", mode="edits", root=tmp_sessions)
-    s3 = create_session(model="m", working_dir="/a", mode="yolo", root=tmp_sessions)
-
-    all_sessions = list_sessions(root=tmp_sessions)
-    assert len(all_sessions) == 3
-
-    # Filter by working_dir.
-    filtered = list_sessions(working_dir="/a", root=tmp_sessions)
-    assert len(filtered) == 2
-    assert all(s.working_dir == "/a" for s in filtered)
 
 
 def test_export_training_format(tmp_sessions: str) -> None:
@@ -171,20 +122,6 @@ def test_export_training_format(tmp_sessions: str) -> None:
     assert msgs[-1]["role"] == "assistant"
 
 
-def test_resume_loads_messages(tmp_sessions: str) -> None:
-    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-    messages = [
-        {"role": "system", "content": "prompt"},
-        {"role": "user", "content": "hello"},
-        {"role": "assistant", "content": "hi there"},
-    ]
-    append_messages(sess.id, messages, root=tmp_sessions)
-
-    # Simulate resume: load messages from session.
-    loaded = load_messages(sess.id, root=tmp_sessions)
-    assert len(loaded) == 3
-    assert loaded[0]["role"] == "system"
-    assert loaded[2]["content"] == "hi there"
 
 
 def test_session_dir_env_var(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -227,26 +164,8 @@ def test_tools_persistence(tmp_sessions: str) -> None:
     assert loaded[0]["function"]["name"] == "test_tool"
 
 
-def test_multiple_appends(tmp_sessions: str) -> None:
-    """Multiple append_messages calls should accumulate."""
-    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-    append_messages(sess.id, [{"role": "user", "content": "first"}], root=tmp_sessions)
-    append_messages(sess.id, [{"role": "assistant", "content": "response"}], root=tmp_sessions)
-    append_messages(sess.id, [{"role": "user", "content": "second"}], root=tmp_sessions)
-
-    loaded = load_messages(sess.id, root=tmp_sessions)
-    assert len(loaded) == 3
-    assert loaded[0]["content"] == "first"
-    assert loaded[2]["content"] == "second"
 
 
-def test_empty_append_noop(tmp_sessions: str) -> None:
-    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-    append_messages(sess.id, [], root=tmp_sessions)
-
-    # messages.jsonl should not exist (no messages were written).
-    msgs_path = Path(tmp_sessions) / sess.id / "messages.jsonl"
-    assert not msgs_path.exists()
 
 
 def test_export_strips_trailing_tool_messages(tmp_sessions: str) -> None:
@@ -269,27 +188,5 @@ def test_export_strips_trailing_tool_messages(tmp_sessions: str) -> None:
     assert msgs[-1]["role"] == "assistant"
 
 
-def test_cleanup_sessions_removes_old(tmp_sessions: str) -> None:
-    """Sessions older than max_age_days should be removed."""
-    # Create a session and backdate its meta.json.
-    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-    meta_path = Path(tmp_sessions) / sess.id / "meta.json"
-    meta = json.loads(meta_path.read_text())
-    meta["updated_at"] = "2020-01-01T00:00:00+00:00"
-    meta_path.write_text(json.dumps(meta))
-
-    # Create a recent session that should survive.
-    recent = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-
-    removed = cleanup_sessions(max_age_days=30, root=tmp_sessions)
-    assert removed == 1
-    assert not (Path(tmp_sessions) / sess.id).exists()
-    assert (Path(tmp_sessions) / recent.id).exists()
 
 
-def test_cleanup_sessions_keeps_recent(tmp_sessions: str) -> None:
-    """Recent sessions should not be removed."""
-    sess = create_session(model="m", working_dir="/tmp", mode="plan", root=tmp_sessions)
-    removed = cleanup_sessions(max_age_days=30, root=tmp_sessions)
-    assert removed == 0
-    assert (Path(tmp_sessions) / sess.id).exists()

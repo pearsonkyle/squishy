@@ -63,14 +63,9 @@ async def test_pure_exploration_gets_nudged(tmp_path):
     nudges = [m for m in result.messages
               if m.get("role") == "user" and "not changed any file" in str(m.get("content", ""))]
     assert nudges, "a shell run that never writes should be prodded"
-    assert "heredoc" in nudges[0]["content"] or "EOF" in nudges[0]["content"]
+    assert "git diff" in nudges[0]["content"]
 
 
-async def test_the_shell_is_never_blocked(tmp_path):
-    """The whole point: withdrawing the only tool strands the model."""
-    agent, _ = await _run(tmp_path, ["ls -la"] * 12)
-    assert "run_command" not in agent.tool_ctx.blocked_tools
-    assert agent._active_st.shell_refusals == 0
 
 
 async def test_a_run_that_writes_is_left_alone(tmp_path):

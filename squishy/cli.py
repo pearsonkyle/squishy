@@ -24,7 +24,6 @@ from squishy.config import Config
 from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references_with_missing
-from squishy.plan_state import clear_plan
 from squishy.session import (
     create_session,
     export_training_to_file,
@@ -35,7 +34,6 @@ from squishy.session import (
 from squishy.tool_restrictions import TOOL_PROFILES
 from squishy.tools.base import Tool
 
-EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
 
 # Slash commands that take no arguments — typing extra text is almost
 # always a typo (e.g. ``/clear all``) that we silently swallowed before.
@@ -44,8 +42,6 @@ _NO_ARG_SLASH_CMDS: frozenset[str] = frozenset({
     "/help",
     "/clear", "/new",
     "/status",
-    "/plan",
-    "/exit-plan",
     "/session",
     "/sessions",
 })
@@ -79,13 +75,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--timeout", type=float, default=None, help="Task timeout in seconds")
     p.add_argument("--request-timeout", type=float, default=120.0)
     p.add_argument("--max-retries", type=int, default=4)
-    p.add_argument("--plan", action="store_true", help="Start in plan mode (default, read-only)")
     p.add_argument("--edits", action="store_true", help="Start in edits mode")
     p.add_argument("--yolo", action="store_true", help="Start in yolo mode (no prompts)")
     p.add_argument(
         "--tools", dest="tool_profile", choices=sorted(TOOL_PROFILES), default="standard",
         help="Tool profile: standard (all tools the mode allows) or minimal "
-             "(shell + file primitives only, no phase machine)",
+             "(shell + file primitives only)",
     )
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
     p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
@@ -130,8 +125,6 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.max_turns = args.max_turns
     if args.temperature is not None:
         cfg.temperature = args.temperature
-    if args.plan:
-        cfg.permission_mode = "plan"
     elif args.yolo:
         cfg.permission_mode = "yolo"
     elif args.edits:
@@ -275,14 +268,7 @@ async def _amain() -> None:
         approval_session: PromptSession[str] = PromptSession()
 
         async def prompt_fn(tool: Tool, args_: dict):
-            # For plan_task, free-text input is sent back to the model as
-            # decline-with-feedback so it can revise the plan. Spell that
-            # out — "feedback" alone reads like a separate menu option.
-            label = (
-                "  approve? [y=yes / N=no / type feedback to revise / ^C=cancel] "
-                if tool.name == "plan_task"
-                else "  approve? [y/N, ^C cancels] "
-            )
+            label = "  approve? [y/N, ^C cancels] "
             # Make sure any in-flight streaming markdown is finalised before
             # we hand the terminal to prompt_toolkit, otherwise the live
             # region and the prompt fight for the same screen rows.
@@ -295,29 +281,21 @@ async def _amain() -> None:
                     display.info("declined.")
                     return False
                 # Ctrl+C is intentionally *not* caught here. We want it to
-                # propagate up through _handle_plan_approval and the agent
-                # loop so the entire turn is cancelled and the user lands
+                # propagate up through the agent loop so the whole turn
+                # is cancelled and the user lands
                 # back at the REPL prompt — instead of the agent silently
                 # treating it as "n" and continuing to chug.
             stripped = (reply or "").strip()
             lowered = stripped.lower()
-            if lowered in ("y", "yes"):
-                return True
-            if lowered in ("", "n", "no"):
-                return False
-            # Anything else is treated as a decline with free-text feedback
-            # the agent can use to revise its plan.
-            if tool.name == "plan_task":
-                return ("feedback", stripped)
-            return False
+            return lowered in ("y", "yes")
 
  
         if args.message:
             # -m is a one-shot ("send one message, print result, exit"). Only
             # wire the interactive approval prompt when stdin is a real TTY —
-            # otherwise (piped/CI/non-TTY) a plan-mode plan_task would block
-            # forever on an approval prompt that can never be answered. Non-TTY
-            # falls back to auto-approve, matching the stdin-pipe branch below.
+            # otherwise (piped/CI/non-TTY) a shell approval would block forever
+            # on a prompt that can never be answered. Non-TTY falls back to
+            # auto-approve, matching the stdin-pipe branch below.
             interactive = sys.stdin.isatty()
             await _run_one(
                 cfg, client, display,
@@ -395,86 +373,6 @@ async def _run_direct_command(cmd: str, timeout: float = 120.0) -> int:
     return proc.returncode if proc.returncode is not None else 1
 
 
-async def _show_exit_plan(cfg: Config, display: Display, plan: dict | None) -> None:
-    """Show the active plan and offer to switch into edits mode."""
-    if cfg.permission_mode != "plan":
-        display.warn("/exit-plan only works in plan mode")
-        return
-    if not plan:
-        display.info("no active plan — ask the agent to produce one first")
-        return
-
-    display.plan_panel(plan)
-    await _prompt_switch_to_edits(
-        cfg,
-        display,
-        prompt_text="  Switch to edits mode and execute the plan? [Y/n] ",
-        success_text="[bold green]✓ Switched to edits mode[/]",
-    )
-
-
-async def _prompt_switch_to_edits(
-    cfg: Config,
-    display: Display,
-    *,
-    prompt_text: str,
-    success_text: str,
-) -> None:
-    # Use prompt_toolkit instead of asyncio.to_thread(input) so Ctrl+C
-    # raises cleanly without leaving an orphan input thread blocked on
-    # stdin (which freezes the terminal).
-    session: PromptSession[str] = PromptSession()
-    try:
-        reply = await session.prompt_async(prompt_text)
-    except (EOFError, KeyboardInterrupt):
-        display.info("Cancelled.")
-        return
-    if (reply or "").strip().lower() in ("", "y", "yes"):
-        cfg.permission_mode = "edits"
-        display.set_mode("edits")
-        display.info(success_text)
-    else:
-        display.info("Staying in plan mode.")
-
-
-async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeout: float | None) -> None:
-    """If a plan was just approved BY A HUMAN, switch to edits mode and execute it.
-
-    Without a human in the loop (pipe / non-TTY ``-m``) the plan is
-    auto-approved, so auto-switching plan→edits would silently escalate a
-    read-only run into one that writes files and runs commands — with nobody
-    having reviewed the plan. In that case we stop after planning and tell the
-    user how to execute deliberately.
-    """
-    plan = agent.tool_ctx.plan
-    if not (
-        cfg.permission_mode == "plan"
-        and plan is not None
-        and plan.approved
-        and not agent.tool_ctx.plan_switch_prompted
-    ):
-        return
-    if agent.prompt_fn is None:
-        agent.tool_ctx.plan_switch_prompted = True
-        display.info(
-            "plan ready — not executing automatically because nothing was "
-            "approved interactively. Re-run with --edits or --yolo to execute it."
-        )
-        return
-    agent.tool_ctx.plan_switch_prompted = True
-    cfg.permission_mode = "edits"
-    display.set_mode("edits")
-    display.info("[bold green]✓ Switched to edits mode[/]")
-    try:
-        await agent.run(EXECUTE_APPROVED_PLAN_PROMPT, timeout=timeout)
-    except AgentTimeout as e:
-        display.error(str(e))
-    except AgentCancelled:
-        display.warn("cancelled")
-    except LLMError as e:
-        display.error(f"LLM error: {e}")
-
-
 def _create_session_for_agent(
     cfg: Config, model_name: str, display: Display | None = None,
 ) -> str | None:
@@ -504,9 +402,6 @@ def _create_session_for_agent(
 
 
 async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycler=None):  # type: ignore[no-untyped-def]
-    # One-shot invocations should not pick up a leftover plan from a previous
-    # interactive run.
-    clear_plan(cfg.working_dir)
     session_id = _create_session_for_agent(cfg, cfg.model, display)
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
     cycler = mode_cycler or _NullModeCycler()
@@ -532,13 +427,6 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycle
         display.error(f"LLM error: {e}")
         return
 
-    try:
-        async with cycler:
-            await _auto_execute_plan(agent, cfg, display, timeout)
-    except (AgentCancelled, KeyboardInterrupt):
-        display.flush_streaming_text()
-        display.warn("cancelled")
-
 
 class _NullModeCycler:
     """No-op stand-in used when the mode cycler isn't available
@@ -559,7 +447,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     def _cycle(event):  # type: ignore[no-untyped-def]
         new_mode = cfg.cycle_mode()
         # Print the change so the user sees it inline — silently swapping
-        # plan→edits while a tool is queued is the easiest way to give
+        # edits→yolo while a tool is queued is the easiest way to give
         # the agent unintended write permissions. ``mode_changed`` calls
         # ``set_mode`` internally so we don't double-set.
         display.mode_changed(new_mode)
@@ -594,8 +482,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             display.info("starting a fresh session instead.")
             resume_id = None
     if current_agent is None:
-        # Fresh interactive session — never inherit a plan from a previous run.
-        clear_plan(cfg.working_dir)
         session_id = _create_session_for_agent(cfg, display.model or cfg.model, display)
         current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
         if session_id:
@@ -638,10 +524,8 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         if line == "/help":
             display.info(
                 "  /help                     — show this help\n"
-                "  /mode <plan|edits|yolo>   — switch permission mode\n"
+                "  /mode <edits|yolo>        — switch permission mode\n"
                 "  /status                   — show current config\n"
-                "  /plan                     — show active plan progress\n"
-                "  /exit-plan                — exit plan mode with detailed plan\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
                 "  /init [--no-summaries]    — build/refresh repo index\n"
                 "  /mcp [list|reload|add|remove] — manage MCP servers\n"
@@ -660,10 +544,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
-            # Drop any persisted plan so the next agent starts fresh —
-            # otherwise __post_init__ will silently reload the prior plan
-            # and the user sees "[plan] restored …" right after /clear.
-            clear_plan(cfg.working_dir)
             # Rebuild agent with fresh conversation history and new session.
             session_id = _create_session_for_agent(cfg, display.model or cfg.model, display)
             current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
@@ -675,18 +555,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             continue
         if line == "/status":
             display.status(cfg.permission_mode)
-            continue
-        if line == "/plan":
-            # Show active plan progress
-            plan = current_agent.tool_ctx.plan
-            if plan:
-                display.plan_panel(plan.to_dict())
-            else:
-                display.info("no active plan")
-            continue
-        if line == "/exit-plan":
-            plan = current_agent.tool_ctx.plan
-            await _show_exit_plan(cfg, display, plan.to_dict() if plan else None)
             continue
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")
@@ -703,12 +571,12 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         if line.startswith("/mode"):
             _, _, rest = line.partition(" ")
             rest = rest.strip()
-            if rest in ("plan", "edits", "yolo"):
+            if rest in ("edits", "yolo"):
                 cfg.permission_mode = rest
                 display.set_mode(rest)
                 display.info(f"mode → {rest}")
             else:
-                display.warn("usage: /mode plan|edits|yolo")
+                display.warn("usage: /mode edits|yolo")
             continue
         if line.startswith("/mcp"):
             _, _, mcp_rest = line.partition(" ")
@@ -806,13 +674,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         except LLMError as e:
             display.error(f"LLM error: {e}")
             continue
-
-        try:
-            async with cycler:
-                await _auto_execute_plan(current_agent, cfg, display, timeout)
-        except (AgentCancelled, KeyboardInterrupt):
-            display.flush_streaming_text()
-            display.warn("cancelled")
 
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:

@@ -102,10 +102,6 @@ def test_slash_extra_args_no_args():
     assert rest == ""
 
 
-def test_slash_extra_args_with_args():
-    head, rest = cli._slash_extra_args("/mode plan")
-    assert head == "/mode"
-    assert rest == "plan"
 
 
 def test_slash_extra_args_strips_trailing_whitespace():
@@ -122,7 +118,6 @@ def test_slash_extra_args_non_slash_returns_empty():
 
 def test_no_arg_slash_cmds_includes_expected_commands():
     """Sanity check — extra-arg warning fires for the no-arg commands."""
-    expected = {"/clear", "/new", "/status", "/plan", "/help",
-                "/quit", "/exit", "/q", "/session", "/sessions",
-                "/exit-plan"}
+    expected = {"/clear", "/new", "/status", "/help",
+                "/quit", "/exit", "/q", "/session", "/sessions"}
     assert expected <= cli._NO_ARG_SLASH_CMDS

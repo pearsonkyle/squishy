@@ -140,9 +140,8 @@ def build_system_prompt(
     body = "\n\n".join(parts)
     # Tail blocks already start with their own leading "\n" or are empty.
     # MCP tools are NOT listed in prose here: they're already in the tool
-    # schema (with names + descriptions) in edits/yolo, and correctly hidden
-    # from the schema in plan mode — so a prose block would only duplicate them
-    # (wasting context) or advertise tools that are blocked in plan mode.
+    # schema (with names + descriptions), so a prose block would only
+    # duplicate them and waste context.
     return body + index_block + top_files_block + instructions_block
 
 
@@ -158,9 +157,6 @@ def _rules_block(has_idx: bool, profile: str = "standard") -> str:
         if has_idx
         else "- No repo index yet. Use targeted `read_file`/`list_directory`/`search_files` to navigate; suggest `/init` to enable `recall`."
     )
-    plan_line = (
-        "- For non-trivial work call `plan_task` early; after the plan is approved, call `update_plan(step_index=N, status=\"done\")` per step and `finish_plan` once at the end. Don't repeat `update_plan` on the same step."
-    )
     return (
         "## Rules\n"
         "- Read files before editing them.\n"
@@ -170,8 +166,7 @@ def _rules_block(has_idx: bool, profile: str = "standard") -> str:
         "- Don't re-read a file you've already read unless you need a different range.\n"
         "- `@filename` in user input injects that file inline wrapped in `<file>` tags.\n"
         "- When the task is done, reply with a plain-text summary and no tool call.\n"
-        f"{recall_line}\n"
-        f"{plan_line}"
+        f"{recall_line}"
     )
 
 
@@ -280,15 +275,17 @@ def load_agent_instructions(cwd: str) -> str:
 def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
     """Per-mode rules.
 
-    Each block is the *delta* on top of `## Rules` — anything already
-    in the core ruleset (recall, planning, update_plan, etc.) is not
-    repeated. Workflow examples and JSON shape blocks were dropped
-    because the tool schemas already document them.
+    Each block is the *delta* on top of `## Rules` — anything already in the
+    core ruleset is not repeated. Workflow examples and JSON shape blocks were
+    dropped because the tool schemas already document them.
+
+    The bench block is now the same short task framing for every profile. It
+    used to narrate a five-phase state machine to the model; that machine is
+    gone, and describing it cost ~250 tokens on every single request.
     """
     if profile in ("minimal", "shell"):
-        # The standard bench block narrates the phase machine, which the
-        # minimal profile doesn't run, and names tools it doesn't expose.
-        # What's left is only the task framing that actually moves patch rate.
+        # Narrow profiles don't expose save_note, so the bench framing below
+        # would name a tool they can't call.
         if mode == "bench":
             return (
                 "## Task\n"
@@ -301,47 +298,27 @@ def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
                 "file. Ending with no edit is a failed run."
             )
         return ""
-    if mode == "plan":
-        return (
-            "## Mode: plan (read-only)\n"
-            "- For any task that touches files, call `plan_task` first; don't write prose before the plan is approved.\n"
-            "- Skip `plan_task` only for trivial reads (e.g. one file, no edits).\n"
-            "- Aim for `plan_task` within 2-3 turns: recall → 1-2 targeted reads → plan.\n"
-            "- Prefer the dedicated tools (`list_directory`, `read_file`, `search_files`, `glob_files`) — they always work. `run_command` accepts a small read-only allowlist (linters, `git` reads, `pytest --collect-only`, common inspection binaries); the dispatcher lists the exact set if you guess wrong.\n"
-            "- The shell already runs in the project root — don't prefix commands with `cd /abs/path && …` (use a relative path or pass `cwd`). `python -c \"…\"` and other arbitrary scripts are rejected; use the dedicated read tools instead.\n"
-            "- After approval the user switches you into edits mode to execute the plan."
-        )
     if mode == "bench":
         return (
-            "## Mode: bench (phase-gated)\n"
-            "- Tools are managed by phase. You progress through phases automatically:\n"
-            "  1. **explore** — read-only tools + run_command. Use `recall` to search the index, "
-            "read relevant files, run the failing tests to see the error.\n"
-            "  2. **plan** — only `plan_task`, `save_note`, `recall`. Call `plan_task` with your fix strategy.\n"
-            "  3. **execute** — editing tools available. Read the target file, apply your fix with `edit_file`, "
-            "then run tests. Call `update_plan` after completing each step.\n"
-            "  4. **verify** — check test results. If tests pass, call `finish_plan`. "
-            "If tests fail, you return to execute.\n"
-            "  5. **done** — the agent finishes automatically.\n"
-            "- Phase transitions happen automatically based on your actions.\n"
-            "- Do NOT create reproduction scripts or new test files. Run the LISTED failing tests.\n"
-            "- Do NOT fix import/environment errors — they are NOT the bug.\n"
-            "- Fix the SOURCE code, not the tests.\n"
-            "- If the listed failing tests are not found, study the problem statement for expected behavior.\n"
-            "- Pay close attention to function signatures, argument order, and types.\n"
+            "## Task\n"
+            "- Change the SOURCE code that implements the behavior. Editing "
+            "tests is never a fix.\n"
+            "- Don't write reproduction scripts or new test files; run the "
+            "failing tests you were given.\n"
+            "- Import and environment errors are not the bug — don't chase them.\n"
             "- Use `save_note` for key findings so they survive context compaction.\n"
-            "- After editing, run the specific test that exercises the bug. `show_diff` before finishing."
+            "- Do not stop until you have actually edited a non-test source "
+            "file. Ending with no edit is a failed run."
         )
     if mode == "yolo":
         return (
             "## Mode: yolo\n"
-            "- All tools available, no approval prompts — be careful with destructive commands.\n"
-            "- For non-trivial work follow the plan-then-execute loop from `## Rules` (plan_task → update_plan per step → finish_plan)."
+            "- All tools available, no approval prompts — be careful with "
+            "destructive commands."
         )
     return (
         "## Mode: edits\n"
-        "- `run_command` requires per-call user approval.\n"
-        "- If a plan was approved, follow it (see `## Rules` for the update_plan / finish_plan flow)."
+        "- `run_command` requires per-call user approval."
     )
 
 

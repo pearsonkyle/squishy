@@ -284,33 +284,10 @@ def test_system_prompt_softer_recall_rule_when_no_index(tmp_path):
     assert "/init" in prompt
 
 
-def test_system_prompt_no_duplicated_planning_block(tmp_path):
-    """`## Planning` used to repeat what mode blocks already cover —
-    the planning rule now lives once inside `## Rules`."""
-    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
-    assert "## Planning" not in prompt
-    # The planning rule should appear exactly once (it's in `## Rules`).
-    assert prompt.count("update_plan(step_index=N") <= 1
 
 
-def test_system_prompt_drops_json_shape_example(tmp_path):
-    """The plan_task tool schema documents the JSON shape — repeating it
-    here just bloats the prompt."""
-    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
-    assert '```json' not in prompt
-    assert '"files_to_modify"' not in prompt
-    assert '"files_to_create"' not in prompt
 
 
-def test_system_prompt_drops_shell_allowlist_enumeration(tmp_path):
-    """The runtime error already enumerates the allowlist when the model
-    guesses wrong, so don't burn tokens spelling it all out in prose.
-    A short hint is fine; a full enumeration is not."""
-    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
-    # The block used to list every binary explicitly: ls, cat, head, tail,
-    # wc, grep, rg, find, pwd, which, file, stat, tree, ruff check, mypy,
-    # pyright, git status/log/diff/show/branch/blame/ls-files, …
-    assert "stat" not in prompt or "tree" not in prompt or "blame" not in prompt
 
 
 def test_system_prompt_top_files_dropped_when_index_present(tmp_path):

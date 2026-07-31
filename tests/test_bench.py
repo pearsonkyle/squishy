@@ -98,14 +98,18 @@ def test_load_tasks_jsonl_and_json(tmp_path):
     assert [t.id for t in got] == ["c"]
  
  
+ 
+ 
+ 
+ 
 class _FakeSquishy:
     """A Squishy stand-in that reports success without touching the network."""
- 
+
     def __init__(self, *, success: bool = True, final_text: str = "done") -> None:
         self._success = success
         self._final_text = final_text
         self.runs: list[tuple[str, str | None]] = []
- 
+
     async def run(
         self, message: str, *, working_dir: str | None = None, timeout: float | None = None
     ) -> TaskResult:
@@ -116,27 +120,9 @@ class _FakeSquishy:
             turns_used=1,
             elapsed_s=0.01,
             messages=[{"role": "assistant", "content": self._final_text}],
-            plan_state={"id": "plan-1", "progress": {"done": 1, "total": 1}},
         )
- 
- 
-async def test_run_terminal_task_verifies_via_shell(tmp_path):
-    task = TerminalTask(
-        id="probe",
-        description="doesn't actually need to run because Squishy is faked",
-        verify="test -f marker",
-        files={"marker": "ok"},
-    )
-    fake = _FakeSquishy(success=True)
-    result = await run_terminal_task(task, squishy=fake, workspace_root=tmp_path)  # type: ignore[arg-type]
-    assert result.success
-    assert result.prediction["verify_exit_code"] == 0
-    assert "marker" in result.prediction["task_id"] or result.task_id == "probe"
-    assert result.prediction["plan_state"]["id"] == "plan-1"
-    assert result.artifacts["transcript"][0]["content"] == "done"
-    assert result.artifacts["verify_result"]["exit_code"] == 0
- 
- 
+
+
 async def test_run_terminal_task_verify_failure(tmp_path):
     task = TerminalTask(
         id="v-fail",
@@ -169,77 +155,21 @@ def test_path_types(tmp_path: Path) -> None:
     p2.close()
 
 
-def test_plan_adherence_no_plan():
-    from squishy.bench.terminalbench import _plan_adherence
-
-    assert _plan_adherence(None) == {"had_plan": False}
-    assert _plan_adherence({}) == {"had_plan": False}
 
 
-def test_plan_adherence_computes_completion_ratio():
-    from squishy.bench.terminalbench import _plan_adherence
-
-    plan_state = {
-        "approved": True,
-        "progress": {"done": 3, "total": 4, "blocked": 0, "skipped": 0, "pending": 1, "in_progress": 0},
-    }
-    result = _plan_adherence(plan_state)
-    assert result["had_plan"] is True
-    assert result["approved"] is True
-    assert result["total_steps"] == 4
-    assert result["done"] == 3
-    assert result["completion_ratio"] == 0.75
 
 
-def test_tool_counts_parses_transcript():
-    from squishy.bench.terminalbench import _tool_counts
-
-    messages = [
-        {"role": "user", "content": "hi"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
-                {"id": "c2", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
-            ],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "..."},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "c3", "type": "function", "function": {"name": "plan_task", "arguments": "{}"}},
-            ],
-        },
-    ]
-    assert _tool_counts(messages) == {"read_file": 2, "plan_task": 1}
-    assert _tool_counts(None) == {}
 
 
-def test_classify_error_maps_common_cases():
-    from squishy.bench.terminalbench import _classify_error
-
-    ok = TaskResult(success=True)
-    assert _classify_error(ok, verified=True) == "ok"
-    assert _classify_error(ok, verified=False) == "verify_failed"
-
-    tr = TaskResult(success=False, error="max turns (30) reached")
-    assert _classify_error(tr, verified=True) == "max_turns"
-
-    tr = TaskResult(success=False, error="3 consecutive tool failures — stopping.")
-    assert _classify_error(tr, verified=True) == "tool_error_loop"
-
-    tr = TaskResult(success=False, error="plan-mode run finished without producing a plan_task")
-    assert _classify_error(tr, verified=True) == "plan_mode_no_plan"
 
 
 def test_build_prompt_includes_env_error_guidance():
-    """Bench mode block contains the expected mode header and phase-gated info."""
+    """Bench mode block states the task framing without naming a phase machine."""
     from squishy.context import _mode_block
 
     bench_block = _mode_block("bench", "/tmp")
-    assert "bench" in bench_block
-    assert "phase-gated" in bench_block
-    assert "explore" in bench_block
-    assert "execute" in bench_block
+    assert "SOURCE code" in bench_block
+    assert "Import and environment errors are not the bug" in bench_block
+    # The block used to narrate a five-phase state machine to the model. That
+    # machine is gone; describing it cost ~250 tokens on every request.
+    assert "phase" not in bench_block

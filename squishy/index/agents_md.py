@@ -312,14 +312,11 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
                 lines.append(", ".join(name for name, _ in deps))
                 lines.append("")
 
-    # Planning workflow — minimal markup, no nested bold.
-    lines.append("## Planning workflow")
-    lines.append("")
-    lines.append("In plan mode:")
+    # Navigation workflow — minimal markup, no nested bold.
+    lines.append("## Navigation")
     lines.append("")
     lines.append("1. recall(query=...) first — use the index to find relevant files")
     lines.append("2. 1-2 targeted reads to understand the problem")
-    lines.append("3. plan_task(problem=..., solution=..., steps=[...])")
     lines.append("")
     lines.append(
         "Prefer recall(query=...) to locate code fast. If the index misses or "

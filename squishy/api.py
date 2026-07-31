@@ -96,7 +96,7 @@ class Squishy:
     max_turns: int = 30
     permission_mode: PermissionMode = "yolo"
     # "standard" = every tool the mode allows; "minimal" = shell + file
-    # primitives only, and no phase machine. See squishy.tool_restrictions.
+    # primitives; "shell" = run_command alone. See squishy.tool_restrictions.
     tool_profile: str = "standard"
     request_timeout: float = 120.0
     max_retries: int = 8
@@ -104,24 +104,13 @@ class Squishy:
     sandbox_image: str = "python:3.11-slim"
     thinking: bool = False
     max_consecutive_errors: int = 8
-    max_plan_nudges: int = 4
-    max_plan_investigation_turns: int = 4
-    max_recall_skip_turns: int = 2
     max_history_messages: int = 10
     # 0 = auto-detect from the endpoint, falling back to assumed_context_window
     # (many local servers don't advertise context_length).
     context_window: int = 0
     assumed_context_window: int = 32_768
-    max_quality_retries: int = 3
     compaction_threshold: float = 0.7
-    max_explore_turns: int = 8
     max_turns_without_edit: int = 12
-    max_plan_turns: int = 3
-    max_fix_verify_cycles: int = 6
-    # v2 auto-pytest finish gate (bench mode only).
-    max_auto_pytest_runs: int = 2
-    # v5 pre-finish F2P partial-pass gate (bench mode only).
-    max_finish_gate_intercepts: int = 2
     max_tool_output_chars: int = 32_000
     auto_init: bool = False
     # Indexing knobs (latent — Config supports these but they were not
@@ -189,7 +178,7 @@ class Squishy:
         Both may be sync or async callables.
 
         ``permission_mode`` overrides the facade's mode for this run only
-        (e.g. run one task in ``"plan"`` and the next in ``"yolo"`` off one
+        (e.g. run one task in ``"edits"`` and the next in ``"yolo"`` off one
         ``Squishy``). ``notes`` pre-populates ``ToolContext.notes`` — bench
         harnesses thread eval metadata (FAIL_TO_PASS, install status) through
         without polluting the prompt.

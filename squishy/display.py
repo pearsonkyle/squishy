@@ -13,7 +13,6 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from squishy.plan_state import STATUS_ICONS
 
 # Re-exported so existing `from squishy.display import estimate_tokens`
 # imports keep working; the implementation now lives in squishy.tokens.
@@ -357,90 +356,6 @@ class Display:
     def error(self, s: str) -> None:
         self.console.print(f"[red]✗ {s}[/]")
 
-    def plan_panel(self, data: dict) -> None:
-        """Render a structured plan in a Rich panel.
-
-        All free-text fields here (plan/problem/solution/step
-        descriptions, file paths) come from the LLM or user input and
-        may contain ``[`` characters that Rich would otherwise treat as
-        broken markup.  Escape every interpolation that isn't a literal
-        style tag.
-        """
-        lines: list[str] = []
-
-        if data.get("plan"):
-            lines.append(f"[bold]{rich_escape(str(data['plan']))}[/]")
-            lines.append("")
-
-        lines.append(f"[bold red]Problem:[/]  {rich_escape(str(data.get('problem', '')))}")
-        lines.append(f"[bold green]Solution:[/] {rich_escape(str(data.get('solution', '')))}")
-        lines.append("")
-        lines.append("[bold yellow]Steps:[/]")
-        for i, step in enumerate(data.get("steps", []), 1):
-            desc = step if isinstance(step, str) else step.get("description", "")
-            status = "" if isinstance(step, str) else step.get("status", "pending")
-            raw_icon = STATUS_ICONS.get(status, "○")
-            color = {"done": "green", "in-progress": "cyan", "skipped": "dim", "blocked": "red"}.get(status, "dim")
-            status_icon = f"[{color}]{raw_icon}[/{color}]"
-            lines.append(f"  {status_icon} {i}. {rich_escape(str(desc))}")
-
-        if data.get("files_to_create"):
-            lines.append("")
-            lines.append("[bold blue]Create:[/]")
-            for f in data["files_to_create"]:
-                lines.append(f"  [green]+[/] {rich_escape(str(f))}")
-
-        if data.get("files_to_modify"):
-            lines.append("")
-            lines.append("[bold blue]Modify:[/]")
-            for f in data["files_to_modify"]:
-                lines.append(f"  [yellow]~[/] {rich_escape(str(f))}")
-
-        self.console.print(Panel("\n".join(lines), title="📋 Plan", border_style="cyan"))
-
-    def plan_progress(self, steps: list[dict]) -> None:
-        """Show a compact progress line for the active plan.
-
-        The count breakdown matches the bar so a user looking at
-        ``▓▓░░…`` doesn't see ``0/7 resolved`` alongside it. We list
-        whichever non-zero buckets exist (done / in-progress / blocked
-        / skipped) plus the unresolved-pending tail.
-        """
-        total = len(steps)
-        done = sum(1 for s in steps if s.get("status") == "done")
-        skipped = sum(1 for s in steps if s.get("status") == "skipped")
-        in_prog = sum(1 for s in steps if s.get("status") == "in-progress")
-        blocked = sum(1 for s in steps if s.get("status") == "blocked")
-        pending = max(0, total - done - skipped - in_prog - blocked)
-        if total:
-            bar_done = int(20 * done / total)
-            bar_skip = int(20 * skipped / total)
-            bar_active = int(20 * in_prog / total)
-            bar_block = int(20 * blocked / total)
-        else:
-            bar_done = bar_skip = bar_active = bar_block = 0
-        bar_empty = max(0, 20 - bar_done - bar_skip - bar_active - bar_block)
-        bar = (
-            "[green]█[/]" * bar_done
-            + "[cyan]▓[/]" * bar_active
-            + "[red]▓[/]" * bar_block
-            + "[dim]▒[/]" * bar_skip
-            + "[dim]░[/]" * bar_empty
-        )
-        bits: list[str] = []
-        if done:
-            bits.append(f"[green]{done} done[/]")
-        if in_prog:
-            bits.append(f"[cyan]{in_prog} in-progress[/]")
-        if blocked:
-            bits.append(f"[red]{blocked} blocked[/]")
-        if skipped:
-            bits.append(f"[dim]{skipped} skipped[/]")
-        if pending:
-            bits.append(f"[dim]{pending} pending[/]")
-        breakdown = " · ".join(bits) if bits else f"{total} pending"
-        self.console.print(f"  plan: {bar}  {breakdown}  ({total} total)")
- 
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats
         cw = s.context_window
