@@ -268,18 +268,25 @@ def recall_from_index(
 recall = Tool(
     name="recall",
     description=(
-        "Search the repo index for relevant files/symbols before reading. Returns "
-        "ranked path, kind, line range, and summary. Requires /init; if it misses, "
-        "fall back to search_files/read_file."
+        "Find where something lives in this repo by searching a prebuilt index "
+        "of files and symbols. Returns ranked paths with line ranges and "
+        "summaries — use it to locate code before reading files. If it returns "
+        "nothing useful, fall back to reading and searching directly."
     ),
     parameters={
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Natural-language phrase or symbol name",
+                "description": (
+                    "What you are looking for: a symbol name, or a phrase "
+                    "describing the behavior, e.g. 'parses unary operators'."
+                ),
             },
-            "limit": {"type": "integer", "default": DEFAULT_LIMIT},
+            "limit": {
+                "type": "integer", "default": DEFAULT_LIMIT,
+                "description": "Maximum number of results to return.",
+            },
             "token_budget": {
                 "type": "integer",
                 "default": DEFAULT_TOKEN_BUDGET,

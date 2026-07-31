@@ -92,7 +92,10 @@ save_note = Tool(
         "type": "object",
         "properties": {
             "key": {"type": "string", "description": "Short label, e.g. 'root_cause'"},
-            "content": {"type": "string"},
+            "content": {
+                "type": "string",
+                "description": "The note itself — keep it short; it is re-sent every turn.",
+            },
         },
         "required": ["key", "content"],
     },

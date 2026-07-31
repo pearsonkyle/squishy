@@ -227,15 +227,27 @@ plan_task = Tool(
         "type": "object",
         "properties": {
             "plan": {"type": "string", "description": "Short title"},
-            "problem": {"type": "string"},
-            "solution": {"type": "string"},
+            "problem": {
+                "type": "string",
+                "description": "What is actually wrong, in one or two sentences.",
+            },
+            "solution": {
+                "type": "string",
+                "description": "How you intend to fix it.",
+            },
             "steps": {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Ordered, concrete steps",
             },
-            "files_to_create": {"type": "array", "items": {"type": "string"}},
-            "files_to_modify": {"type": "array", "items": {"type": "string"}},
+            "files_to_create": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Paths of files this plan will create. Omit if none.",
+            },
+            "files_to_modify": {
+                "type": "array", "items": {"type": "string"},
+                "description": "Paths of existing files this plan will change.",
+            },
         },
         "required": ["problem", "solution", "steps"],
     },
@@ -255,6 +267,10 @@ update_plan = Tool(
             "status": {
                 "type": "string",
                 "enum": ["done", "in-progress", "skipped", "blocked"],
+                "description": (
+                    "New state for this step. Use 'done' when it is finished, "
+                    "'blocked' with a note explaining what stopped you."
+                ),
             },
             "note": {"type": "string", "description": "Optional rationale (required if blocked)"},
             "add_steps": {
@@ -355,9 +371,16 @@ finish_plan = Tool(
             "status": {
                 "type": "string",
                 "enum": ["done", "skipped"],
+                "description": (
+                    "Only 'done' or 'skipped' are accepted here — a partially "
+                    "finished plan is still 'done' if you are stopping."
+                ),
                 "description": "Applied to all unresolved steps (default done)",
             },
-            "summary": {"type": "string"},
+            "summary": {
+                "type": "string",
+                "description": "Short account of what you changed and why.",
+            },
         },
         "required": [],
     },

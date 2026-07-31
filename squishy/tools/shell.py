@@ -316,14 +316,29 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
 run_command = Tool(
     name="run_command",
-    description="Run a shell command and capture stdout/stderr/exit code. "
-                "Sandboxed in Docker when available.",
+    description=(
+        "Run a shell command and return its stdout, stderr, and exit code. "
+        "Use it to run tests, inspect the tree, and search — it covers "
+        "anything without a dedicated tool."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "command": {"type": "string"},
-            "timeout": {"type": "integer", "default": DEFAULT_TIMEOUT},
-            "cwd": {"type": "string"},
+            "command": {
+                "type": "string",
+                "description": (
+                    "Command to run. Already executes in the working directory, "
+                    "so no leading `cd` is needed."
+                ),
+            },
+            "timeout": {
+                "type": "integer", "default": DEFAULT_TIMEOUT,
+                "description": "Seconds to allow before the command is killed.",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Subdirectory to run in, relative to the working directory.",
+            },
         },
         "required": ["command"],
     },

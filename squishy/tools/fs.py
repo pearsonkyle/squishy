@@ -1021,14 +1021,26 @@ def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_
 
 read_file = Tool(
     name="read_file",
-    description="Read a file from disk. Returns its content and line count. "
-                "Use offset/limit to page through large files.",
+    description=(
+        "Read a file and return its contents with a line count. "
+        "Repeating the identical read is refused — page through a large file "
+        "with offset/limit instead."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Relative or absolute path"},
-            "offset": {"type": "integer", "description": "Line offset (0-based)", "default": 0},
-            "limit": {"type": "integer", "description": "Max lines to return"},
+            "path": {
+                "type": "string",
+                "description": "Path relative to the working directory, e.g. 'src/app.py'.",
+            },
+            "offset": {
+                "type": "integer", "default": 0,
+                "description": "First line to return, 0-based.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to return. Omit to read to the end.",
+            },
         },
         "required": ["path"],
     },
@@ -1037,12 +1049,21 @@ read_file = Tool(
  
 write_file = Tool(
     name="write_file",
-    description="Create a new file. Refuses if the file already exists — use edit_file for existing files.",
+    description=(
+        "Create a NEW file. Refused if the path already exists — use edit_file "
+        "to change an existing file."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string", "description": "Full file content"},
+            "path": {
+                "type": "string",
+                "description": "Path for the new file, relative to the working directory.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete contents of the file.",
+            },
         },
         "required": ["path", "content"],
     },
@@ -1051,15 +1072,33 @@ write_file = Tool(
  
 edit_file = Tool(
     name="edit_file",
-    description="Replace a unique substring in a file. Use for targeted changes in existing files. "
-                "Set replace_all=true to replace every occurrence.",
+    description=(
+        "Change an existing file by replacing an exact snippet of its text. "
+        "This is the way to modify code."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "old_str": {"type": "string", "description": "Exact text to find (must be unique unless replace_all=true)"},
-            "new_str": {"type": "string", "description": "Replacement text"},
-            "replace_all": {"type": "boolean", "default": False},
+            "path": {
+                "type": "string",
+                "description": "Path relative to the working directory.",
+            },
+            "old_str": {
+                "type": "string",
+                "description": (
+                    "Text to replace, copied verbatim from the file including "
+                    "indentation. Must appear exactly once unless replace_all "
+                    "is true; add surrounding lines to make it unique."
+                ),
+            },
+            "new_str": {
+                "type": "string",
+                "description": "Text to put in its place. Use \"\" to delete.",
+            },
+            "replace_all": {
+                "type": "boolean", "default": False,
+                "description": "Replace every occurrence instead of requiring a unique match.",
+            },
         },
         "required": ["path", "old_str", "new_str"],
     },
@@ -1072,7 +1111,10 @@ list_directory = Tool(
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "default": "."},
+            "path": {
+                "type": "string", "default": ".",
+                "description": "Directory to list, relative to the working directory.",
+            },
             "show_hidden": {
                 "type": "boolean",
                 "default": False,
@@ -1090,7 +1132,10 @@ search_files = Tool(
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Regex"},
-            "path": {"type": "string", "default": "."},
+            "path": {
+                "type": "string", "default": ".",
+                "description": "Directory or file to search under, relative to the working directory.",
+            },
             "glob": {"type": "string", "description": "Optional filename glob (e.g. '*.py')"},
         },
         "required": ["pattern"],
