@@ -55,6 +55,12 @@ you have actually edited a non-test source file — a run that ends with no edit
 is scored as a failure. When the fix is in place, give a short summary.
 """
 
+EMPTY_PATCH_NUDGE = """STOP — you have not edited any file, so there is nothing
+to grade. You said you understand the bug; now act on it. Edit the responsible
+non-test source file now. Do not stop again until a file has actually been
+modified."""
+
+
 # The evaluation target, stated where the model cannot miss it.
 #
 # These identifiers were already reaching the model — as raw JSON under a
