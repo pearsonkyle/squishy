@@ -6,10 +6,12 @@ was also `vyper/`, so the model asked for `vyper/vyper/ast/natspec.py`. A bare
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from squishy.tools import dispatch
-from squishy.tools.fs import _path_candidates
+from squishy.tools.fs import _not_found_error, _path_candidates
 
 
 @pytest.fixture
@@ -103,3 +105,38 @@ async def test_write_file_still_creates_genuinely_new_files(ctx, repo):
     }, ctx)
     assert res.success, res.error
     assert (repo / "vyper" / "ast" / "brand_new.py").read_text() == "x = 1\n"
+
+
+def test_module_split_into_package_is_named(tmp_path):
+    """`foo.py` that is really `foo/` must say so, and list the modules.
+
+    Observed live on wtforms-614: a model asked for `src/wtforms/widgets.py`
+    four times across two arms, each time getting a bare "file not found"
+    while `src/wtforms/widgets/` sat right beside it. The module list is the
+    answer it needed, and it costs one listdir.
+    """
+    pkg = tmp_path / "src" / "wtforms" / "widgets"
+    pkg.mkdir(parents=True)
+    for name in ("__init__.py", "core.py", "html5.py"):
+        (pkg / name).write_text("x")
+
+    err = _not_found_error(
+        "src/wtforms/widgets.py", str(tmp_path),
+        str(tmp_path / "src/wtforms/widgets.py"),
+    )
+    assert "package directory" in err
+    assert "core.py" in err and "html5.py" in err
+
+    # Same when the model roots the path at the repo directory name.
+    root = os.path.basename(os.path.realpath(str(tmp_path)))
+    rooted = f"/{root}/src/wtforms/widgets.py"
+    err2 = _not_found_error(rooted, str(tmp_path), str(tmp_path / "x"))
+    assert "package directory" in err2
+
+
+def test_genuinely_missing_file_does_not_claim_a_package(tmp_path):
+    (tmp_path / "src").mkdir()
+    err = _not_found_error(
+        "src/nope.py", str(tmp_path), str(tmp_path / "src/nope.py"),
+    )
+    assert "package directory" not in err

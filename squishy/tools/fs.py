@@ -140,8 +140,60 @@ def _not_found_error(path: str, cwd: str, abs_path: str) -> str:
     if candidates:
         return (f"file not found: {path}. Did you mean: "
                 f"{', '.join(candidates)}?")
+    # `foo.py` that is really the package `foo/`. Common where a module was
+    # split into a package: observed live, a model asked for
+    # `src/wtforms/widgets.py` four times across two arms, each time getting a
+    # bare "file not found" while `src/wtforms/widgets/` sat right there. The
+    # module list is the actual answer, so return it rather than the generic
+    # "paths are relative to..." boilerplate.
+    pkg = _package_for_module(path, cwd)
+    if pkg is not None:
+        pkg_path, modules = pkg
+        listing = f" It contains: {', '.join(modules)}." if modules else ""
+        return (f"file not found: {path}, but `{pkg_path}` is a package "
+                f"directory — that module was split into a package.{listing}")
     return (f"file not found: {path}. Paths are relative to the working "
             f"directory ({cwd}) — don't prefix them with the repo name.")
+
+
+def _package_for_module(path: str, cwd: str) -> tuple[str, list[str]] | None:
+    """If ``path`` looks like ``foo.py`` and ``foo/`` is a directory, return
+    ``(foo/, [its module files])``. Otherwise None.
+
+    Applies the same leading-component repairs as :func:`_path_candidates`, so
+    ``/wtforms/src/wtforms/widgets.py`` resolves against ``src/wtforms/widgets/``
+    even though the model rooted it at the repo name.
+    """
+    base, ext = os.path.splitext(path)
+    if not ext or not base:
+        return None
+
+    root = os.path.basename(os.path.realpath(cwd))
+    parts = [p for p in base.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts:
+        return None
+
+    rels: list[str] = ["/".join(parts)]
+    if parts[0] == root:
+        rels.append("/".join(parts[1:]))
+    if os.path.isabs(base):
+        rels.extend("/".join(parts[i:]) for i in range(1, len(parts)))
+
+    for rel in rels:
+        rel = rel.strip("/")
+        if not rel:
+            continue
+        cand = os.path.join(cwd, rel)
+        if os.path.isdir(cand):
+            try:
+                names = sorted(
+                    n for n in os.listdir(cand)
+                    if n.endswith(ext) and not n.startswith(".")
+                )[:20]
+            except OSError:
+                names = []
+            return rel, names
+    return None
 
 
 def _not_a_dir_error(path: str, cwd: str, abs_path: str) -> str:
