@@ -144,6 +144,33 @@ def _not_found_error(path: str, cwd: str, abs_path: str) -> str:
             f"directory ({cwd}) — don't prefix them with the repo name.")
 
 
+def _not_a_dir_error(path: str, cwd: str, abs_path: str) -> str:
+    """A 'not a directory' the model can act on.
+
+    Two real cases from the sweep: the model passed a *file* where a directory
+    was wanted, and it dropped an extension (`src/printer` for
+    `src/printer.ts`). A bare "not a directory" leaves it guessing.
+    """
+    if os.path.isfile(abs_path):
+        return (f"{path} is a file, not a directory. Use `read_file` to read "
+                f"it, or pass its parent directory.")
+    candidates = _path_candidates(path, cwd)
+    if candidates:
+        return (f"not a directory: {path}. These files exist though: "
+                f"{', '.join(candidates)} — use `read_file` for those.")
+    parent = os.path.dirname(path.rstrip("/"))
+    parent_abs = os.path.join(cwd, parent) if parent else cwd
+    if os.path.isdir(parent_abs):
+        try:
+            near = sorted(os.listdir(parent_abs))[:20]
+        except OSError:
+            near = []
+        if near:
+            return (f"not a directory: {path}. {parent or '.'} contains: "
+                    f"{', '.join(near)}")
+    return f"not a directory: {path}. Paths are relative to {cwd}."
+
+
 def _unescape_str(s: str) -> str:
     """Unescape over-escaped characters in model-generated strings.
 
@@ -182,6 +209,21 @@ def _collapse_double_backslash(s: str) -> str:
 # with an explicit caveat.
 _FUZZY_STRONG = 0.85
 _FUZZY_WEAK = 0.6
+
+def _requested_span(offset: int, limit: Any) -> tuple[int, int]:
+    """(start, end) line range for a read. `end` is open-ended without a limit."""
+    start = max(0, int(offset or 0))
+    if isinstance(limit, int) and limit > 0:
+        return start, start + limit
+    return start, 1 << 30
+
+
+def _spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
+
+
+# Overlapping re-reads of the same region tolerated before read_file refuses.
+_MAX_OVERLAPPING_READS = 4
 
 _UNDO_STACK_CAP = 50
 # Identical cached reads tolerated before read_file refuses (1 = the first
@@ -312,17 +354,28 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             display=f"cache hit ({prior['returned_lines']} lines, already read)",
         )
 
-    # Hard cap: refuse after too many reads of the same path.
-    # Exempt files where edit_file just failed — the model needs fresh content
-    # for an accurate old_str.
-    path_count = ctx.files_read_count.get(abs_path, 0)
-    if path_count >= 5 and abs_path not in ctx.edit_fail_files:
+    # Hard cap: refuse circling back over content the model already has.
+    #
+    # Only *overlapping* re-reads count. Every read reaching this point is a
+    # range not served before (exact repeats returned from the cache above), so
+    # counting all of them punished paging through a large file with
+    # offset/limit — which is precisely what read_file's own description tells
+    # the model to do. That made "read_file: refused" the top tool failure in
+    # two consecutive sweeps (106, then 131).
+    #
+    # Files where edit_file just failed are exempt either way: the model needs
+    # fresh content for an accurate old_str.
+    span = _requested_span(offset, limit)
+    prior_spans = ctx.files_read_spans.get(abs_path, [])
+    redundant = sum(1 for s in prior_spans if _spans_overlap(s, span))
+    if redundant >= _MAX_OVERLAPPING_READS and abs_path not in ctx.edit_fail_files:
         return ToolResult(
             False,
             error=(
-                f"Refused: you have already read '{path}' {path_count} times. "
-                "You have the content — use `save_note` to persist key parts if needed, "
-                "then call `edit_file` with your fix. Do NOT read this file again."
+                f"Refused: you have already read these lines of '{path}' "
+                f"{redundant} times. You have the content — call `edit_file` "
+                f"with your fix, or read a different part of the file with "
+                f"offset/limit."
             ),
         )
 
@@ -342,9 +395,12 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         "total_lines": len(lines),
         "returned_lines": len(sliced),
     }
-    # Track total reads per path (regardless of offset/limit).
+    # Track total reads per path (regardless of offset/limit) for the advisory
+    # warning, and the concrete span served for the overlap-based hard cap.
     ctx.files_read_count[abs_path] = ctx.files_read_count.get(abs_path, 0) + 1
     path_reads = ctx.files_read_count[abs_path]
+    served = (span[0], span[0] + len(sliced)) if sliced else span
+    ctx.files_read_spans.setdefault(abs_path, []).append(served)
 
     data: dict[str, Any] = {
         "path": path,
@@ -833,7 +889,7 @@ async def _list_directory(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if err:
         return ToolResult(False, error=err)
     if not os.path.isdir(abs_path):
-        return ToolResult(False, error=f"not a directory: {path}")
+        return ToolResult(False, error=_not_a_dir_error(path, ctx.working_dir, abs_path))
 
     entries = []
     for name in sorted(os.listdir(abs_path)):
@@ -1232,7 +1288,7 @@ async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if err:
         return ToolResult(False, error=err)
     if not os.path.isdir(abs_path):
-        return ToolResult(False, error=f"not a directory: {path}")
+        return ToolResult(False, error=_not_a_dir_error(path, ctx.working_dir, abs_path))
 
     try:
         matches = await asyncio.to_thread(_glob_files_sync, abs_path, pattern)

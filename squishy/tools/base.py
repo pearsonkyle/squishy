@@ -33,6 +33,10 @@ class ToolContext:
     # Lets read_file escalate from "here it is again" to a hard refusal when a
     # model loops on the identical read.
     read_cache_hits: dict[tuple[str, int, Any], int] = field(default_factory=dict)
+    # Line spans already served per path, as (start, end). Lets read_file tell
+    # paging through a big file (new ground each time) apart from circling back
+    # over content the model already has — only the latter is a loop.
+    files_read_spans: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
     # Tools the agent loop has temporarily withdrawn, mapped to the message
