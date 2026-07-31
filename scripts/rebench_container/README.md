@@ -41,6 +41,22 @@ those are reported as `eval_error` and excluded from rates, never counted as
 successes. Patch-produced is recorded too, but it is not the headline: in
 practice a full patch rate coexists with a much lower resolved rate.
 
+### Validating the grader
+
+Before believing a 0% resolved rate, check that the pipeline can report a
+pass at all:
+
+```bash
+python scripts/rebench_container/run_bench.py \
+    --instances scripts/index_ablation/instances_sample.jsonl \
+    --tools gold --out gold.jsonl
+```
+
+The `gold` arm skips the agent and grades the dataset's own patch. Anything
+short of 100% resolved there is a harness bug, and every other arm's numbers
+are meaningless until it's fixed. It needs no LLM and no agent install, so
+it's cheap to re-run whenever the grading path changes.
+
 One adaptation is applied automatically. Some images configure pytest with
 xdist; if every worker crashes on an unrelated import error, pytest reports
 "no tests ran" and exits 5 — indistinguishable from a genuinely empty

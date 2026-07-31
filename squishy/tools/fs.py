@@ -836,15 +836,60 @@ async def _search_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
     cap = 50 if ctx.permission_mode == "bench" else SEARCH_CAP
     rg = shutil.which("rg")
-    if rg:
-        return await _rg_search(rg, pattern, abs_path, glob, cap=cap)
-    return await asyncio.to_thread(_python_search, pattern, abs_path, glob, cap=cap)
+
+    async def _run(pat: str, *, force_literal: bool = False) -> ToolResult:
+        if rg:
+            return await _rg_search(rg, pat, abs_path, glob, cap=cap,
+                                    force_literal=force_literal)
+        return await asyncio.to_thread(_python_search, pat, abs_path, glob,
+                                       cap=cap, force_literal=force_literal)
+
+    res = await _run(pattern)
+
+    # A pattern can be valid regex and still not mean what the model intended:
+    # `data[0]` is a character class, so searching for the literal text
+    # `data[0]` returns nothing and the model concludes the code isn't there.
+    # When a metacharacter-bearing pattern finds nothing, retry it literally.
+    if (
+        res.success
+        and not res.data.get("count")
+        and _HAS_REGEX_META.search(pattern)
+    ):
+        literal_res = await _run(pattern, force_literal=True)
+        if literal_res.success and literal_res.data.get("count"):
+            literal_res.data["note"] = (
+                f"No regex matches for '{pattern}', but it appears literally "
+                f"in the code — showing literal matches."
+            )
+            return literal_res
+    return res
  
  
+# Characters that make a pattern "look like" a regex. Used to decide
+# whether a zero-match search is worth retrying as a literal string.
+_HAS_REGEX_META = re.compile(r"[\\\[\]().*+?{}|^$]")
+
+
+def _is_regex(pattern: str) -> bool:
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
 async def _rg_search(
     rg: str, pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_CAP,
+    force_literal: bool = False,
 ) -> ToolResult:
-    cmd = [rg, "-n", "--no-heading", "-S", pattern, abs_path]
+    # Models routinely pass a glob (`*.py`) or a raw code snippet where a
+    # regex is expected. Searching those literally is what they meant; failing
+    # is never useful.
+    literal = force_literal or not _is_regex(pattern)
+    cmd = [rg, "-n", "--no-heading", "-S"]
+    if literal:
+        cmd.append("-F")
+    cmd += [pattern, abs_path]
     if isinstance(glob, str):
         cmd.extend(["-g", glob])
     try:
@@ -855,31 +900,57 @@ async def _rg_search(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=SEARCH_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=SEARCH_TIMEOUT)
         except TimeoutError:
             proc.kill()
             await proc.wait()
             return ToolResult(False, error="ripgrep timed out")
     except FileNotFoundError as e:
         return ToolResult(False, error=str(e))
+
+    # rg exits 1 for "no matches" and >=2 for a real error. Ignoring the code
+    # reported a broken search as "0 matches", so the model concluded the
+    # symbol didn't exist and moved on.
+    if proc.returncode is not None and proc.returncode >= 2:
+        msg = stderr.decode("utf-8", errors="replace").strip().splitlines()
+        return ToolResult(
+            False,
+            error=f"search failed: {msg[0] if msg else 'ripgrep error'}",
+        )
  
     matches: list[dict[str, Any]] = []
     for line in stdout.decode("utf-8", errors="replace").splitlines()[:cap]:
         parts = line.split(":", 2)
         if len(parts) == 3:
             matches.append({"file": parts[0], "line": int(parts[1]), "text": parts[2]})
+    data: dict[str, Any] = {
+        "pattern": pattern, "matches": matches, "count": len(matches),
+    }
+    if literal:
+        data["note"] = (
+            f"'{pattern}' is not a valid regex; searched for it literally."
+        )
     return ToolResult(
         True,
-        data={"pattern": pattern, "matches": matches, "count": len(matches)},
-        display=f"{len(matches)} matches",
+        data=data,
+        display=f"{len(matches)} matches" + (" (literal)" if literal else ""),
     )
  
  
-def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_CAP) -> ToolResult:
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return ToolResult(False, error=f"invalid regex: {e}")
+def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_CAP,
+                   force_literal: bool = False) -> ToolResult:
+    # Same fallback as the ripgrep path: an unparseable pattern is treated as
+    # a literal string rather than rejected.
+    literal = force_literal
+    if force_literal:
+        rx = re.compile(re.escape(pattern))
+    else:
+        try:
+            rx = re.compile(pattern)
+        except re.error:
+            literal = True
+            rx = re.compile(re.escape(pattern))
     matches: list[dict[str, Any]] = []
     for root, dirs, files in os.walk(abs_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -901,13 +972,20 @@ def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_
         if len(matches) >= cap:
             break
  
+    data: dict[str, Any] = {
+        "pattern": pattern, "matches": matches, "count": len(matches),
+    }
+    if literal:
+        data["note"] = (
+            f"'{pattern}' is not a valid regex; searched for it literally."
+        )
     return ToolResult(
         True,
-        data={"pattern": pattern, "matches": matches, "count": len(matches)},
-        display=f"{len(matches)} matches",
+        data=data,
+        display=f"{len(matches)} matches" + (" (literal)" if literal else ""),
     )
- 
- 
+
+
 read_file = Tool(
     name="read_file",
     description="Read a file from disk. Returns its content and line count. "

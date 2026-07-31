@@ -331,7 +331,9 @@ def run_instance(inst: dict, args, cache: Path, uv: Path, src: Path,
     try:
         cid = start_container(inst["image_name"])
         repo = find_repo(cid)
-        install_agent(cid, uv, src)
+        # A gold-only run never starts the agent, so skip the install.
+        if any(a["tools"] != "gold" for a in arms):
+            install_agent(cid, uv, src)
     except Exception as e:  # noqa: BLE001
         err = f"{type(e).__name__}: {e}"
         if cid:
@@ -360,8 +362,15 @@ def run_instance(inst: dict, args, cache: Path, uv: Path, src: Path,
                     if r.returncode != 0:
                         rec["index_error"] = r.stderr[-300:]
 
-                rec.update(run_agent(cid, repo, inst, arm_args, cache))
-                patch = collect_patch(cid, repo)
+                if arm["tools"] == "gold":
+                    # Harness self-test: grade the dataset's own fix. If this
+                    # doesn't come back resolved, the grading pipeline is
+                    # broken and every other arm's 0% is meaningless.
+                    patch = inst.get("gold_patch") or ""
+                    rec["exit_status"] = "gold"
+                else:
+                    rec.update(run_agent(cid, repo, inst, arm_args, cache))
+                    patch = collect_patch(cid, repo)
                 rec["patched"] = bool(patch.strip())
                 rec["patch_bytes"] = len(patch)
                 rec["patch"] = patch
@@ -386,8 +395,10 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://host.docker.internal:1234/v1")
     ap.add_argument("--mode", default="bench")
     ap.add_argument("--tools", default="minimal",
-                    help="Comma-separated tool profiles to run per instance "
-                         "(minimal, standard). Multiple arms share one container.")
+                    help="Comma-separated arms to run per instance: minimal, "
+                         "standard, or `gold` (skip the agent and grade the "
+                         "dataset's own patch — a self-test of the grading "
+                         "pipeline). Arms share one container.")
     ap.add_argument("--index", default="off",
                     help="Index arms to run: off, on, or both")
     ap.add_argument("--max-turns", type=int, default=60)
