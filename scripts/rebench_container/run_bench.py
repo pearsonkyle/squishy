@@ -78,15 +78,54 @@ modified."""
 TESTS_BLOCK = """
 The evaluation runs {total} test{plural} against your patch{spread}:
 
-{ids}
-Run them now. If they error on import or collection, read that error closely —
-it usually names the exact symbol you have to add. If a test does not exist in
-this checkout yet, that is expected: the evaluation adds it after your patch is
-applied, so implement the behavior its name implies instead of hunting for it.
+{ids}{absent}
+{closing}
 """
 
+# Two closings, because the honest advice differs. Telling a model to "run the
+# failing tests" when every one of them is added by the evaluation sends it
+# hunting for something that isn't there — the same instruct-then-block
+# pattern that cost cliquet-203 both of its 30-turn budgets.
+_CLOSING_RUNNABLE = """Run them now. If they error on import or collection, read that error closely —
+it usually names the exact symbol you have to add."""
 
-def _tests_block(fail_to_pass: list, limit: int = 10) -> str:
+_CLOSING_ABSENT = """You cannot run them; they do not exist yet. Work from the description above:
+implement the behavior their names describe, then run the test files they will
+live in to check you have not broken what is already there."""
+
+
+_ADDED_DEF_RE = re.compile(
+    r"^\+\s*(?:def|func|fn|public\s+void|it|test)\s*[(\s]*['\"]?([A-Za-z_][\w]*)")
+
+
+def _tests_added_by_patch(fail_to_pass: list, test_patch: str) -> set:
+    """FAIL_TO_PASS ids whose test function is ADDED by the evaluation's patch.
+
+    These do not exist in the checkout the model is given, and telling it so is
+    the difference between a fix and a scavenger hunt. Observed on cliquet-203:
+    both arms burned their entire 30-turn budget grepping for
+    `test_overriden_default_settings` — a name the test patch introduces — and
+    neither ever wrote a line of source. Saying "an absent test is expected" in
+    the abstract did not land; naming the specific tests does.
+
+    Derived from the diff's added `def` lines, so it costs nothing and leaks no
+    assertions: the model learns the name is absent, not what it checks.
+    """
+    if not test_patch:
+        return set()
+    added = {
+        m.group(1) for line in test_patch.splitlines()
+        if (m := _ADDED_DEF_RE.match(line))
+    }
+    if not added:
+        return set()
+    return {
+        t for t in (str(x) for x in (fail_to_pass or []))
+        if t.rsplit("::", 1)[-1].split("[", 1)[0] in added
+    }
+
+
+def _tests_block(fail_to_pass: list, limit: int = 10, test_patch: str = "") -> str:
     """Render the FAIL_TO_PASS target, or nothing when the harness supplied none.
 
     Shows the per-file spread before the sample. wtforms-614 carries 262 ids
@@ -118,9 +157,24 @@ def _tests_block(fail_to_pass: list, limit: int = 10) -> str:
     lines = "".join(f"  {t}\n" for t in sample)
     if len(ids) > len(sample):
         lines += f"  ... and {len(ids) - len(sample)} more\n"
+
+    absent = _tests_added_by_patch(ids, test_patch)
+    if absent:
+        shown = sorted(absent)[:6]
+        more = f" (and {len(absent) - len(shown)} more)" if len(absent) > len(shown) else ""
+        note = (
+            "\nNOTE: these are added by the evaluation and are NOT in this "
+            "checkout — searching for them will find nothing, so don't:\n"
+            + "".join(f"  {t}\n" for t in shown)
+            + (f"  ...{more}\n" if more else "")
+        )
+    else:
+        note = ""
+
+    closing = _CLOSING_ABSENT if len(absent) == len(ids) else _CLOSING_RUNNABLE
     return TESTS_BLOCK.format(
         total=len(ids), plural="" if len(ids) == 1 else "s",
-        spread=spread, ids=lines,
+        spread=spread, ids=lines, absent=note, closing=closing,
     )
 
 
@@ -376,7 +430,10 @@ def run_agent(cid: str, repo: str, inst: dict, args, cache: Path) -> dict:
         "repo": repo,
         "prompt": PROMPT.format(
             problem=inst["problem_statement"][:6000],
-            tests=_tests_block(inst.get("FAIL_TO_PASS") or []),
+            tests=_tests_block(
+                inst.get("FAIL_TO_PASS") or [],
+                test_patch=inst.get("test_patch") or "",
+            ),
         ),
         "empty_patch_nudge": EMPTY_PATCH_NUDGE,
         "empty_patch_retries": args.empty_patch_retries,

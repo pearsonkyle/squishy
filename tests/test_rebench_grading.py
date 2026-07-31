@@ -143,3 +143,57 @@ def test_tests_block_leads_with_the_per_file_spread(rb):
 
 def test_tests_block_is_empty_without_targets(rb):
     assert rb._tests_block([]) == ""
+
+
+# -- absent-test detection ---------------------------------------------------
+
+def test_names_the_tests_the_evaluation_adds(rb):
+    """The scavenger hunt this exists to prevent.
+
+    cliquet-203: both arms spent their whole 30-turn budget grepping for
+    `test_overriden_default_settings`, which the test patch introduces, and
+    neither wrote a line of source. The harness has the test patch — it can
+    simply say the name is not there.
+    """
+    f2p = ["cliquet/tests/test_initialization.py::InitializationTest::test_overriden_default_settings"]
+    patch = (
+        "--- a/cliquet/tests/test_initialization.py\n"
+        "+++ b/cliquet/tests/test_initialization.py\n"
+        "@@\n"
+        "     def test_existing(self):\n"
+        "+    def test_overriden_default_settings(self):\n"
+        "+        assert True\n"
+    )
+    assert rb._tests_added_by_patch(f2p, patch) == set(f2p)
+
+    block = rb._tests_block(f2p, test_patch=patch)
+    assert "NOT in this checkout" in block
+    # And it must not tell the model to run something that cannot run.
+    assert "Run them now" not in block
+    assert "cannot run them" in block
+
+
+def test_pre_existing_test_is_not_reported_absent(rb):
+    f2p = ["tests/test_a.py::test_already_here"]
+    patch = (
+        "--- a/tests/test_a.py\n+++ b/tests/test_a.py\n@@\n"
+        "     def test_already_here(self):\n"
+        "-        assert old\n"
+        "+        assert new\n"
+    )
+    assert rb._tests_added_by_patch(f2p, patch) == set()
+    block = rb._tests_block(f2p, test_patch=patch)
+    assert "NOT in this checkout" not in block
+    assert "Run them now" in block
+
+
+def test_partial_absence_keeps_the_runnable_closing(rb):
+    f2p = ["tests/a.py::test_old", "tests/a.py::test_new"]
+    patch = "--- a/tests/a.py\n+++ b/tests/a.py\n@@\n+    def test_new(self):\n"
+    block = rb._tests_block(f2p, test_patch=patch)
+    assert "test_new" in block.split("NOT in this checkout")[1]
+    assert "Run them now" in block
+
+
+def test_no_test_patch_makes_no_claim(rb):
+    assert rb._tests_added_by_patch(["a::b"], "") == set()
