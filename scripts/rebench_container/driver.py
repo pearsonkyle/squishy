@@ -36,9 +36,16 @@ def _bucket(err: str) -> str:
     """
     e = err.lower()
     for marker, label in (
+        # Read-guard causes first: both start with "refused:", and collapsing
+        # them together is what hid *which* guard was firing across two sweeps.
+        ("already read this exact range", "read cap: identical repeat"),
+        ("already read these lines", "read cap: overlapping"),
         ("not found in", "old_string not found"),
         ("appears", "old_string not unique"),
         ("already exists", "file exists"),
+        ("did you mean", "path wrong (suggestion offered)"),
+        ("is a directory", "path is a directory"),
+        ("file not found", "path not found"),
         ("no such file", "missing path"),
         ("refused:", "refused"),
         ("read the file", "read before edit"),
@@ -49,6 +56,22 @@ def _bucket(err: str) -> str:
         if marker in e:
             return label
     return (err.split("\n")[0][:60] or "unknown")
+
+
+def _args_summary(name: str, args: dict) -> str:
+    """One-line, information-dense rendering of a tool call's arguments."""
+    if name == "run_command":
+        return " ".join(str(args.get("command", "")).split())[:160]
+    if name == "read_file":
+        span = ""
+        if args.get("offset") or args.get("limit"):
+            span = f" [off={args.get('offset', 0)} lim={args.get('limit')}]"
+        return f"{args.get('path', '')}{span}"
+    if name in ("edit_file", "write_file"):
+        return str(args.get("path", ""))
+    if name in ("search_files", "glob_files", "recall"):
+        return str(args.get("pattern") or args.get("query") or "")[:80]
+    return " ".join(f"{k}={str(v)[:40]}" for k, v in list(args.items())[:3])
 
 
 class Metrics:
@@ -94,12 +117,14 @@ class Metrics:
                 key = f"{name}: {_bucket(ev.get('error') or '')}"
                 self.failure_reasons[key] = self.failure_reasons.get(key, 0) + 1
             self.trace.append(f"{self._turn}:{name}" + ("" if ok else "!"))
-            # With a shell-only profile the command *is* the trajectory —
-            # a trace of 76 identical "run_command" entries says nothing about
-            # why a run produced no patch.
-            if name == "run_command":
-                cmd = " ".join(str((ev.get("args") or {}).get("command", "")).split())
-                self.commands.append(f"{self._turn}{'' if ok else '!'}: {cmd[:160]}")
+            # The *arguments* are the trajectory. A trace of 76 identical
+            # "run_command" entries — or 40 "read_file" entries — says nothing
+            # about why a run produced no patch; which file, which range, and
+            # which command is the whole story.
+            self.commands.append(
+                f"{self._turn}{'' if ok else '!'}: {name} {_args_summary(name, ev.get('args') or {})}"
+                + ("" if ok else f"  <- {_bucket(ev.get('error') or '')}")
+            )
         self.flush()
 
     def as_dict(self) -> dict:

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -375,6 +376,51 @@ class Agent:
         self.messages.append(assistant)
         self.messages.append(tool_result)
 
+    def _forget_invisible_reads(self) -> None:
+        """Drop read-tracking for files whose content is no longer in history.
+
+        ``read_file`` refuses a re-read once the model has already been served
+        the same lines enough times. That is only fair while the model can
+        still see them. ``trim_history`` keeps the last N messages, so a read
+        from 30 turns ago is gone from the transcript while our bookkeeping
+        still counts it — and the model gets refused for trying to recover
+        content the harness deleted.
+
+        ``agent_dispatch`` stamps ``_squishy_read_path`` on every successful
+        read_file tool message, so the surviving set is exactly the reads the
+        model can still see.
+        """
+        ctx = self.tool_ctx
+        if not ctx.files_read_spans and not ctx.files_read_count:
+            return
+
+        visible: set[str] = set()
+        for m in self.messages:
+            rel = m.get("_squishy_read_path")
+            if rel:
+                visible.add(self._abs_read_path(str(rel)))
+
+        for path in list(ctx.files_read_spans):
+            if path not in visible:
+                del ctx.files_read_spans[path]
+        for path in list(ctx.files_read_count):
+            if path not in visible:
+                del ctx.files_read_count[path]
+        # The cache and its hit counter are keyed by (abs_path, offset, limit).
+        for key in list(ctx.files_read_meta):
+            if key[0] not in visible:
+                del ctx.files_read_meta[key]
+        for key in list(ctx.read_cache_hits):
+            if key[0] not in visible:
+                del ctx.read_cache_hits[key]
+
+    def _abs_read_path(self, rel: str) -> str:
+        p = os.path.join(self.config.working_dir, rel)
+        try:
+            return os.path.realpath(p)
+        except OSError:
+            return p
+
     # ------------------------------------------------------------------
     # Prose completion handling
     # ------------------------------------------------------------------
@@ -518,6 +564,17 @@ class Agent:
             self._last_persisted_idx = len(self.messages)
             self._full_log_idx = len(self.messages)
 
+            # Forget reads whose content trimming just dropped. The read guards
+            # exist to stop a model circling over content it already has — so
+            # they have to be measured against what the model can still SEE,
+            # not against everything it ever read. Tracking that never expires
+            # turns a correct re-read (the tool result scrolled out of history)
+            # into "Refused: you have already read these lines", which was the
+            # top tool failure in three consecutive sweeps. Compaction already
+            # had this fix; trimming drops the same content without ever
+            # setting did_compact, so it needs it too.
+            self._forget_invisible_reads()
+
             # Rebuild the live-context pair AFTER trim/compact. The pair carries
             # notes for the model but is kept out of the canonical history so
             # the system prefix stays byte-stable turn-over-turn.
@@ -526,18 +583,17 @@ class Agent:
             if did_compact:
                 st.compaction_count += 1
 
-                # Compaction dropped file bodies out of context, so re-reading
-                # is now the *correct* move and the repeat-read guards are
-                # measuring history the model can no longer see. Leaving them
-                # armed made "read_file: refused" the single largest source of
-                # tool failures in a 26-run sweep.
+                # Compaction summarizes file bodies away wholesale, so drop the
+                # read tracking entirely rather than per-path.
+                had_reads = bool(self.tool_ctx.files_read_count)
                 self.tool_ctx.files_read_count.clear()
                 self.tool_ctx.read_cache_hits.clear()
                 self.tool_ctx.files_read_spans.clear()
+                self.tool_ctx.files_read_meta.clear()
 
                 # The one thing a tool result cannot tell the model: that the
                 # harness rewrote its history underneath it.
-                if self.tool_ctx.files_read_count or self.tool_ctx.notes:
+                if had_reads or self.tool_ctx.notes:
                     inject_nudge(self, st, turn, (
                         "[system] Context was compacted — earlier file contents "
                         "are no longer in your history. Re-read any file you "
