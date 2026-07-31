@@ -76,6 +76,10 @@ class LoopState:
     # answers the refusal by retrying the same call is not going to be argued
     # into editing, and looping on it is worse than lifting the gate.
     shell_refusals: int = 0
+    # Shell commands that looked like they modified a file. Under a
+    # shell-only profile this is the only edit signal there is — `files_edited`
+    # only ever records edit_file/write_file.
+    shell_writes: int = 0
     recent_edit_fail_files: set[str] = field(default_factory=set)
     # Identical-old_str-per-path tracking (catches edit loops that bypass
     # repeated_tool_call detection because args.new_str varies). Maps
@@ -393,3 +397,29 @@ def f2p_files_in_command(cmd: str, fail_to_pass: list[str]) -> set[str]:
     return covered
 
 
+
+
+# Shell fragments that indicate a command wrote to a file. Deliberately broad:
+# a false positive only means we skip one nudge, while a false negative means
+# nagging a model that has already done the work.
+_WRITE_CMD_RE = re.compile(
+    r"(?x)"
+    r"(?<![0-9])>>?\s*[\w./~$-]"       # `> file` / `>> file`, not `2>&1`
+    r"|\b(?:sed|perl)\b[^|;&]*\s-i"    # in-place edit
+    r"|\btee\b"
+    r"|\bpatch\b\s+-p\d"
+    r"|\bgit\s+apply\b"
+    r"|\bmv\b|\bcp\b"
+    r"|\.write\(|\.write_text\(|open\([^)]*['\"][wa]"
+)
+
+
+def looks_like_file_write(command: str) -> bool:
+    """True if *command* plausibly modified a file on disk.
+
+    Used only to decide whether the agent still needs prodding toward making
+    an edit; it never gates or blocks anything, so over-matching is cheap.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    return bool(_WRITE_CMD_RE.search(command))

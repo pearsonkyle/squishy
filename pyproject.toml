@@ -40,6 +40,10 @@ asyncio_mode = "auto"
 markers = [
     "smoke: integration test requiring a live OpenAI-compatible endpoint",
 ]
+# Smoke tests hit a real endpoint and load a real model. Declaring the marker
+# never excluded them, so a bare `pytest -q` ran all of them against whatever
+# server happened to be up. Select them explicitly with `-m smoke`.
+addopts = "-m 'not smoke'"
  
 [tool.ruff]
 line-length = 100

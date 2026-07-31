@@ -1,9 +1,12 @@
 """Live integration tests for the squishy API."""
 
 import asyncio
+import functools
+import json
 import os
 import shutil
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -23,11 +26,35 @@ def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
+@functools.lru_cache(maxsize=1)
+def _model() -> str:
+    """The model id to test against.
+
+    Resolved from the endpoint's own model list rather than a hardcoded
+    default. Asking an inference server for a model it does not have makes it
+    JIT-load something to satisfy the request — which is how these tests
+    silently pulled an unrelated model onto the user's machine.
+    """
+    explicit = os.environ.get("SQUISHY_MODEL")
+    if explicit:
+        return explicit
+    base = _env("SQUISHY_BASE_URL", "http://localhost:1234/v1").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/models", timeout=5) as resp:
+            data = json.load(resp)
+        served = [m["id"] for m in data.get("data", []) if m.get("id")]
+    except Exception:  # noqa: BLE001
+        served = []
+    if not served:
+        pytest.skip(f"no model available at {base}; set SQUISHY_MODEL")
+    return served[0]
+
+
 async def test_health_check():
     """Verify the API can connect to the LLM server."""
     print("\n=== Test: Health Check ===")
     async with Squishy(
-        model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+        model=_model(),
         base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
         api_key=_env("SQUISHY_API_KEY", "local"),
     ) as sq:
@@ -43,7 +70,7 @@ async def test_yolo_mode_simple_write():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -72,7 +99,7 @@ async def test_yolo_mode_file_edit():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -100,7 +127,7 @@ async def test_plan_mode_read_only():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="plan",
@@ -127,7 +154,7 @@ async def test_edits_mode_with_plan():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
@@ -161,7 +188,7 @@ async def test_plan_mode_step_tracking():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
@@ -205,7 +232,7 @@ def divide(a, b):
 """)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
@@ -237,7 +264,7 @@ async def test_streaming_callback():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -264,7 +291,7 @@ async def test_multiple_turns():
 
         # Turn 1: Create a file
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -278,7 +305,7 @@ async def test_multiple_turns():
 
         # Turn 2: Modify the file
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -301,7 +328,7 @@ async def test_thinking_mode():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -336,7 +363,7 @@ async def test_session_persistence():
 
         # Turn 1: Create a file
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -353,7 +380,7 @@ async def test_session_persistence():
 
         # Turn 2: Read the file using the same session - context should be preserved
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -377,7 +404,7 @@ async def test_timeout_handling():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -424,7 +451,7 @@ def divide(a, b):
     return a / b
 """)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="bench",
@@ -459,7 +486,7 @@ async def test_context_compaction():
             )
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -521,7 +548,7 @@ class UserService:
 """)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -552,7 +579,7 @@ async def test_consecutive_error_recovery():
         (working_dir / "simple.py").write_text("# A simple file\nprint('hello')\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -584,7 +611,7 @@ async def test_tool_call_loop_detection():
         (working_dir / "data.txt").write_text("line1\nline2\nline3\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -618,7 +645,7 @@ async def test_sandbox_mode():
         working_dir = Path(tmp)
         try:
             async with Squishy(
-                model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+                model=_model(),
                 base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
                 api_key=_env("SQUISHY_API_KEY", "local"),
                 permission_mode="yolo",
@@ -648,7 +675,7 @@ async def test_mcp_tool_integration():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -678,7 +705,7 @@ async def test_quality_gate():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -708,7 +735,7 @@ async def test_token_usage_tracking():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -736,7 +763,7 @@ async def test_file_change_detection():
         (working_dir / "config.py").write_text("VERSION = '1.0.0'\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -773,7 +800,7 @@ async def test_show_diff_tool():
         subprocess.run(["git", "commit", "-m", "initial"], cwd=working_dir, capture_output=True)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -807,7 +834,7 @@ async def test_glob_files_tool():
         (working_dir / "tests").joinpath("test_utils.py").write_text("def test_util(): pass\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -863,7 +890,7 @@ class UserService:
         save_index(str(working_dir), build_index(str(working_dir)))
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -890,7 +917,7 @@ async def test_scratchpad_tool():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -933,7 +960,7 @@ class Square:
 """)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",

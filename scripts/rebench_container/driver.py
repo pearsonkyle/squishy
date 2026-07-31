@@ -62,6 +62,7 @@ class Metrics:
         self.tool_counts: dict[str, int] = {}
         self.tool_failures = 0
         self.failure_reasons: dict[str, int] = {}
+        self.commands: list[str] = []
         # (turn, tool) so we can see *when* a tool ran, not just how often.
         self.trace: list[str] = []
         self._turn = 0
@@ -93,6 +94,12 @@ class Metrics:
                 key = f"{name}: {_bucket(ev.get('error') or '')}"
                 self.failure_reasons[key] = self.failure_reasons.get(key, 0) + 1
             self.trace.append(f"{self._turn}:{name}" + ("" if ok else "!"))
+            # With a shell-only profile the command *is* the trajectory —
+            # a trace of 76 identical "run_command" entries says nothing about
+            # why a run produced no patch.
+            if name == "run_command":
+                cmd = " ".join(str((ev.get("args") or {}).get("command", "")).split())
+                self.commands.append(f"{self._turn}{'' if ok else '!'}: {cmd[:160]}")
         self.flush()
 
     def as_dict(self) -> dict:
@@ -106,6 +113,7 @@ class Metrics:
             "tool_failures": self.tool_failures,
             "failure_reasons": self.failure_reasons,
             "trace": self.trace,
+            "commands": self.commands[-120:],
         }
 
     def flush(self) -> None:

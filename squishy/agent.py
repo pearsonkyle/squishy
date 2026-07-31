@@ -43,6 +43,7 @@ from squishy.agent_state import (
     brief,
     call_key,
     extract_problem_files,
+    looks_like_file_write,
     prose_msg,
 )
 from squishy.client import Client, CompletionResult, ToolCall
@@ -74,6 +75,9 @@ _SHELL_BLOCKED_MSG = (
     "patch beats no patch."
 )
 _MAX_SHELL_REFUSALS = 3
+# How often to repeat the edit nudge under a shell-only profile, where
+# there is no tool to withdraw and pressure has to come from the prompt.
+_SHELL_NUDGE_EVERY = 6
 
 
 # F3: heuristics for "the agent observed a test failure but did not edit
@@ -833,6 +837,27 @@ class Agent:
             else:
                 self.tool_ctx.blocked_tools.pop("run_command", None)
 
+            # Shell-only profiles get the same pressure as a nudge rather than
+            # a block. Blocking is not available (the shell is the only tool)
+            # and, on the evidence, not desirable either — the blocking version
+            # of this gate livelocked. Without any forcing function at all a
+            # shell run explored for 80 turns and produced no patch.
+            if (
+                _is_constrained
+                and edit_budget > 0
+                and not profile_has_edit_tool(self.config.tool_profile)
+                and not st.shell_writes
+                and turn > edit_budget
+                and turn % _SHELL_NUDGE_EVERY == 1
+            ):
+                inject_nudge(self, st, turn, (
+                    "[system] You have not changed any file yet, and a run that "
+                    "ends with no edit scores zero. Stop investigating and apply "
+                    "your best fix now — write the file with a heredoc "
+                    "(`cat > path <<'EOF'`) or a small `python - <<'EOF'` script, "
+                    "then confirm with `git diff`."
+                ), min_gap=0, force=True)
+
             self.tool_ctx.permission_mode = self.config.permission_mode
             now_plan_active = _plan_active()
             now_phase = ps.phase if ps else None
@@ -1148,6 +1173,12 @@ class Agent:
 
                 outcome = await run_tool(self, turn, tc)
                 dispatched_pairs.append((tc, outcome))
+                if (
+                    tc.name == "run_command"
+                    and outcome.get("success")
+                    and looks_like_file_write(str(tc.args.get("command", "")))
+                ):
+                    st.shell_writes += 1
                 if str(outcome.get("error") or "") == _SHELL_BLOCKED_MSG:
                     st.shell_refusals += 1
                     if st.shell_refusals == _MAX_SHELL_REFUSALS:
