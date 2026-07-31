@@ -177,6 +177,12 @@ def _collapse_double_backslash(s: str) -> str:
     return s.replace("\\\\", "\\") if "\\\\" in s else s
 
 
+# Fuzzy-match confidence tiers for a failed `old_str`. Above _FUZZY_STRONG the
+# block is almost certainly the intended one; between the two it is offered
+# with an explicit caveat.
+_FUZZY_STRONG = 0.85
+_FUZZY_WEAK = 0.6
+
 _UNDO_STACK_CAP = 50
 # Identical cached reads tolerated before read_file refuses (1 = the first
 # repeat is served from cache, the next one errors).
@@ -735,8 +741,11 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                     )
                     break
 
-        # Stage 3: fuzzy match — find a contiguous block that closely matches old_str
-        if not hint and len(old_lines_list) >= 2:
+        # Stage 3: fuzzy match — find a contiguous block that closely matches
+        # old_str. Single-line old_str is included: it is the most common shape
+        # ("return 1") and excluding it sent the most frequent failure straight
+        # to the useless "read the file first" fallback.
+        if not hint and len(old_lines_list) >= 1:
             best_ratio = 0.0
             best_start = -1
             num_old = len(old_lines_list)
@@ -748,11 +757,20 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_start = i
-            if best_ratio >= 0.85 and best_start >= 0:
+            if best_ratio >= _FUZZY_WEAK and best_start >= 0:
                 actual_lines = file_lines[best_start : best_start + num_old]
                 actual_block = "\n".join(actual_lines)
+                # Below the strong threshold this may well be the wrong block,
+                # so say so rather than implying a confident location. Even a
+                # tentative pointer beats "read the file first", which gives
+                # the model nowhere to go.
+                lead = (
+                    " A similar block was found"
+                    if best_ratio >= _FUZZY_STRONG
+                    else " The closest block found (may not be the right one)"
+                )
                 hint = (
-                    f" A similar block was found at lines {best_start + 1}-"
+                    f"{lead} at lines {best_start + 1}-"
                     f"{best_start + num_old} ({best_ratio:.0%} match):\n"
                     f"---\n{actual_block}\n---\n"
                     f"Re-call edit_file with the exact text above as old_str."
