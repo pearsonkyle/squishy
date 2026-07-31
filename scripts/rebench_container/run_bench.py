@@ -69,32 +69,52 @@ is scored as a failure. When the fix is in place, give a short summary.
 # something that isn't there — the harness instructing an action it has made
 # impossible.
 TESTS_BLOCK = """
-The evaluation runs these tests against your patch:
+The evaluation runs {total} test{plural} against your patch{spread}:
 
 {ids}
-Run them now to see how they currently fail. If one does not exist in this
-checkout yet, that is expected — the evaluation adds it after your patch is
-applied. In that case do not go looking for it: implement the behavior its
-name and the description above imply, and run the surrounding test file to
-check you have not broken anything.
+Run them now. If they error on import or collection, read that error closely —
+it usually names the exact symbol you have to add. If a test does not exist in
+this checkout yet, that is expected: the evaluation adds it after your patch is
+applied, so implement the behavior its name implies instead of hunting for it.
 """
 
 
-def _tests_block(fail_to_pass: list, limit: int = 12) -> str:
-    """Render the FAIL_TO_PASS ids, or nothing when the harness supplied none."""
+def _tests_block(fail_to_pass: list, limit: int = 10) -> str:
+    """Render the FAIL_TO_PASS target, or nothing when the harness supplied none.
+
+    Shows the per-file spread before the sample. wtforms-614 carries 262 ids
+    across three files; printing the first 10 in list order gave the model ten
+    incidental `test_fields.py` names and no hint that the real work lived in
+    `test_widgets.py`. The counts are what tell it where the task is.
+    """
     ids = [str(t) for t in (fail_to_pass or []) if str(t).strip()]
     if not ids:
         return ""
-    shown = ids[:limit]
-    lines = "".join(f"  {t}\n" for t in shown)
-    if len(ids) > limit:
-        lines += f"  ... and {len(ids) - limit} more\n"
-    return TESTS_BLOCK.format(ids=lines)
 
-EMPTY_PATCH_NUDGE = """STOP — you have not edited any file, so there is nothing
-to grade. You said you understand the bug; now act on it. Edit the responsible
-non-test source file now. Do not stop again until a file has actually been
-modified."""
+    by_file: dict[str, list[str]] = {}
+    for t in ids:
+        by_file.setdefault(t.split("::")[0], []).append(t)
+
+    spread = ""
+    if len(by_file) > 1 or len(ids) > limit:
+        counts = sorted(by_file.items(), key=lambda kv: -len(kv[1]))
+        spread = " — " + ", ".join(f"{len(v)} in {k}" for k, v in counts)
+
+    # Sample across files rather than taking a prefix, so every file that
+    # carries part of the task is represented.
+    sample: list[str] = []
+    per_file = max(1, limit // max(1, len(by_file)))
+    for _, group in sorted(by_file.items(), key=lambda kv: -len(kv[1])):
+        sample.extend(group[:per_file])
+    sample = sample[:limit]
+
+    lines = "".join(f"  {t}\n" for t in sample)
+    if len(ids) > len(sample):
+        lines += f"  ... and {len(ids) - len(sample)} more\n"
+    return TESTS_BLOCK.format(
+        total=len(ids), plural="" if len(ids) == 1 else "s",
+        spread=spread, ids=lines,
+    )
 
 
 def sh(*args: str, timeout: int = 900, stdin: str | None = None) -> subprocess.CompletedProcess:

@@ -169,7 +169,7 @@ def test_build_prompt_includes_env_error_guidance():
 
     bench_block = _mode_block("bench", "/tmp")
     assert "SOURCE code" in bench_block
-    assert "Import and environment errors are not the bug" in bench_block
+    assert "ImportError naming a symbol from THIS repo" in bench_block
     # The block used to narrate a five-phase state machine to the model. That
     # machine is gone; describing it cost ~250 tokens on every request.
     assert "phase" not in bench_block
