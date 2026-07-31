@@ -37,6 +37,11 @@ class ToolContext:
     # paging through a big file (new ground each time) apart from circling back
     # over content the model already has — only the latter is a loop.
     files_read_spans: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # How many times an equivalent shell command has already returned the same
+    # output. Under a shell-only profile this is the only loop-breaking signal
+    # available — re-running a grep always succeeds, so nothing else pushes
+    # back on a model circling the same three commands.
+    command_echoes: dict[str, int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
     extra_env: dict[str, str] = field(default_factory=dict)
     # Tools the agent loop has temporarily withdrawn, mapped to the message
