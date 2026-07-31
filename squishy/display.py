@@ -14,6 +14,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from squishy.plan_state import STATUS_ICONS
+
 # Re-exported so existing `from squishy.display import estimate_tokens`
 # imports keep working; the implementation now lives in squishy.tokens.
 from squishy.tokens import estimate_tokens as estimate_tokens
@@ -137,11 +138,11 @@ class Display:
         self.console.print(f"  [{color}]◆ mode → {mode}[/]")
         if prev == "plan" and mode in ("edits", "yolo"):
             self.console.print(
-                f"  [yellow]⚠ write tools now allowed — agent can modify files in this mode[/]"
+                "  [yellow]⚠ write tools now allowed — agent can modify files in this mode[/]"
             )
         elif mode == "yolo":
             self.console.print(
-                f"  [yellow]⚠ yolo mode: shell commands run without per-call approval[/]"
+                "  [yellow]⚠ yolo mode: shell commands run without per-call approval[/]"
             )
 
     def command_line(self, command: str) -> None:

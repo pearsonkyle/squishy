@@ -58,7 +58,7 @@ class ModeCycler:
             return False
         try:
             import termios  # noqa: F401
-            import tty      # noqa: F401
+            import tty  # noqa: F401
         except ImportError:
             return False
         return True

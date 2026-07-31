@@ -222,7 +222,7 @@ async def _build_index_async(
     file_nodes: list[Node] = []
     by_ext: dict[str, int] = defaultdict(int)
     symbol_count = 0
-    for rec, (node, count) in zip(records, results):
+    for rec, (node, count) in zip(records, results, strict=False):
         by_ext[rec.ext or "<none>"] += 1
         if node is not None:
             file_nodes.append(node)

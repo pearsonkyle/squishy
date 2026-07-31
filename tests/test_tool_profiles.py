@@ -209,3 +209,22 @@ async def test_must_edit_gate_yields_rather_than_livelocking(tmp_path):
         f"gate should stop refusing after {_MAX_SHELL_REFUSALS}, got {refusals}")
     # Once lifted, it stays lifted for the rest of the run.
     assert "run_command" not in agent.tool_ctx.blocked_tools
+
+
+def test_recall_is_hidden_without_an_index():
+    """Offering a tool whose only possible answer is 'no index' wastes a call.
+
+    Seen 6 times in one sweep: the standard profile advertised `recall`
+    unconditionally, so the model called it and was told to run /init.
+    """
+    names = {s["function"]["name"]
+             for s in openai_schemas("bench", has_index=False)}
+    assert "recall" not in names
+    assert "recall" in {s["function"]["name"]
+                        for s in openai_schemas("bench", has_index=True)}
+
+
+@pytest.mark.parametrize("mode", ["plan", "edits", "yolo", "bench"])
+def test_recall_hidden_without_index_in_every_mode(mode):
+    assert "recall" not in {s["function"]["name"]
+                            for s in openai_schemas(mode, has_index=False)}

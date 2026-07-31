@@ -40,9 +40,9 @@ def _safe_resolve(path: str, cwd: str) -> tuple[str, str | None]:
     try:
         os.path.commonpath([real_abs, real_cwd])
     except ValueError:
-        return "", f"path outside working directory: {path}"
+        return "", _escape_error(path, cwd)
     if not (real_abs == real_cwd or real_abs.startswith(real_cwd + os.sep)):
-        return "", f"path outside working directory: {path}"
+        return "", _escape_error(path, cwd)
     return abs_path, None
 
 
@@ -109,6 +109,21 @@ def _path_candidates(path: str, cwd: str) -> list[str]:
             if len(out) >= _MISS_MAX_CANDIDATES:
                 break
     return out[:_MISS_MAX_CANDIDATES]
+
+
+def _escape_error(path: str, cwd: str) -> str:
+    """An 'outside the working directory' message with a way forward.
+
+    Absolute paths the model invents are usually the right file under a wrong
+    root (`/test/fast-check/src/x.ts` for a repo checked out elsewhere). The
+    refusal must stand — but pointing at the real path costs nothing and saves
+    the model from guessing another root.
+    """
+    base = f"path outside working directory: {path}"
+    candidates = _path_candidates(path, cwd)
+    if candidates:
+        return f"{base}. Did you mean: {', '.join(candidates)}?"
+    return f"{base}. Paths must be relative to {cwd}."
 
 
 def _not_found_error(path: str, cwd: str, abs_path: str) -> str:

@@ -88,6 +88,7 @@ def openai_schemas(
     phase: str | None = None,
     profile: str = "standard",
     extra_tools: frozenset[str] | set[str] | None = None,
+    has_index: bool = True,
 ) -> list[dict[str, object]]:
     """Return OpenAI-format tool schemas, optionally filtered by mode and phase.
 
@@ -122,6 +123,11 @@ def openai_schemas(
         narrow = narrow | frozenset(extra_tools)
 
     def _keep(name: str) -> bool:
+        # `recall` without an index can only ever answer "no index found. Run
+        # /init first" — a wasted call, and one models kept making. Hide it
+        # instead of advertising a tool that cannot work here.
+        if name == "recall" and not has_index:
+            return False
         return narrow is None or name in narrow
 
     # Phase-gated filtering for bench mode.

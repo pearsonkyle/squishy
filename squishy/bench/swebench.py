@@ -16,9 +16,9 @@ is delegated to the upstream harness:
 """
  
 from __future__ import annotations
- 
-import asyncio
+
 import ast
+import asyncio
 import json as _json
 import logging
 import os
@@ -27,11 +27,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from squishy.api import Squishy
 from squishy.agent_state import distinct_f2p_files
+from squishy.api import Squishy
 from squishy.bench.runner import BenchResult
 from squishy.errors import BenchError
- 
+
 log = logging.getLogger("squishy.bench.swebench")
  
 # SWE-bench instances use github.com/<repo> with a specific base_commit.
@@ -188,7 +188,7 @@ async def install_deps(
         )
         try:
             _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=300)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.communicate()
             log.warning("install timeout for %s: %s", instance["instance_id"], cmd[:80])

@@ -16,8 +16,6 @@ from pathlib import Path
 
 from squishy.index.model import Index, Node
 
-
-
 # Directories that are noise in the project overview: VCS internals,
 # build artifacts, virtualenvs, dependency caches, and squishy's own
 # generated session/index storage.

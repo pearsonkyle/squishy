@@ -165,7 +165,7 @@ class Client:
                 if isinstance(ctx, int) and ctx > 0:
                     self.context_window = ctx
                 return model.id
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning(
                 "model discovery timed out after %.1fs against %s — "
                 "endpoint may be down; using configured model name",

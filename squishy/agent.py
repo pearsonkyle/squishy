@@ -738,10 +738,8 @@ class Agent:
         # index behind it — otherwise the model spends a call to be told the
         # tool it was offered doesn't work here.
         _profile = self.config.tool_profile
-        _extra = (
-            frozenset({"recall"})
-            if has_index(self.config.working_dir) else frozenset()
-        )
+        _has_idx = has_index(self.config.working_dir)
+        _extra = frozenset({"recall"}) if _has_idx else frozenset()
 
         _cached_perm_mode = self.config.permission_mode
         _cached_plan_active = _plan_active()
@@ -749,6 +747,7 @@ class Agent:
         _cached_schemas = openai_schemas(
             _cached_perm_mode, plan_active=_cached_plan_active,
             phase=_cached_phase, profile=_profile, extra_tools=_extra,
+            has_index=_has_idx,
         )
 
         for turn in range(1, self.config.max_turns + 1):
@@ -839,6 +838,7 @@ class Agent:
                 _cached_schemas = openai_schemas(
                     _cached_perm_mode, plan_active=_cached_plan_active,
                     phase=_cached_phase, profile=_profile, extra_tools=_extra,
+                    has_index=_has_idx,
                 )
                 if self.display is not None:
                     self.display.set_mode(self.config.permission_mode)
@@ -939,6 +939,17 @@ class Agent:
                     "old_str, call read_file again to get the precise text — do NOT guess. "
                     "Use save_note to persist important content across compactions."
                 ), min_gap=5, force=True)
+
+            if did_compact:
+                # Re-reading is now the *correct* move: compaction dropped the
+                # file bodies out of context, so the repeat-read guards are
+                # measuring history the model can no longer see. Leaving them
+                # armed made "read_file: refused" the single largest source of
+                # tool failures in a 26-run sweep (106 of them) — the nudge
+                # directly above tells the model to re-read, and the next read
+                # was rejected for being a repeat.
+                self.tool_ctx.files_read_count.clear()
+                self.tool_ctx.read_cache_hits.clear()
 
             # Re-inject index-recall pointers after compaction (bench only).
             # The original "## Relevant Code (from index)" section lives in
