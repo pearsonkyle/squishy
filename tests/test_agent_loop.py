@@ -336,3 +336,40 @@ async def test_must_edit_gate_not_applied_after_an_edit(tmp_path):
     assert "run_command" in seen[-1], "run_command must remain after an edit landed"
 
 
+
+
+async def test_live_context_never_shows_the_model_a_phantom_tool_call(tmp_path):
+    """The notes block must not reach the model as a call to a tool we don't have.
+
+    It used to be a fabricated (assistant tool_calls, tool result) pair naming
+    `_squishy_context`, which appears in no schema we send. That pair was
+    filtered out of TaskResult and the SFT export — but not out of the
+    transcript the model actually reads, and models imitate their own history.
+    On msrest-for-python-43 the model called `_squishy_context` twice and got
+    `unknown tool` back both times: the harness demonstrating a tool call and
+    then refusing it.
+
+    What the model is sent is `FakeClient`'s recorded input, so assert there.
+    """
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 4
+    fake = FakeClient(
+        script=[
+            CompletionResult(tool_calls=[_tc("save_note", {"key": "k", "content": "v"})]),
+            CompletionResult(text="done", tool_calls=[]),
+        ]
+    )
+    agent = Agent(cfg, fake, display=None)  # type: ignore[arg-type]
+    await agent.run("note something")
+
+    sent = [m for call in fake.calls_seen for m in call]
+    assert sent, "expected the fake client to have recorded outgoing messages"
+    # The note itself still has to reach the model — this is not a deletion.
+    assert any("Saved Notes" in (m.get("content") or "") for m in sent)
+    # But never as a tool call, and never as a tool result.
+    for m in sent:
+        assert m.get("name") != "_squishy_context"
+        for tc in m.get("tool_calls") or []:
+            assert tc.get("function", {}).get("name") != "_squishy_context"

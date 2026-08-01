@@ -50,9 +50,16 @@ Your job is to CHANGE THE SOURCE CODE — the modules that implement the
 behavior, not the test suite. Find the function or class responsible and edit
 its implementation. Writing or editing tests is never a valid fix on its own.
 
-Understanding the bug is not the goal; editing the code is. Do not stop until
-you have actually edited a non-test source file — a run that ends with no edit
-is scored as a failure. When the fix is in place, give a short summary.
+Reproduce the failure first. Build the smallest snippet that triggers what the
+description shows — `run_command` with `python -c "..."`, or a scratch file
+under /tmp — and run it until you see the error yourself. That reproduction,
+not the test suite, is your evidence: it tells you when the bug is real and
+when your fix has landed. Keep scratch files in /tmp so they stay out of the
+diff.
+
+Do not stop until you have actually edited a non-test source file — a run that
+ends with no edit is scored as a failure. When the fix is in place, give a
+short summary.
 """
 
 EMPTY_PATCH_NUDGE = """STOP — you have not edited any file, so there is nothing
@@ -93,6 +100,21 @@ _CLOSING_ABSENT = """You cannot run them; they do not exist yet. Work from the d
 implement the behavior their names describe, then run the test files they will
 live in to check you have not broken what is already there."""
 
+# The third case, and the most dangerous one, because the instructed action
+# *succeeds* and returns the wrong answer. On msrest-for-python-43 the graded
+# test `test_attr_duration` is present in the checkout, but the evaluation
+# rewrites the fixture around it (TestObj.__init__, setUp's Serializer
+# registration). The checkout's copy therefore PASSES at base. Told to "run
+# them now", the model ran that test eleven times, saw green every time, and
+# spent all 60 turns looking for a bug its only oracle said did not exist. It
+# never edited a file. Meanwhile apptuit-py-10, whose targets are newly added
+# and correctly flagged absent, was solved in 8 turns.
+_CLOSING_STALE = """You can run them, but the copy in this checkout is NOT the copy you are graded
+on — the evaluation replaces these test files, and the version here may well
+pass as it stands. A green run proves nothing. Work from the description above:
+find the code it describes and fix that. Use the tests only to check you have
+not broken what already works."""
+
 
 _ADDED_DEF_RE = re.compile(
     r"^\+\s*(?:def|func|fn|public\s+void|it|test)\s*[(\s]*['\"]?([A-Za-z_][\w]*)")
@@ -122,6 +144,29 @@ def _tests_added_by_patch(fail_to_pass: list, test_patch: str) -> set:
     return {
         t for t in (str(x) for x in (fail_to_pass or []))
         if t.rsplit("::", 1)[-1].split("[", 1)[0] in added
+    }
+
+
+def _tests_rewritten_by_patch(fail_to_pass: list, test_patch: str) -> set:
+    """FAIL_TO_PASS ids whose test FILE the evaluation rewrites.
+
+    Weaker claim than `_tests_added_by_patch` and a strict superset of it: the
+    test may exist and be runnable, but the copy in the checkout is not the one
+    that decides the grade. File-level is deliberate — working out whether a
+    given hunk lands inside one test function is fragile, and over-warning here
+    costs nothing while under-warning costs the whole run.
+    """
+    if not test_patch:
+        return set()
+    files = {
+        line[6:].strip() for line in test_patch.splitlines()
+        if line.startswith("+++ b/")
+    }
+    if not files:
+        return set()
+    return {
+        t for t in (str(x) for x in (fail_to_pass or []))
+        if t.split("::")[0] in files
     }
 
 
@@ -171,7 +216,15 @@ def _tests_block(fail_to_pass: list, limit: int = 10, test_patch: str = "") -> s
     else:
         note = ""
 
-    closing = _CLOSING_ABSENT if len(absent) == len(ids) else _CLOSING_RUNNABLE
+    # Order matters: "absent" is the strongest claim, "stale" the next, and
+    # only a test the evaluation leaves untouched is a trustworthy oracle.
+    stale = _tests_rewritten_by_patch(ids, test_patch) - absent
+    if len(absent) == len(ids):
+        closing = _CLOSING_ABSENT
+    elif len(absent) + len(stale) == len(ids):
+        closing = _CLOSING_STALE
+    else:
+        closing = _CLOSING_RUNNABLE
     return TESTS_BLOCK.format(
         total=len(ids), plural="" if len(ids) == 1 else "s",
         spread=spread, ids=lines, absent=note, closing=closing,
@@ -219,7 +272,7 @@ def source_tarball(cache: Path) -> Path:
     """Pack the working tree's squishy source for installation in-container."""
     out = cache / "squishy-src.tgz"
     with tarfile.open(out, "w:gz") as tf:
-        for item in ("squishy", "pyproject.toml", "README.md"):
+        for item in ("squishy", "graphagent", "pyproject.toml", "README.md"):
             p = REPO_ROOT / item
             if p.exists():
                 tf.add(p, arcname=item, filter=_skip_junk)
@@ -254,6 +307,49 @@ def find_repo(cid: str) -> str:
     return str(Path(line[0]).parent)
 
 
+def testbed_env(cid: str) -> dict[str, str]:
+    """PATH with the image's `testbed` conda env ahead of the default one.
+
+    SWE-rebench images ship the project's test dependencies in a `testbed`
+    conda env, but their `/root/.bashrc` runs `conda activate base` and a plain
+    `docker exec` doesn't source it anyway. So every command — the grader's test
+    runs *and* the agent's `run_command`, which inherits this process's env —
+    landed in `base`, where the project and its deps are absent.
+
+    That is not a cosmetic difference. On the three shared instances the gold
+    patch scored 0/3 resolved purely from this: `pytest: not found` on
+    azure-cli-2214, `No module named 'isodate'` on msrest-43. With the right
+    env (and `install` actually run, below) the same gold patch passes 46/46.
+    It also silently withdrew the agent's ability to run the tests the prompt
+    tells it to run.
+    """
+    p = dexec(cid, "ls -d /opt/conda/envs/testbed/bin 2>/dev/null; printenv PATH")
+    lines = [x for x in p.stdout.strip().splitlines() if x.strip()]
+    if len(lines) < 2:
+        return {}
+    return {"PATH": f"{lines[0]}:{lines[1]}"}
+
+
+def run_install(cid: str, repo: str, inst: dict, env: dict[str, str]) -> str:
+    """Run the instance's own `install_config.install` commands.
+
+    These ride along in every instance record and were never executed. Without
+    them the repo isn't importable from the testbed env, so the tests fail for
+    a reason that has nothing to do with the patch under test.
+
+    Re-run after every reset because `git clean -fd` removes the `*.egg-info`
+    an editable install leaves in the tree.
+    """
+    cmds = inst.get("install") or []
+    if isinstance(cmds, str):
+        cmds = [cmds]
+    if not cmds:
+        return ""
+    script = " && ".join(str(c) for c in cmds)
+    p = dexec(cid, script, workdir=repo, timeout=1800, env=env)
+    return "" if p.returncode == 0 else (p.stdout + p.stderr)[-400:]
+
+
 def install_agent(cid: str, uv: Path, src: Path, timeout: int = 1800) -> None:
     """Install squishy into an isolated venv with its own Python 3.11.
 
@@ -275,14 +371,20 @@ def install_agent(cid: str, uv: Path, src: Path, timeout: int = 1800) -> None:
 
 # -- repo state -------------------------------------------------------------
 
-def reset_repo(cid: str, repo: str, base_commit: str) -> None:
+def reset_repo(cid: str, repo: str, base_commit: str,
+               env: dict[str, str] | None = None) -> None:
     # No -x on clean: build outputs and vendored deps (node_modules, target/)
     # are baked into the image and gitignored; removing them would break the
     # test run we are about to do.
+    # `-e '*.egg-info'` keeps the editable install valid across resets. Without
+    # it every reset deletes the metadata `pip install -e .` wrote, so the
+    # package stops importing and the instance's install has to be re-run for
+    # each of the three resets an arm performs — 200s apiece on azure-cli.
     dexec(cid, (
-        "rm -rf .squishy; git checkout -- . 2>/dev/null; git clean -fd -- . 2>/dev/null; "
+        "rm -rf .squishy; git checkout -- . 2>/dev/null; "
+        "git clean -fd -e '*.egg-info' -e '.eggs' -- . 2>/dev/null; "
         f"git checkout -f {base_commit} -- . 2>/dev/null; true"
-    ), workdir=repo, timeout=600)
+    ), workdir=repo, timeout=600, env=env or {})
 
 
 def collect_patch(cid: str, repo: str) -> str:
@@ -333,10 +435,43 @@ def _parse_statuses(output: str) -> dict:
     return statuses
 
 
-def run_tests(cid: str, repo: str, test_cmd: str, timeout: int) -> dict:
+def scope_test_cmd(test_cmd: str, f2p: list, p2p: list) -> str:
+    """Restrict a bare `pytest` to the files that actually carry graded tests.
+
+    The dataset's `test_cmd` names no path, so pytest collects the whole repo
+    while FAIL_TO_PASS/PASS_TO_PASS only ever cover one or two files. Any
+    unrelated module that fails to import then aborts the entire run with
+    "Interrupted: N errors during collection" — and since that yields no
+    per-test lines, grading falls through to the suite exit code and calls the
+    patch unresolved. On the shared holdout that alone sank two of three gold
+    patches: azure-cli-2214 died on `scripts/smoke_test_install/`, msrest-43 on
+    a missing `httpretty` in `tests/test_runtime.py`. Neither has anything to do
+    with the fix under test.
+
+    Files, not full node ids: some FAIL_TO_PASS entries are parametrized ids
+    truncated at a space (`test_validate[Valid`), which pytest cannot resolve.
+    The file is enough to dodge the unrelated imports, and `-rA` still reports
+    per-test outcomes for the real grading in `_grade_by_test`.
+
+    Left alone for non-pytest runners (go test, cargo test), where these ids
+    are not paths.
+    """
+    if "pytest" not in test_cmd:
+        return test_cmd
+    files = sorted({
+        str(t).split("::")[0] for t in list(f2p or []) + list(p2p or [])
+        if "::" in str(t) and str(t).split("::")[0].endswith(".py")
+    })
+    if not files:
+        return test_cmd
+    return test_cmd + " " + " ".join(files)
+
+
+def run_tests(cid: str, repo: str, test_cmd: str, timeout: int,
+              env: dict[str, str] | None = None) -> dict:
     t0 = time.time()
     try:
-        p = dexec(cid, test_cmd, workdir=repo, timeout=timeout)
+        p = dexec(cid, test_cmd, workdir=repo, timeout=timeout, env=env or {})
         output = p.stdout + p.stderr
         return {"exit_code": p.returncode, "timed_out": False,
                 "elapsed_s": round(time.time() - t0, 1),
@@ -425,7 +560,12 @@ def _grade_by_test(pre: dict, post: dict, f2p: list, p2p: list) -> dict | None:
 
 # -- the run ----------------------------------------------------------------
 
-def run_agent(cid: str, repo: str, inst: dict, args, cache: Path) -> dict:
+# Arms driven by the OpenAI Agents SDK rather than squishy's own loop.
+SDK_ARMS = ("sdk", "graph")
+
+
+def run_agent(cid: str, repo: str, inst: dict, args, cache: Path,
+              env: dict[str, str] | None = None) -> dict:
     task = {
         "repo": repo,
         "prompt": PROMPT.format(
@@ -450,14 +590,22 @@ def run_agent(cid: str, repo: str, inst: dict, args, cache: Path) -> dict:
     tf = cache / "task.json"
     tf.write_text(json.dumps(task))
     sh("docker", "cp", str(tf), f"{cid}:/opt/squishy-task.json", timeout=120)
-    sh("docker", "cp", str(Path(__file__).parent / "driver.py"),
+    # The SDK arms run a different driver against the same task and result
+    # files, so both harnesses are graded by the code path below without a
+    # branch anywhere after this point.
+    driver = "driver_graph.py" if args.tools in SDK_ARMS else "driver.py"
+    sh("docker", "cp", str(Path(__file__).parent / driver),
        f"{cid}:/opt/driver.py", timeout=120)
 
     # Hard wall on top of the agent's own timeout, so a wedged process can't
     # hold the whole sweep hostage.
     wall = int(args.task_timeout * (1 + args.empty_patch_retries) + 300)
     try:
-        dexec(cid, f"{VENV}/bin/python /opt/driver.py", workdir=repo, timeout=wall)
+        # env carries the testbed PATH; squishy's run_command inherits this
+        # process's environment, so the agent runs tests in the same env the
+        # grader does.
+        dexec(cid, f"{VENV}/bin/python /opt/driver.py", workdir=repo,
+              timeout=wall, env=env or {})
     except subprocess.TimeoutExpired:
         pass  # partial metrics are already on disk — that's the point
 
@@ -493,33 +641,36 @@ def _serial_variant(cmd: str) -> str | None:
     return None
 
 
-def grade(cid: str, repo: str, inst: dict, patch: str, args) -> dict:
+def grade(cid: str, repo: str, inst: dict, patch: str, args,
+          env: dict[str, str] | None = None) -> dict:
     """Two real test runs. See module docstring for why `pre` matters."""
     test_cmd = inst.get("test_cmd") or ""
     if not test_cmd:
         return {"resolved": False, "eval_error": "instance has no test_cmd"}
+    test_cmd = scope_test_cmd(
+        test_cmd, inst.get("FAIL_TO_PASS") or [], inst.get("PASS_TO_PASS") or [])
     base, tp = inst["base_commit"], inst.get("test_patch") or ""
     adapted = ""
 
-    reset_repo(cid, repo, base)
+    reset_repo(cid, repo, base, env)
     ok, err = apply_patch(cid, repo, tp, "test")
     if not ok:
         return {"resolved": False, "eval_error": f"gold test patch failed to apply: {err}"}
-    pre = run_tests(cid, repo, test_cmd, args.test_timeout)
+    pre = run_tests(cid, repo, test_cmd, args.test_timeout, env)
     if _no_tests_ran(pre):
         alt = _serial_variant(test_cmd)
         if alt:
-            retry = run_tests(cid, repo, alt, args.test_timeout)
+            retry = run_tests(cid, repo, alt, args.test_timeout, env)
             if not _no_tests_ran(retry):
                 # Adopt it for both runs so pre and post stay comparable.
                 test_cmd, pre, adapted = alt, retry, "serial"
 
-    reset_repo(cid, repo, base)
+    reset_repo(cid, repo, base, env)
     ok, err = apply_patch(cid, repo, tp, "test")
     if not ok:
         return {"resolved": False, "eval_error": f"gold test patch failed to apply: {err}"}
     applied, apply_err = apply_patch(cid, repo, patch, "model")
-    post = run_tests(cid, repo, test_cmd, args.test_timeout) if applied else {
+    post = run_tests(cid, repo, test_cmd, args.test_timeout, env) if applied else {
         "exit_code": None, "timed_out": False, "elapsed_s": 0.0, "tail": ""}
 
     out = {"pre": pre, "post": post, "model_patch_applied": applied,
@@ -569,7 +720,9 @@ def run_instance(inst: dict, args, cache: Path, uv: Path, src: Path,
     try:
         cid = start_container(inst["image_name"])
         repo = find_repo(cid)
-        # A gold-only run never starts the agent, so skip the install.
+        env = testbed_env(cid)
+        install_err = run_install(cid, repo, inst, env)
+        # A gold-only run never starts the agent, so skip installing squishy.
         if any(a["tools"] != "gold" for a in arms):
             install_agent(cid, uv, src)
     except Exception as e:  # noqa: BLE001
@@ -586,9 +739,15 @@ def run_instance(inst: dict, args, cache: Path, uv: Path, src: Path,
             t0 = time.time()
             rec = {"instance_id": iid, "language": inst["language"],
                    "model": args.model, **arm}
+            # Recorded, not raised: some instances genuinely have no install
+            # step, and a partial failure still often leaves a runnable tree.
+            # But a silent one turns "the model is bad" into an unfalsifiable
+            # claim, which is how this whole path stayed broken.
+            if install_err:
+                rec["install_error"] = install_err
             arm_args = argparse.Namespace(**{**vars(args), **arm})
             try:
-                reset_repo(cid, repo, inst["base_commit"])
+                reset_repo(cid, repo, inst["base_commit"], env)
                 if arm["index"]:
                     # Built directly, not via `squishy --init`, which would
                     # need LLM round-trips for file summaries.
@@ -607,12 +766,12 @@ def run_instance(inst: dict, args, cache: Path, uv: Path, src: Path,
                     patch = inst.get("gold_patch") or ""
                     rec["exit_status"] = "gold"
                 else:
-                    rec.update(run_agent(cid, repo, inst, arm_args, cache))
+                    rec.update(run_agent(cid, repo, inst, arm_args, cache, env))
                     patch = collect_patch(cid, repo)
                 rec["patched"] = bool(patch.strip())
                 rec["patch_bytes"] = len(patch)
                 rec["patch"] = patch
-                rec.update(grade(cid, repo, inst, patch, arm_args))
+                rec.update(grade(cid, repo, inst, patch, arm_args, env))
             except Exception as e:  # noqa: BLE001
                 rec["setup_error"] = f"{type(e).__name__}: {e}"
                 rec.setdefault("resolved", False)
@@ -633,13 +792,23 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://host.docker.internal:1234/v1")
     ap.add_argument("--mode", default="bench")
     ap.add_argument("--tools", default="minimal",
-                    help="Comma-separated arms to run per instance: minimal, "
-                         "standard, or `gold` (skip the agent and grade the "
+                    help="Comma-separated arms to run per instance. squishy's "
+                         "own loop: minimal, standard. OpenAI Agents SDK: "
+                         "`sdk` (filesystem tools) and `graph` (knowledge "
+                         "graph). `gold` skips the agent and grades the "
                          "dataset's own patch — a self-test of the grading "
-                         "pipeline). Arms share one container.")
+                         "pipeline. Arms share one container.")
+    ap.add_argument("--seeds", type=int, default=1,
+                    help="Repeats of every arm per instance. Patch rate at one "
+                         "seed is noise; three is the minimum that separates a "
+                         "harness change from run-to-run variance.")
     ap.add_argument("--index", default="off",
                     help="Index arms to run: off, on, or both")
-    ap.add_argument("--max-turns", type=int, default=60)
+    # An upper bound, not a promise. Big repos (qiskit, azure-cli) need the
+    # headroom, and the SDK driver projects the *binding* limit from the
+    # observed per-turn cost against --task-timeout, so raising this does not
+    # silently hand a slow image a budget its wall clock cannot pay for.
+    ap.add_argument("--max-turns", type=int, default=100)
     ap.add_argument("--max-turns-without-edit", type=int, default=12)
     ap.add_argument("--empty-patch-retries", type=int, default=1)
     ap.add_argument("--task-timeout", type=float, default=1200.0)
@@ -658,12 +827,17 @@ def main() -> int:
     if args.limit:
         insts = insts[: args.limit]
 
-    # One arm per (tool profile x index setting), all sharing a container.
+    # One arm per (tool profile x index setting x seed), all sharing a
+    # container. Seeds are repeats of an identical arm: at n=1 a patch-rate
+    # difference between two profiles is indistinguishable from the same
+    # profile run twice, so a single-seed comparison cannot be read at all.
     index_arms = {"off": [False], "on": [True], "both": [False, True]}[args.index]
-    arms = [{"tools": t, "index": i}
+    arms = [{"tools": t, "index": i, "seed": s}
+            for s in range(args.seeds)
             for t in args.tools.split(",") for i in index_arms]
-    print(f"{len(insts)} instances x {len(arms)} arms: "
-          + ", ".join(f"{a['tools']}/index={a['index']}" for a in arms))
+    print(f"{len(insts)} instances x {len(arms)} arms "
+          f"({args.seeds} seed(s)): "
+          + ", ".join(sorted({f"{a['tools']}/index={a['index']}" for a in arms})))
 
     outp = Path(args.out)
     done: set[tuple] = set()
@@ -671,7 +845,8 @@ def main() -> int:
         for line in outp.read_text().splitlines():
             if line.strip():
                 r = json.loads(line)
-                done.add((r["instance_id"], r.get("tools"), r.get("index")))
+                done.add((r["instance_id"], r.get("tools"), r.get("index"),
+                          r.get("seed", 0)))
         print(f"resuming: {len(done)} arm-runs already done")
 
     cache = Path(tempfile.gettempdir()) / "squishy_bench_cache"
@@ -682,7 +857,8 @@ def main() -> int:
     with outp.open("a") as out:
         for n, inst in enumerate(insts, 1):
             iid = inst["instance_id"]
-            todo = [a for a in arms if (iid, a["tools"], a["index"]) not in done]
+            todo = [a for a in arms
+                    if (iid, a["tools"], a["index"], a["seed"]) not in done]
             if not todo:
                 print(f"[{n}/{len(insts)}] {iid} — skipped (resume)", flush=True)
                 continue
@@ -690,7 +866,8 @@ def main() -> int:
             for rec in run_instance(inst, args, cache, uv, src, todo):
                 out.write(json.dumps(rec) + "\n")
                 out.flush()
-                label = f"{rec['tools']}{'+index' if rec['index'] else ''}"
+                label = (f"{rec['tools']}{'+index' if rec['index'] else ''}"
+                         f"#{rec.get('seed', 0)}")
                 print(
                     f"    {label:16} resolved={str(rec.get('resolved')):5} "
                     f"patched={str(rec.get('patched')):5} "

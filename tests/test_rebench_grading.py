@@ -174,6 +174,13 @@ def test_names_the_tests_the_evaluation_adds(rb):
 
 
 def test_pre_existing_test_is_not_reported_absent(rb):
+    """Present but rewritten: runnable, and not to be trusted.
+
+    The model can execute this one, so it must not be called absent — but the
+    evaluation replaces the file, so the checkout's copy may pass at base.
+    Telling it to "run them now" here is what cost msrest-for-python-43 all 60
+    of its turns: the test went green eleven times and the model never edited.
+    """
     f2p = ["tests/test_a.py::test_already_here"]
     patch = (
         "--- a/tests/test_a.py\n+++ b/tests/test_a.py\n@@\n"
@@ -182,18 +189,61 @@ def test_pre_existing_test_is_not_reported_absent(rb):
         "+        assert new\n"
     )
     assert rb._tests_added_by_patch(f2p, patch) == set()
+    assert rb._tests_rewritten_by_patch(f2p, patch) == set(f2p)
     block = rb._tests_block(f2p, test_patch=patch)
     assert "NOT in this checkout" not in block
-    assert "Run them now" in block
+    assert "Run them now" not in block
+    assert "A green run proves nothing" in block
 
 
-def test_partial_absence_keeps_the_runnable_closing(rb):
+def test_partial_absence_still_warns_the_file_is_replaced(rb):
+    """One added, one rewritten — neither is a trustworthy oracle."""
     f2p = ["tests/a.py::test_old", "tests/a.py::test_new"]
     patch = "--- a/tests/a.py\n+++ b/tests/a.py\n@@\n+    def test_new(self):\n"
     block = rb._tests_block(f2p, test_patch=patch)
     assert "test_new" in block.split("NOT in this checkout")[1]
+    assert "Run them now" not in block
+    assert "A green run proves nothing" in block
+
+
+def test_untouched_test_file_is_the_only_runnable_case(rb):
+    """A target the evaluation leaves alone is a real oracle — say so."""
+    f2p = ["tests/test_a.py::test_untouched"]
+    patch = "--- a/tests/test_b.py\n+++ b/tests/test_b.py\n@@\n+    def test_other(self):\n"
+    assert rb._tests_rewritten_by_patch(f2p, patch) == set()
+    block = rb._tests_block(f2p, test_patch=patch)
     assert "Run them now" in block
 
 
 def test_no_test_patch_makes_no_claim(rb):
     assert rb._tests_added_by_patch(["a::b"], "") == set()
+
+
+def test_scope_test_cmd_restricts_pytest_to_the_graded_files(rb):
+    """A bare `pytest` collects the whole repo; the grade covers two files.
+
+    An unrelated module that fails to import then aborts the run with
+    "Interrupted: N errors during collection", which yields no per-test lines,
+    so grading falls back to the suite exit code and calls every patch
+    unresolved. That alone sank two of three gold patches on the shared
+    holdout.
+    """
+    cmd = "pytest --no-header -rA"
+    scoped = rb.scope_test_cmd(
+        cmd, ["tests/test_a.py::test_x"], ["tests/test_b.py::test_y"])
+    assert scoped == cmd + " tests/test_a.py tests/test_b.py"
+
+
+def test_scope_test_cmd_leaves_non_pytest_runners_alone(rb):
+    """Go and Rust ids are not paths, so there is nothing to scope to."""
+    assert rb.scope_test_cmd("go test -v ./...", ["TestBase64"], []) == "go test -v ./..."
+
+
+def test_scope_test_cmd_ignores_truncated_parametrized_ids(rb):
+    """`test_validate[Valid` (split at a space upstream) is not a resolvable id.
+
+    Scoping to the file dodges the unrelated imports without asking pytest to
+    resolve a node id it cannot.
+    """
+    f2p = ["test/unit/test_ref.py::test_validate[Valid"]
+    assert rb.scope_test_cmd("pytest", f2p, []) == "pytest test/unit/test_ref.py"

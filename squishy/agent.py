@@ -350,31 +350,31 @@ class Agent:
         self._strip_live_context_pair()
         if not self.tool_ctx.notes:
             return
-        content = render_notes(self.tool_ctx.notes)
-        assistant = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": self._LIVE_CTX_CALL_ID,
-                    "type": "function",
-                    "function": {
-                        "name": self._LIVE_CTX_TOOL_NAME,
-                        "arguments": "{}",
-                    },
-                }
-            ],
+        # A tail `system` message, not a fabricated (assistant tool_calls, tool
+        # result) pair. The pair put a call to `_squishy_context` — a tool that
+        # is in no schema we send — into the transcript the model reads, every
+        # single turn. Models imitate their own history: on
+        # msrest-for-python-43 the model duly called `_squishy_context` twice
+        # and got `unknown tool` back both times. The harness demonstrated a
+        # tool call and then refused it.
+        #
+        # `_build_result` already filtered this pair out of the SFT export for
+        # exactly this reason ("it would teach a `_squishy_context` tool call
+        # that does not exist") — but the live model was never covered by that
+        # guard, only the training data downstream of it.
+        #
+        # A system message keeps every property the pair was chosen for: it is
+        # appended at the tail so `messages[0]` is untouched and the vLLM prefix
+        # cache survives, it carries no `tool_call_id` so it cannot orphan, and
+        # `normalize_messages` passes non-assistant/tool roles through
+        # unchanged. It is also not a user turn, so the "feedback belongs in the
+        # tool result" rule is not at stake — this is standing context, not
+        # feedback on an action.
+        self.messages.append({
+            "role": "system",
+            "content": render_notes(self.tool_ctx.notes),
             self._LIVE_CTX_MARKER: True,
-        }
-        tool_result = {
-            "role": "tool",
-            "tool_call_id": self._LIVE_CTX_CALL_ID,
-            "name": self._LIVE_CTX_TOOL_NAME,
-            "content": content,
-            self._LIVE_CTX_MARKER: True,
-        }
-        self.messages.append(assistant)
-        self.messages.append(tool_result)
+        })
 
     def _forget_invisible_reads(self) -> None:
         """Drop read-tracking for files whose content is no longer in history.

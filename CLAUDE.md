@@ -117,3 +117,42 @@ trained on another harness is never penalized.
 - **SWE-bench** (`bench/swebench.py`): clones repo, runs install commands, builds prompt with problem statement + failing tests + optional index recall, runs agent, captures `git diff` as patch.
 - **Terminal-bench** (`bench/terminalbench.py`): creates temp workspace, seeds files, runs agent, scores by verify-shell exit code.
 - **Runner** (`bench/runner.py`): generic async batch runner with `asyncio.Semaphore` concurrency and append-only JSONL output.
+
+### graphagent: the second harness
+
+`graphagent/` is a separate agent built on the OpenAI Agents SDK, kept in this
+repo so it can be compared against squishy's loop on the same instances, in the
+same containers, through the same grader. It has its own README.
+
+- Read tools are pure functions in `agentkit/tools.py` (no SDK imports); write
+  tools in `agentkit/edit.py`. The factories wrap them with `@function_tool`.
+- `agentkit/llm.py::resolve_model` points the SDK at any OpenAI-compatible
+  endpoint. It **refuses to default the model id** on the local path — LM Studio
+  loads whatever id it is handed.
+- Bench arms: `run_bench.py --tools sdk,graph` runs
+  `scripts/rebench_container/driver_graph.py` instead of `driver.py`. Both write
+  the same result file, so grading is unchanged.
+- The one rule this harness needs that squishy's doesn't: **`Runner.run`
+  returning is not proof the task is done.** An empty assistant message ends a
+  run, and the SDK calls that "completed". `driver_graph._drive` resumes the
+  same transcript with a nudge while the tree is unchanged, sharing one turn
+  budget. Guarded by `tests/kg/test_driver_graph.py`.
+- Same rule as squishy's loop: **the brakes live in the tool result.** Three of
+  them, all in `swe.py::_log`, all found by reading one trace — an identical
+  repeat (`[repeat]`), a run of commands with nothing edited (`[probes]`), and
+  the turn budget running out before any edit (`[budget]`). Together they took
+  the SDK arms from 5/7 to 21/21 patched.
+- `_effective_budget` reports the *binding* limit of `--max-turns` and
+  `--task-timeout`, projected from the observed per-turn cost. They are set
+  independently and disagree on slow images; the agent was being told it had
+  nine turns left as the process was killed.
+- Sizing tool output against a round trip: a turn costs 8.5-11k prompt tokens
+  because the whole transcript is resent, so a summary that saves less than
+  that and forces a follow-up call is a net loss. This is why `read_file`
+  returns an outline only above the 400-line read cap, where the file
+  truncates anyway.
+- `run_bench.py --seeds N` repeats every arm. At one seed a patch-rate
+  difference between two profiles is indistinguishable from the same profile
+  run twice.
+- graphagent's tests live in `tests/kg/` (a package, so its `conftest.py` does
+  not collide with `tests/conftest.py`).

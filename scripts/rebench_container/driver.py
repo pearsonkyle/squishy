@@ -68,7 +68,13 @@ def _args_summary(name: str, args: dict) -> str:
             span = f" [off={args.get('offset', 0)} lim={args.get('limit')}]"
         return f"{args.get('path', '')}{span}"
     if name in ("edit_file", "write_file"):
-        return str(args.get("path", ""))
+        # The path alone can't distinguish "tried to edit and the match failed"
+        # from "never tried" — and now that harness refusals are gone, a failed
+        # edit is the last thing standing between a run and a patch. Record the
+        # first line of what it tried to match.
+        target = str(args.get("old_str") or args.get("old_string") or "")
+        first = " ".join(target.split("\n", 1)[0].split())[:70]
+        return f"{args.get('path', '')}" + (f"  old_str={first!r}" if first else "")
     if name in ("search_files", "glob_files", "recall"):
         return str(args.get("pattern") or args.get("query") or "")[:80]
     return " ".join(f"{k}={str(v)[:40]}" for k, v in list(args.items())[:3])

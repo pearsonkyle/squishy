@@ -379,3 +379,27 @@ async def test_undo_stack_is_bounded(ctx):
     for i in range(_UNDO_STACK_CAP + 20):
         await write_file.run({"path": f"f{i}.py", "content": "x\n"}, ctx)
     assert len(ctx.undo_stack) <= _UNDO_STACK_CAP
+
+
+async def test_bench_repro_refusal_offers_tmp_instead_of_blocking(tmp_path):
+    """Refuse the location, not the technique.
+
+    Reproducing the failure in a throwaway script is how the bug gets confirmed
+    at all — on msrest-for-python-43 it is the whole difference between the
+    reference agent (repro snippets, resolved) and squishy (none, 60 turns, no
+    patch). The one real objection is that a scratch file in the repo lands in
+    the graded diff, so the refusal must hand back the route that works rather
+    than telling the model to stop trying.
+    """
+    from squishy.tools.base import ToolContext
+
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="bench",
+                      use_sandbox=False)
+    r = await write_file.run(
+        {"path": "repro_bug.py", "content": "print(1)\n"}, ctx)
+    assert not r.success
+    # Names the actual objection, and the working alternative.
+    assert "graded diff" in r.error
+    assert "/tmp/repro_bug.py" in r.error
+    # And must not withdraw the technique itself.
+    assert "not allowed" not in r.error

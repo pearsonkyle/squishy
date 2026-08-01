@@ -38,3 +38,6 @@ temp/
 
 # Generated repo index
 .squishy/
+
+# Generated knowledge graph
+.graphagent.json

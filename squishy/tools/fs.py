@@ -519,12 +519,24 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             or "repro" in basename or "reproduction" in basename
         )
         if is_test_file:
+            # Refuse the location, not the technique. Reproducing the bug in a
+            # throwaway script is how the failure gets confirmed at all — on
+            # msrest-for-python-43 it is the entire difference between the
+            # reference agent (nine repro snippets, resolved) and this one
+            # (zero, sixty turns, no patch). The only real objection is that a
+            # scratch file inside the repo lands in the graded diff, and /tmp
+            # answers that. Refusing outright and saying "fix the SOURCE code
+            # instead" withdrew the tool and the technique together.
             return ToolResult(
                 False,
                 error=(
-                    "write_file refused — creating test/reproduction files is not "
-                    "allowed in bench mode. Fix the SOURCE code instead.\n"
-                    "Use `edit_file` on the existing source file to apply your fix."
+                    f"write_file refused — {path} is inside the repo, so it would "
+                    "land in the graded diff.\n"
+                    "Write it under /tmp instead and run it from there:\n"
+                    f'  write_file(path="/tmp/{os.path.basename(abs_path)}", content=...)\n'
+                    '  run_command(command="python /tmp/'
+                    f'{os.path.basename(abs_path)}")\n'
+                    "The fix itself still belongs in the source file — use `edit_file` for that."
                 ),
             )
 

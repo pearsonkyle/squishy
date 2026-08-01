@@ -85,7 +85,10 @@ def main() -> int:
     from dataclasses import asdict, is_dataclass
     payload = asdict(summary) if is_dataclass(summary) else summary
     (ws / "summary.json").write_text(json.dumps(payload, indent=2, default=str))
-    records = payload.get("records") or payload.get("instances") or []
+    # SweSummary names this `per_instance`; the other two keys never existed,
+    # so this line printed "resolved 0/0 (0%)" over a run that had in fact
+    # resolved everything it was given.
+    records = payload.get("per_instance") or []
     n = len(records) or 1
     res = sum(1 for r in records if r.get("resolved"))
     pat = sum(1 for r in records if r.get("patch_produced"))
