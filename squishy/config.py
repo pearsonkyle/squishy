@@ -63,11 +63,6 @@ class Config:
     max_tool_output_chars: int = 32_000
     compaction_threshold: float = 0.7
     max_system_nudges: int = 8  # cap total nudges to avoid flooding context
-    # Turns allowed with no successful edit before the loop starts periodically
-    # reminding the model that a run ending with no diff scores zero. This is a
-    # nudge, not a gate: the blocking version of it withdrew `run_command` and
-    # measurably cost patches. bench/yolo only; 0 disables.
-    max_turns_without_edit: int = 12
     # Session persistence.
     session_dir: str = field(
         default_factory=lambda: os.environ.get(

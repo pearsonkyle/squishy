@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from graphagent.graph.builder import build_graph
-from graphagent.graph.models import EdgeKind, NodeKind
+from squishy.graph.builder import build_graph
+from squishy.graph.models import EdgeKind, NodeKind
 
 
 def test_indexes_all_python_files(sample_repo: Path) -> None:

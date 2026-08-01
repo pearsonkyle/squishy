@@ -272,7 +272,7 @@ def source_tarball(cache: Path) -> Path:
     """Pack the working tree's squishy source for installation in-container."""
     out = cache / "squishy-src.tgz"
     with tarfile.open(out, "w:gz") as tf:
-        for item in ("squishy", "graphagent", "pyproject.toml", "README.md"):
+        for item in ("squishy", "pyproject.toml", "README.md"):
             p = REPO_ROOT / item
             if p.exists():
                 tf.add(p, arcname=item, filter=_skip_junk)
@@ -286,10 +286,28 @@ def _skip_junk(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return info
 
 
+def _image_present(image: str) -> bool:
+    """True if the image is already in the local daemon."""
+    # `docker image inspect` matches on the exact reference, so the
+    # `docker.io/` prefix the dataset sometimes carries has to be tried both
+    # ways — the same image is stored under the short name.
+    for ref in {image, image.removeprefix("docker.io/")}:
+        if sh("docker", "image", "inspect", ref, timeout=60).returncode == 0:
+            return True
+    return False
+
+
 def start_container(image: str) -> str:
     p = sh("docker", "pull", "-q", "--platform", "linux/amd64", image, timeout=3600)
     if p.returncode != 0:
-        raise RuntimeError(f"pull failed: {p.stderr.strip()[:300]}")
+        # A pull failure is only fatal if the image isn't already here. It
+        # routinely isn't fatal: these images are multi-gigabyte and pulled
+        # once, so an offline machine or an unreachable registry was throwing
+        # away a fully usable local cache and failing every instance in the
+        # sweep with a network error.
+        if not _image_present(image):
+            raise RuntimeError(f"pull failed: {p.stderr.strip()[:300]}")
+        print(f"    (pull failed, using cached image: {p.stderr.strip()[:80]})")
     p = sh("docker", "run", "-d", "--platform", "linux/amd64",
            "--entrypoint", "sleep", image, "infinity", timeout=300)
     if p.returncode != 0:
@@ -560,10 +578,6 @@ def _grade_by_test(pre: dict, post: dict, f2p: list, p2p: list) -> dict | None:
 
 # -- the run ----------------------------------------------------------------
 
-# Arms driven by the OpenAI Agents SDK rather than squishy's own loop.
-SDK_ARMS = ("sdk", "graph")
-
-
 def run_agent(cid: str, repo: str, inst: dict, args, cache: Path,
               env: dict[str, str] | None = None) -> dict:
     task = {
@@ -582,7 +596,6 @@ def run_agent(cid: str, repo: str, inst: dict, args, cache: Path,
         "mode": args.mode,
         "tool_profile": args.tools,
         "max_turns": args.max_turns,
-        "max_turns_without_edit": args.max_turns_without_edit,
         "task_timeout": args.task_timeout,
         "fail_to_pass": inst.get("FAIL_TO_PASS") or [],
         "test_cmd": inst.get("test_cmd", ""),
@@ -590,11 +603,7 @@ def run_agent(cid: str, repo: str, inst: dict, args, cache: Path,
     tf = cache / "task.json"
     tf.write_text(json.dumps(task))
     sh("docker", "cp", str(tf), f"{cid}:/opt/squishy-task.json", timeout=120)
-    # The SDK arms run a different driver against the same task and result
-    # files, so both harnesses are graded by the code path below without a
-    # branch anywhere after this point.
-    driver = "driver_graph.py" if args.tools in SDK_ARMS else "driver.py"
-    sh("docker", "cp", str(Path(__file__).parent / driver),
+    sh("docker", "cp", str(Path(__file__).parent / "driver.py"),
        f"{cid}:/opt/driver.py", timeout=120)
 
     # Hard wall on top of the agent's own timeout, so a wedged process can't
@@ -792,10 +801,9 @@ def main() -> int:
     ap.add_argument("--base-url", default="http://host.docker.internal:1234/v1")
     ap.add_argument("--mode", default="bench")
     ap.add_argument("--tools", default="minimal",
-                    help="Comma-separated arms to run per instance. squishy's "
-                         "own loop: minimal, standard. OpenAI Agents SDK: "
-                         "`sdk` (filesystem tools) and `graph` (knowledge "
-                         "graph). `gold` skips the agent and grades the "
+                    help="Comma-separated arms to run per instance: standard, "
+                         "minimal, graph (adds `explore` over a prebuilt code "
+                         "graph), shell. `gold` skips the agent and grades the "
                          "dataset's own patch — a self-test of the grading "
                          "pipeline. Arms share one container.")
     ap.add_argument("--seeds", type=int, default=1,
@@ -809,7 +817,6 @@ def main() -> int:
     # observed per-turn cost against --task-timeout, so raising this does not
     # silently hand a slow image a budget its wall clock cannot pay for.
     ap.add_argument("--max-turns", type=int, default=100)
-    ap.add_argument("--max-turns-without-edit", type=int, default=12)
     ap.add_argument("--empty-patch-retries", type=int, default=1)
     ap.add_argument("--task-timeout", type=float, default=1200.0)
     ap.add_argument("--test-timeout", type=int, default=1800)

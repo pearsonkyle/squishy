@@ -14,6 +14,9 @@ READ_ONLY_TOOLS = frozenset({
     "search_files",
     "glob_files",
     "recall",
+    "explore",
+    "impact_of",
+    "repo_map",
     "save_note",
     "show_diff",
 })
@@ -55,6 +58,14 @@ MINIMAL_TOOLS = frozenset({
     "run_command", "read_file", "edit_file", "write_file",
 })
 
+# `minimal` plus the one graph tool that replaces a crawl. `explore` earns its
+# ~120 schema tokens by answering in one call what grep-then-read-then-read
+# answers in four; `impact_of` and `repo_map` do not, so they stay out — a
+# narrow profile exists to be narrow. Only offered when a graph exists.
+GRAPH_TOOLS = frozenset({
+    "run_command", "read_file", "edit_file", "write_file", "explore",
+})
+
 # The mini-swe-agent / quant-tuner shape: a shell and nothing else. Reading,
 # editing, searching and testing all go through the same command interface,
 # which is the tool vocabulary these models have seen most. Costs ~170 schema
@@ -65,6 +76,7 @@ TOOL_PROFILES: dict[str, frozenset[str] | None] = {
     # None = no narrowing; the permission mode alone decides.
     "standard": None,
     "minimal": MINIMAL_TOOLS,
+    "graph": GRAPH_TOOLS,
     "shell": SHELL_ONLY_TOOLS,
 }
 

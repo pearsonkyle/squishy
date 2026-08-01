@@ -332,3 +332,16 @@ async def test_client_on_retry_callback_errors_dont_break_retry():
     # Retry budget still ran to completion despite the broken callback.
     assert result.text == "ok"
     assert client.last_call_retries == 2
+
+
+def test_graph_calls_show_what_they_were_asked():
+    """A bare `explore` line hides the only interesting part of the call.
+
+    Every other tool prints its target — the path, the pattern, the query —
+    so a run is readable at a glance. The graph tools were the exception.
+    """
+    from squishy.agent_state import brief
+    from squishy.client import ToolCall
+
+    assert brief(ToolCall(id="1", name="explore", args={"query": "budget_notice"})) == "budget_notice"
+    assert brief(ToolCall(id="2", name="impact_of", args={"symbol": "CodeGraph"})) == "CodeGraph"

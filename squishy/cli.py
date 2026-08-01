@@ -807,3 +807,22 @@ async def _run_init(cfg: Config, client: Client, display: Display, *, summaries:
     from squishy.index.store import index_path
 
     display.info(f"[index] saved → {index_path(cfg.working_dir)}")
+
+    # The call/import/inherit graph, built from the same tree in the same
+    # command. Kept separate from the index because it answers different
+    # questions (who calls this, what breaks if I change it) and because it is
+    # Python-only, while the index covers every language.
+    display.info("[graph] building…")
+    try:
+        from squishy.graph import build_repo_graph, graph_path
+
+        graph = build_repo_graph(cfg.working_dir)
+        s = graph.stats()
+        display.info(
+            f"[graph] {s['nodes']} nodes, {s['edges']} edges → "
+            f"{graph_path(cfg.working_dir)}"
+        )
+    except Exception as e:  # noqa: BLE001
+        # A repo with no Python, or one that fails to parse, still gets a
+        # working index — the graph is an enhancement, not a prerequisite.
+        display.warn(f"[graph] skipped: {e}")

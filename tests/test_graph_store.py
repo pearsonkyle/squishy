@@ -5,9 +5,9 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
-from graphagent.graph.builder import build_graph
-from graphagent.graph.models import EdgeKind, Node, NodeKind
-from graphagent.graph.store import CodeGraph
+from squishy.graph.builder import build_graph
+from squishy.graph.models import EdgeKind, Node, NodeKind
+from squishy.graph.store import CodeGraph
 
 
 def test_search_ranks_exact_name_first(sample_repo: Path) -> None:

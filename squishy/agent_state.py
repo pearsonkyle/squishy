@@ -116,8 +116,10 @@ def brief(tc: ToolCall) -> str:
         return f'"{a.get("pattern", "")}"'
     if tc.name == "glob_files":
         return str(a.get("pattern", ""))
-    if tc.name == "recall":
+    if tc.name in ("recall", "explore"):
         return str(a.get("query", ""))
+    if tc.name == "impact_of":
+        return str(a.get("symbol", ""))
     return ""
 
 

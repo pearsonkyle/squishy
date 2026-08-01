@@ -75,9 +75,10 @@ scolding it for making one. `tests/test_transcript_integrity.py` guards the
 regression. Loop-breaking now lives in the tools -- `read_file`'s span cache and
 `run_command`'s output-hash echo counter both answer inline.
 
-Only three things still inject: the periodic no-edit-yet reminder, the
-empty-response retry, and the post-compaction "your history was rewritten"
-notice. Nothing else may.
+Only two things still inject: the empty-response retry and the
+post-compaction "your history was rewritten" notice. Nothing else may. The
+periodic no-edit-yet reminder used to be the third; it now rides on the tool
+result instead (see "Edit pressure lives in the tool result").
 
 ### Context management (two layers)
 
@@ -99,7 +100,8 @@ is for evaluation harnesses (drops the web tools, never prompts). Enforced in
 
 Orthogonal to mode, `tool_profile` narrows what the model *sees*: `standard`
 (everything the mode allows, ~1.5k tokens/request), `minimal` (shell + file
-primitives, ~870), `shell` (`run_command` alone, ~420). A profile shapes the
+primitives, ~870), `graph` (minimal plus `explore`), `shell` (`run_command`
+alone, ~420). A profile shapes the
 schema only -- it adds no refusal path, and `tool_aliases.py` maps foreign tool
 vocabularies (bash, str_replace, file_path) onto the canonical names, so a model
 trained on another harness is never penalized.
@@ -112,47 +114,96 @@ trained on another harness is never penalized.
 
 `/init` or `--init` builds `.squishy/index.json` -- a tree of files with symbols extracted via `ast` (Python) or regex fallback (other languages). Docstrings become summaries for free; files without docstrings get optional LLM-generated summaries. Rebuilds are incremental by file hash. The `recall` tool does lexical scored lookup against this index.
 
+### The code graph
+
+The same `/init` also writes `.squishy/graph.json` (`squishy/graph/`): every
+Python file, class, function and method, plus `contains`/`imports`/`calls`/
+`inherits` edges, stored in both directions under one `threading.Lock`. The
+index answers *where does this live*; the graph answers *who calls this* and
+*what breaks if I change it*, which otherwise cost a crawl.
+
+- `graph/query.py` holds pure functions -- no tool plumbing, so every answer
+  is testable without a model. `tools/graph.py` wraps them as `explore`,
+  `impact_of`, `repo_map`.
+- `explore` is deliberately one strong tool: source + callers + callees +
+  subclasses + impact radius in a single call, which is the whole first phase
+  of a bug fix. It filters to exact matches when the query hits one, because
+  substring noise stays in the transcript for the rest of the run.
+- The graph tools leave the schema entirely when `has_graph` is false. Same
+  rule as `recall`: never advertise a tool whose only possible answer is "run
+  /init first".
+- `--tools graph` is a narrow profile: shell, file primitives, `explore`.
+  `impact_of` and `repo_map` are excluded on purpose -- a narrow profile
+  exists to be narrow. `minimal` is deliberately *not* widened with `explore`,
+  or the two profiles stop being comparable in the A/B this repo runs.
+- A miss returns the nearest names from the graph (`difflib`), not "try a
+  shorter substring" -- advice the model cannot act on without another round
+  trip, which on qiskit-terra-5662 produced the same failing query three times.
+
+### Edit pressure lives in the tool result
+
+`tools/pressure.py` is applied centrally in `dispatch()`, so every tool
+carries it and no tool has to remember to:
+
+- `[budget]` -- silent for the first half of the turn budget, a reminder at
+  half, an instruction at four fifths. Nothing else tells the model the clock
+  is running; qiskit-terra-5662 wrote sixteen repro scripts and hit the cap
+  having never touched a source file.
+- `[probes]` -- eight commands with nothing edited. cfn-lint-3965 spent 37 of
+  48 calls on `python -c` variations, no two identical, so no repeat detector
+  could see it. Resets on every source edit, because re-running a reproduction
+  *after* an edit is the correct move.
+
+This replaced a `[system]` user message injected every sixth turn (and the
+`max_turns_without_edit` knob that drove it). Same content, but paired with
+the call that earned it -- the rule the whole loop is built on.
+
+A /tmp scratch write does not count as the edit. The repro script is the right
+move and never reaches the diff, so counting it would switch the pressure off
+at exactly the moment it is needed.
+
+### Scratch files
+
+`write_file`'s own refusal message tells the model to put reproduction scripts
+under /tmp. Until `_resolve_writable` existed, doing so returned "path outside
+working directory" -- the harness refusing the action it had just demanded.
+`read_file`, `write_file` and `edit_file` now accept absolute paths under the
+scratch dir; everything else still has to stay in the repo. Both
+`tempfile.gettempdir()` and a literal `/tmp` count, because they are the same
+directory in every bench container and different ones on macOS.
+
+`read_file` returns an outline instead of a body only when the body exceeds
+the run's output cap and the graph covers the file. Measured, after shipping
+the opposite: a turn costs 8.5-11k prompt tokens because the whole transcript
+is resent, while an outline saves 0.4-3.7k, so an outline that forces a
+follow-up read is a net loss at every size. Above the cap the body is snipped
+anyway, so the follow-up was always going to happen.
+
 ### Bench harnesses
 
 - **SWE-bench** (`bench/swebench.py`): clones repo, runs install commands, builds prompt with problem statement + failing tests + optional index recall, runs agent, captures `git diff` as patch.
 - **Terminal-bench** (`bench/terminalbench.py`): creates temp workspace, seeds files, runs agent, scores by verify-shell exit code.
 - **Runner** (`bench/runner.py`): generic async batch runner with `asyncio.Semaphore` concurrency and append-only JSONL output.
 
-### graphagent: the second harness
+### Measuring a change
 
-`graphagent/` is a separate agent built on the OpenAI Agents SDK, kept in this
-repo so it can be compared against squishy's loop on the same instances, in the
-same containers, through the same grader. It has its own README.
-
-- Read tools are pure functions in `agentkit/tools.py` (no SDK imports); write
-  tools in `agentkit/edit.py`. The factories wrap them with `@function_tool`.
-- `agentkit/llm.py::resolve_model` points the SDK at any OpenAI-compatible
-  endpoint. It **refuses to default the model id** on the local path — LM Studio
-  loads whatever id it is handed.
-- Bench arms: `run_bench.py --tools sdk,graph` runs
-  `scripts/rebench_container/driver_graph.py` instead of `driver.py`. Both write
-  the same result file, so grading is unchanged.
-- The one rule this harness needs that squishy's doesn't: **`Runner.run`
-  returning is not proof the task is done.** An empty assistant message ends a
-  run, and the SDK calls that "completed". `driver_graph._drive` resumes the
-  same transcript with a nudge while the tree is unchanged, sharing one turn
-  budget. Guarded by `tests/kg/test_driver_graph.py`.
-- Same rule as squishy's loop: **the brakes live in the tool result.** Three of
-  them, all in `swe.py::_log`, all found by reading one trace — an identical
-  repeat (`[repeat]`), a run of commands with nothing edited (`[probes]`), and
-  the turn budget running out before any edit (`[budget]`). Together they took
-  the SDK arms from 5/7 to 21/21 patched.
-- `_effective_budget` reports the *binding* limit of `--max-turns` and
-  `--task-timeout`, projected from the observed per-turn cost. They are set
-  independently and disagree on slow images; the agent was being told it had
-  nine turns left as the process was killed.
+- **`scripts/rebench_container/run_bench.py`** is the real evaluation: one
+  clean container per instance, arms share it, `--tools gold` skips the agent
+  and grades the dataset's own patch as a self-test of the pipeline. Run gold
+  before trusting an instance. It falls back to a cached image when the pull
+  fails, so an unreachable registry no longer fails every instance.
+- **`scripts/parity/ab_local.py`** needs no containers: injected bugs in a
+  synthetic package, graded by a real pytest. Fast enough to iterate on, and
+  the only thing available when Docker Hub is down. `scripts/parity/README.md`
+  records the measurement that retired the OpenAI-Agents-SDK reference agent
+  (`graphagent/`) — squishy resolved 9/9 against its 9/9 and 8/9, with fewer
+  tool calls than its filesystem baseline and 5-15% more tokens.
+- `--seeds N` repeats every arm. At one seed a difference between two arms is
+  indistinguishable from the same arm run twice.
+- Read the `commands` field of each result record: the arguments are the
+  trajectory. Forty `read_file` entries say nothing; which file and which
+  range say all of it.
 - Sizing tool output against a round trip: a turn costs 8.5-11k prompt tokens
   because the whole transcript is resent, so a summary that saves less than
-  that and forces a follow-up call is a net loss. This is why `read_file`
-  returns an outline only above the 400-line read cap, where the file
-  truncates anyway.
-- `run_bench.py --seeds N` repeats every arm. At one seed a patch-rate
-  difference between two profiles is indistinguishable from the same profile
-  run twice.
-- graphagent's tests live in `tests/kg/` (a package, so its `conftest.py` does
+  that and forces a follow-up call is a net loss.
   not collide with `tests/conftest.py`).

@@ -50,6 +50,7 @@ from squishy.context import (
 )
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
+from squishy.graph import has_graph
 from squishy.index.store import has_index
 from squishy.tool_aliases import normalize_call
 from squishy.tools import PromptFn, ToolContext, openai_schemas
@@ -490,34 +491,37 @@ class Agent:
         # it leaves the schema. A stable schema also keeps the prompt prefix
         # byte-identical turn over turn, so the server's prefix cache stays warm.
         _has_idx = has_index(self.config.working_dir)
+        _has_graph = has_graph(self.config.working_dir)
+        # `recall` is added back on top of a narrow profile when an index
+        # exists. The graph tools are not: `graph` already lists `explore`,
+        # `standard` shows them all, and quietly widening `minimal` would make
+        # the two profiles incomparable in exactly the A/B this repo runs.
         schemas = openai_schemas(
             self.config.permission_mode,
             profile=self.config.tool_profile,
             extra_tools=frozenset({"recall"}) if _has_idx else frozenset(),
             has_index=_has_idx,
+            has_graph=_has_graph,
         )
 
         for turn in range(1, self.config.max_turns + 1):
             self._active_turn = turn
             self._emit({"type": "turn", "turn": turn})
 
-            # The one piece of edit pressure that survived: a periodic reminder
-            # that a run ending with no diff scores zero. Deliberately a nudge
-            # and not a gate — see _EDIT_NUDGE_EVERY.
-            edit_budget = self.config.max_turns_without_edit
-            if (
-                _is_constrained
-                and edit_budget > 0
-                and not st.files_edited
-                and not st.shell_writes
-                and turn > edit_budget
-                and turn % _EDIT_NUDGE_EVERY == 1
-            ):
-                inject_nudge(self, st, turn, (
-                    "[system] You have not changed any file yet, and a run that "
-                    "ends with no edit scores zero. Stop investigating and apply "
-                    "your best fix now, then confirm with `git diff`."
-                ), min_gap=0, force=True)
+            # Publish the clock so tool results can carry edit pressure. This
+            # replaced an injected `[system]` reminder every sixth turn: same
+            # message, but paired with the call that earned it instead of
+            # arriving out of band, and scaled to the budget actually left
+            # rather than to a fixed period. See `tools/pressure.py`.
+            self.tool_ctx.turns_used = turn
+            self.tool_ctx.turn_budget = (
+                self.config.max_turns if _is_constrained else 0
+            )
+            # Shell writes are edits the tools cannot see: under a shell-only
+            # profile every change goes through `run_command`, and pressuring a
+            # model that has already patched the file is how you get it undone.
+            if st.files_edited or st.shell_writes:
+                self.tool_ctx.source_edited = True
 
             self.tool_ctx.permission_mode = self.config.permission_mode
 

@@ -57,7 +57,7 @@ Useful flags:
 --request-timeout SECONDS  per-HTTP-request timeout (default 120)
 --max-retries N            transient-failure retry budget (default 4)
 --sandbox                  wrap run_command in Docker
---init                     build .squishy/index.json before the REPL
+--init                     build .squishy/index.json + graph.json before the REPL
 --no-summaries             skip LLM summaries when indexing (docstrings only)
 --index-concurrency N      parallel summary calls (default 4)
 ```
@@ -77,10 +77,33 @@ plus top-level symbols extracted with `ast` (Python) or a regex fallback
 - Rebuilds are incremental: unchanged files reuse their prior summary by
   file hash. Deleted files drop out; new files are summarized.
 - Pass `--no-summaries` to skip the LLM entirely (offline-friendly).
-Once an index exists, the new `recall(query=...)` tool surfaces ranked
+Once an index exists, the `recall(query=...)` tool surfaces ranked
 matches (path + summary + line range) so the model can pick the right
 module without walking the tree. A compact index header is injected into
 the system prompt, and squishy nudges you when the index is stale.
+
+## Code graph (`/init`, Python)
+
+The same `/init` also writes `.squishy/graph.json`: every Python file,
+class, function and method, plus the `contains` / `imports` / `calls` /
+`inherits` edges between them, stored in both directions.
+
+The index answers *where does this live*. The graph answers the questions
+that otherwise cost a crawl:
+
+| Tool | Answers |
+|------|---------|
+| `explore(query)` | The symbol's source, its callers and callees, its subclasses, and its impact radius — in one call |
+| `impact_of(symbol)` | Everything that transitively depends on it, before you change shared code |
+| `repo_map()` | Every file with its classes and functions, for orientation |
+
+`explore` is deliberately one strong tool rather than three weak ones: a
+single call covers the whole first phase of a bug fix. The graph tools stay
+out of the tool schema entirely when no graph exists, so the model is never
+offered a tool that can only answer "run /init first".
+
+`--tools graph` is a narrow profile — shell, file primitives and `explore`
+— for models that do better with a small schema.
 
 ## Permission modes
 
@@ -233,6 +256,9 @@ command output, and a workspace snapshot.
 | `search_files` | Regex search via ripgrep if available, Python `re` otherwise |
 | `glob_files` | Recursive file finding by glob pattern (e.g. `**/*.py`) |
 | `recall` | Ranked lookup in the `/init` index — path, lines, summary |
+| `explore` | One-call code answer from the `/init` graph — source, callers, callees, impact |
+| `impact_of` | Everything that transitively depends on a symbol |
+| `repo_map` | Every file with its classes and functions |
 | `run_command` | Shell execution, sandboxed in Docker when `--sandbox` and Docker are available |
 | `plan_task` | Create a structured task plan (plan mode) |
 | `update_plan` | Update plan step status (plan/edits mode) |

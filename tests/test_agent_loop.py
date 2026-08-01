@@ -314,7 +314,6 @@ async def test_must_edit_gate_not_applied_after_an_edit(tmp_path):
     cfg.working_dir = str(tmp_path)
     cfg.permission_mode = "yolo"
     cfg.max_turns = 8
-    cfg.max_turns_without_edit = 2
     (tmp_path / "a.py").write_text("x = 1\n")
 
     seen: list[list[str]] = []

@@ -23,6 +23,8 @@ class ToolContext:
     reserved_note_keys: set[str] = field(default_factory=set)
     _cached_index: Any = field(default=None, repr=False)
     _cached_index_mtime: float = field(default=-1.0, repr=False)
+    _cached_graph: Any = field(default=None, repr=False)
+    _cached_graph_mtime: float = field(default=-1.0, repr=False)
     files_read_count: dict[str, int] = field(default_factory=dict)
     # Repeat count per (abs_path, offset, limit) for reads served from cache.
     # Lets read_file escalate from "here it is again" to a hard refusal when a
@@ -38,6 +40,17 @@ class ToolContext:
     # back on a model circling the same three commands.
     command_echoes: dict[str, int] = field(default_factory=dict)
     edit_fail_files: set[str] = field(default_factory=set)
+    # Edit pressure, measured against the turn budget rather than guessed.
+    # `turns_used`/`turn_budget` are published by the loop each turn so a tool
+    # result can say "turn 38 of 50 and nothing edited yet" — the one thing
+    # only the loop knows and only the tool result can safely deliver.
+    turns_used: int = 0
+    turn_budget: int = 0
+    # True once a non-scratch file in the repo has actually changed.
+    source_edited: bool = False
+    # Commands run since the last source edit. A run of them with nothing
+    # edited is an investigation that is not converging.
+    probe_commands: int = 0
     extra_env: dict[str, str] = field(default_factory=dict)
     # (abs_path, original_content); original_content is None when the entry
     # records a newly-created file (undo deletes it).

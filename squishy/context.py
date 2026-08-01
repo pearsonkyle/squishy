@@ -11,6 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from squishy.graph import has_graph
 from squishy.index.store import has_index
 from squishy.tokens import (
     CHARS_PER_TOKEN,
@@ -119,7 +120,8 @@ def build_system_prompt(
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
 
     has_idx = has_index(cwd)
-    rules = _rules_block(has_idx, profile)
+    has_gr = has_graph(cwd)
+    rules = _rules_block(has_idx, profile, has_graph=has_gr)
     mode_block = _mode_block(mode, cwd, profile)
     project_line = _project_line(project)
     index_block = _index_header(cwd)
@@ -145,13 +147,26 @@ def build_system_prompt(
     return body + index_block + top_files_block + instructions_block
 
 
-def _rules_block(has_idx: bool, profile: str = "standard") -> str:
+# One line, because it has to earn its place in every request. It says the
+# three things that changed behavior in the A/B runs: call it first, one call
+# answers the whole "how does this work" question, and trust the answer
+# instead of re-reading the file to confirm it.
+_GRAPH_LINE = (
+    "- `explore(query=...)` answers a code question in one call — the symbol's "
+    "source, its callers and callees, and what depends on it. Reach for it "
+    "before crawling files, and trust what it returns.\n"
+)
+
+
+def _rules_block(
+    has_idx: bool, profile: str = "standard", *, has_graph: bool = False
+) -> str:
     """Core rules. Recall guidance is folded in here so it's not
     repeated inside every mode block."""
     if profile == "shell":
         return _shell_rules_block()
-    if profile == "minimal":
-        return _minimal_rules_block(has_idx)
+    if profile in ("minimal", "graph"):
+        return _minimal_rules_block(has_idx, has_graph=has_graph)
     recall_line = (
         "- Use `recall(query=...)` to navigate the codebase before reading files; an index lives at `.squishy/index.json`."
         if has_idx
@@ -166,6 +181,7 @@ def _rules_block(has_idx: bool, profile: str = "standard") -> str:
         "- Don't re-read a file you've already read unless you need a different range.\n"
         "- `@filename` in user input injects that file inline wrapped in `<file>` tags.\n"
         "- When the task is done, reply with a plain-text summary and no tool call.\n"
+        f"{_GRAPH_LINE if has_graph else ''}"
         f"{recall_line}"
     )
 
@@ -191,7 +207,7 @@ def _shell_rules_block() -> str:
     )
 
 
-def _minimal_rules_block(has_idx: bool) -> str:
+def _minimal_rules_block(has_idx: bool, *, has_graph: bool = False) -> str:
     """Rules for the `minimal` tool profile.
 
     Deliberately short. The profile exposes `run_command`, `read_file`,
@@ -212,6 +228,7 @@ def _minimal_rules_block(has_idx: bool) -> str:
         "- Use relative paths; the shell already runs in the working dir.\n"
         "- `run_command` covers listing, globbing, and grepping — use it for "
         "anything there isn't a dedicated tool for.\n"
+        f"{_GRAPH_LINE if has_graph else ''}"
         f"{recall_line}"
         "- Verify your change by running the relevant tests.\n"
         "- When the task is done, reply with a plain-text summary and no tool call."
@@ -291,9 +308,13 @@ def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
                 "## Task\n"
                 "- Change the SOURCE code that implements the behavior. Editing "
                 "tests is never a fix.\n"
-                "- Don't write reproduction scripts or new test files. Run the "
-                "tests named in the task; if one doesn't exist yet, implement "
-                "the behavior its name implies rather than hunting for it.\n"
+                "- Reproduce the failure before you fix it: the smallest "
+                "snippet that triggers it, under /tmp so it stays out of the "
+                "diff. That reproduction is your oracle — unlike the graded "
+                "test, it cannot already be green.\n"
+                "- Don't add test files to the repo. Run the tests named in "
+                "the task; if one doesn't exist yet, implement the behavior "
+                "its name implies rather than hunting for it.\n"
                 "- A missing third-party package is an environment problem, not "
             "your bug. But an ImportError naming a symbol from THIS repo is the "
             "task telling you what to add — create it.\n"
@@ -306,9 +327,13 @@ def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
             "## Task\n"
             "- Change the SOURCE code that implements the behavior. Editing "
             "tests is never a fix.\n"
-            "- Don't write reproduction scripts or new test files. Run the "
-            "tests named in the task; if one doesn't exist yet, implement the "
-            "behavior its name implies rather than hunting for it.\n"
+            "- Reproduce the failure before you fix it: the smallest snippet "
+            "that triggers it, under /tmp so it stays out of the diff. That "
+            "reproduction is your oracle — unlike the graded test, it cannot "
+            "already be green.\n"
+            "- Don't add test files to the repo. Run the tests named in the "
+            "task; if one doesn't exist yet, implement the behavior its name "
+            "implies rather than hunting for it.\n"
             "- A missing third-party package is an environment problem, not "
             "your bug. But an ImportError naming a symbol from THIS repo is the "
             "task telling you what to add — create it.\n"

@@ -13,15 +13,20 @@ from typing import Any
 from squishy.tool_restrictions import check_permission as _check_permission
 from squishy.tool_restrictions import get_allowed_tools as _get_allowed_tools
 from squishy.tool_restrictions import get_profile_tools as _get_profile_tools
+from squishy.tools import pressure
 from squishy.tools.base import Tool, ToolContext, ToolResult
 from squishy.tools.fs import FS_TOOLS
+from squishy.tools.graph import GRAPH_TOOLS
 from squishy.tools.recall import RECALL_TOOLS
 from squishy.tools.scratchpad import SCRATCHPAD_TOOLS
 from squishy.tools.shell import SHELL_TOOLS
 from squishy.tools.web import WEB_TOOLS
 
-ALL_TOOLS: list[Tool] = [*FS_TOOLS, *RECALL_TOOLS, *SHELL_TOOLS, *SCRATCHPAD_TOOLS, *WEB_TOOLS]
+ALL_TOOLS: list[Tool] = [
+    *FS_TOOLS, *RECALL_TOOLS, *GRAPH_TOOLS, *SHELL_TOOLS, *SCRATCHPAD_TOOLS, *WEB_TOOLS
+]
 REGISTRY: dict[str, Tool] = {t.name: t for t in ALL_TOOLS}
+_GRAPH_TOOL_NAMES: frozenset[str] = frozenset(t.name for t in GRAPH_TOOLS)
 
 # PromptFn returns either a bool (approve/decline) or a ("feedback", str) tuple
 # where the string is free-text feedback the agent should use to revise.
@@ -69,9 +74,13 @@ async def dispatch(
             return ToolResult(False, error=reason)
 
     try:
-        return await tool.run(args, ctx)
+        result = await tool.run(args, ctx)
     except Exception as e:  # noqa: BLE001
         return ToolResult(False, error=f"{type(e).__name__}: {e}")
+    # Edit pressure rides on the result of the call that earned it. Applied
+    # here rather than in each tool so every tool carries it and no tool has
+    # to remember to.
+    return pressure.apply(ctx, tool.name, result)
 
 
 def openai_schemas(
@@ -80,6 +89,7 @@ def openai_schemas(
     profile: str = "standard",
     extra_tools: frozenset[str] | set[str] | None = None,
     has_index: bool = True,
+    has_graph: bool = True,
 ) -> list[dict[str, object]]:
     """Return OpenAI-format tool schemas, optionally filtered by mode.
 
@@ -113,6 +123,11 @@ def openai_schemas(
         # /init first" — a wasted call, and one models kept making. Hide it
         # instead of advertising a tool that cannot work here.
         if name == "recall" and not has_index:
+            return False
+        # Same rule for the graph tools: with no .squishy/graph.json they can
+        # only answer "run /init first", which is a turn spent to learn what
+        # the schema could have said for free.
+        if name in _GRAPH_TOOL_NAMES and not has_graph:
             return False
         return narrow is None or name in narrow
 

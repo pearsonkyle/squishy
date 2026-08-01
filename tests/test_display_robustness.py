@@ -89,3 +89,24 @@ def test_flush_streaming_text_skips_truly_empty_buffer():
     assert d._stream_buffer == ""
     # No live ever started, no print ever happened.
     assert buf.getvalue() == "" or buf.getvalue().strip() == ""
+
+
+def test_status_lines_keep_their_bracketed_tags():
+    """`[index] walking…` must not print as ` walking…`.
+
+    Rich reads square brackets as markup, so every tagged status line lost its
+    tag — the one piece of information that says which subsystem is talking.
+    `run_command`'s sandbox badge already had to escape by hand; doing it in
+    `info`/`warn`/`error` fixes the whole class.
+    """
+    from rich.console import Console
+
+    from squishy.display import Display
+
+    d = Display()
+    d.console = Console(file=io.StringIO(), width=100, force_terminal=False)
+    d.info("[index] 55 files, 517 symbols")
+    d.warn("[graph] skipped: no python files")
+    out = d.console.file.getvalue()
+    assert "[index]" in out
+    assert "[graph]" in out

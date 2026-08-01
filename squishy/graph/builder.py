@@ -16,8 +16,8 @@ import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from graphagent.graph.models import EdgeKind, Node, NodeKind
-from graphagent.graph.store import CodeGraph
+from squishy.graph.models import EdgeKind, Node, NodeKind
+from squishy.graph.store import CodeGraph
 
 _EXCLUDED_DIRS = {
     ".git",

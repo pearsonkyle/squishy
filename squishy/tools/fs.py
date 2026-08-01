@@ -13,6 +13,7 @@ import fnmatch
 import os
 import re
 import shutil
+import tempfile
 from typing import Any
  
 from squishy.tools.base import Tool, ToolContext, ToolResult
@@ -44,6 +45,44 @@ def _safe_resolve(path: str, cwd: str) -> tuple[str, str | None]:
     if not (real_abs == real_cwd or real_abs.startswith(real_cwd + os.sep)):
         return "", _escape_error(path, cwd)
     return abs_path, None
+
+
+# Both the system temp directory and a literal /tmp. They are the same
+# directory on Linux (so, in every bench container), but not on macOS, where
+# `gettempdir()` is a per-user path under /var/folders and /tmp resolves to
+# /private/tmp. Every prompt in this repo says "/tmp" — honoring only
+# `gettempdir()` would make the instruction work in the container and fail on
+# the machine the developer is testing on.
+_SCRATCH_DIRS = tuple({
+    os.path.realpath(p)
+    for p in (tempfile.gettempdir(), "/tmp")
+    if os.path.isdir(p)
+})
+
+
+def _is_scratch(path: str) -> bool:
+    """True for an absolute path under a scratch directory.
+
+    The bench prompt and `write_file`'s own refusal both tell the model to put
+    reproduction scripts in /tmp, so they stay out of the graded diff. Until
+    this existed, following that instruction returned "path outside working
+    directory" — the harness refusing the exact action it had just demanded,
+    which is the failure mode this codebase keeps rediscovering.
+    """
+    if not os.path.isabs(path):
+        return False
+    real = os.path.realpath(os.path.normpath(path))
+    return any(
+        real == root or real.startswith(root + os.sep) for root in _SCRATCH_DIRS
+    )
+
+
+def _resolve_writable(path: str, cwd: str) -> tuple[str, str | None, bool]:
+    """``(abs_path, error, is_scratch)`` — repo paths plus the scratch dir."""
+    if _is_scratch(path):
+        return os.path.normpath(path), None, True
+    abs_path, err = _safe_resolve(path, cwd)
+    return abs_path, err, False
 
 
 # Directories never worth walking when hunting for a mistyped path.
@@ -330,11 +369,31 @@ def _collect_match_context(
     return "\n".join(out) if out else "(no match context available)"
  
  
+def _outline_for(ctx: ToolContext, abs_path: str) -> str:
+    """The graph's symbol map for a file, or "" when it has none.
+
+    Empty is the safe answer: a file the graph does not cover (not Python, or
+    indexed before it was written) must fall back to a real read rather than
+    being refused.
+    """
+    try:
+        rel = os.path.relpath(abs_path, ctx.working_dir).replace(os.sep, "/")
+    except ValueError:
+        return ""
+    if rel.startswith(".."):
+        return ""
+    from squishy.graph.query import file_outline
+    from squishy.tools.graph import graph_for
+
+    graph = graph_for(ctx)
+    return file_outline(graph, rel) if graph is not None else ""
+
+
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = args.get("path") or args.get("file_path") or args.get("file")
     if not isinstance(path, str):
         return ToolResult(False, error="`path` is required (string)")
-    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    abs_path, err, _scratch = _resolve_writable(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
     corrected = ""
@@ -441,6 +500,36 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
     content = "\n".join(sliced)
 
+    # A whole-file read of something too big to return: send the outline.
+    #
+    # Gated on "too big" for a reason that was measured the hard way. A turn
+    # costs 8.5-11k prompt tokens because the whole transcript is resent, while
+    # an outline saves 0.4k on a short file and 3.7k on a long one — so an
+    # outline that forces a follow-up read is a net loss at every size.
+    # Shipping it unconditionally took cfn-lint's graph arm from 20/29/42 tool
+    # calls to 43/48/29 and cost it both its resolves. Above the output cap the
+    # body gets snipped in the middle anyway, so the follow-up read was always
+    # going to happen, and an outline beats a truncated prefix.
+    outline = ""
+    if offset == 0 and limit is None and len(content) > ctx.max_tool_output_chars:
+        outline = _outline_for(ctx, abs_path)
+    if outline:
+        ctx.files_read_count[abs_path] = ctx.files_read_count.get(abs_path, 0) + 1
+        return ToolResult(
+            True,
+            data={
+                "path": path,
+                "outline": outline,
+                "total_lines": len(lines),
+                "note": (
+                    f"{path} is {len(lines)} lines — too long to return in one "
+                    "call. This is its symbol map; read the range you need with "
+                    "offset/limit, or call explore() on a symbol."
+                ),
+            },
+            display=f"outline ({len(lines)} lines)",
+        )
+
     ctx.files_read[path] = content
     ctx.files_read_meta[cache_key] = {
         "content": content,
@@ -487,9 +576,23 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     content = next((args[k] for k in ("content", "text", "data") if k in args and args[k] is not None), None)
     if not isinstance(path, str) or not isinstance(content, str):
         return ToolResult(False, error="`path` and `content` are required strings")
-    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    abs_path, err, scratch = _resolve_writable(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
+
+    if scratch:
+        # Scratch files are throwaway by definition: they never reach the diff,
+        # so the new-files-only rule, the test-file refusal and the
+        # mistyped-path check below are all irrelevant, and enforcing them
+        # would make the second draft of a repro script impossible.
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return ToolResult(
+            True,
+            data={"path": path, "bytes": len(content.encode()), "scratch": True},
+            display=f"wrote {len(content.encode())} bytes to scratch",
+        )
 
     # Hard guard: write_file is for creating NEW files only. Existing files
     # must be modified with edit_file — full rewrites via write_file are the
@@ -631,7 +734,7 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             ),
         )
 
-    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    abs_path, err, _scratch = _resolve_writable(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
     if not os.path.isfile(abs_path):

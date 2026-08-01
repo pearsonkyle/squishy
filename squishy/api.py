@@ -110,7 +110,6 @@ class Squishy:
     context_window: int = 0
     assumed_context_window: int = 32_768
     compaction_threshold: float = 0.7
-    max_turns_without_edit: int = 12
     max_tool_output_chars: int = 32_000
     auto_init: bool = False
     # Indexing knobs (latent — Config supports these but they were not

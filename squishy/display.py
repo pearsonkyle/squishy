@@ -52,6 +52,9 @@ ICONS = {
     "save_note": "[cyan]📝[/]",
     "recall": "[cyan]🔎[/]",
     "glob_files": "[cyan]🔍[/]",
+    "explore": "[cyan]🧭[/]",
+    "impact_of": "[cyan]🕸[/]",
+    "repo_map": "[cyan]🗺[/]",
 }
 
 
@@ -348,13 +351,13 @@ class Display:
         )
  
     def info(self, s: str) -> None:
-        self.console.print(f"[dim]{s}[/]")
+        self.console.print(f"[dim]{rich_escape(s)}[/]")
  
     def warn(self, s: str) -> None:
-        self.console.print(f"[yellow]! {s}[/]")
+        self.console.print(f"[yellow]! {rich_escape(s)}[/]")
  
     def error(self, s: str) -> None:
-        self.console.print(f"[red]✗ {s}[/]")
+        self.console.print(f"[red]✗ {rich_escape(s)}[/]")
 
     def summary(self, turns: int, elapsed_s: float) -> None:
         s = self.stats

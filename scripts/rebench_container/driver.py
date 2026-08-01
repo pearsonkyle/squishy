@@ -100,6 +100,9 @@ class Metrics:
         # "metrics from the final result" failure, one level up.
         self._base = 0
         self.exit_status = "running"
+        # Arm-specific extras (graph build time and size) merged into every
+        # flush, so a killed run still reports them.
+        self.extra: dict = {}
 
     def on_event(self, ev: dict) -> None:
         kind = ev.get("type")
@@ -135,6 +138,7 @@ class Metrics:
 
     def as_dict(self) -> dict:
         return {
+            **self.extra,
             "exit_status": self.exit_status,
             "turns": self.turns,
             "prompt_tokens": self.prompt_tokens,
@@ -153,10 +157,32 @@ class Metrics:
         tmp.replace(OUT)
 
 
+def _build_graph(repo: str) -> dict:
+    """Index the checkout so `explore` has something to answer from.
+
+    Timed and reported separately from the run: it is a one-off preprocessing
+    cost a real deployment amortizes across every task in the repo, and
+    folding it into the agent's wall clock would flatter the arms that skip it.
+    """
+    from squishy.graph import build_repo_graph
+
+    started = time.perf_counter()
+    graph = build_repo_graph(repo)
+    return {
+        "graph_build_s": round(time.perf_counter() - started, 1),
+        "graph_stats": graph.stats(),
+    }
+
+
 async def main() -> int:
     task = json.loads(TASK.read_text())
     m = Metrics()
     m.flush()
+
+    profile = task.get("tool_profile", "standard")
+    if profile == "graph":
+        m.extra.update(_build_graph(task["repo"]))
+        m.flush()
 
     t0 = time.time()
     final_text = ""
@@ -167,11 +193,10 @@ async def main() -> int:
             base_url=task["base_url"],
             api_key=task.get("api_key", "local"),
             permission_mode=task.get("mode", "bench"),
-            tool_profile=task.get("tool_profile", "standard"),
+            tool_profile=profile,
             max_turns=task["max_turns"],
             request_timeout=task.get("request_timeout", 180.0),
             max_retries=task.get("max_retries", 3),
-            max_turns_without_edit=task.get("max_turns_without_edit", 12),
             # The agent is already inside the instance container; nesting a
             # Docker sandbox here would be both impossible and pointless.
             use_sandbox=False,

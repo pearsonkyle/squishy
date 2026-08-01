@@ -13,7 +13,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from pathlib import Path
 
-from graphagent.graph.models import Edge, EdgeKind, Node, NodeKind
+from squishy.graph.models import Edge, EdgeKind, Node, NodeKind
 
 
 class CodeGraph:

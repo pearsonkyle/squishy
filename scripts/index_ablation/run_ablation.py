@@ -107,7 +107,6 @@ async def run_one(inst: dict, workspace: Path, use_index: bool, args) -> dict:
         # workspace mounted, so the project's toolchain and dependencies are
         # available and the agent's test runs are real.
         use_sandbox=not args.no_sandbox, sandbox_image=inst["image_name"],
-        max_turns_without_edit=args.max_turns_without_edit,
     ) as sq:
         try:
             res = await sq.run(
@@ -166,7 +165,6 @@ async def main() -> None:
     ap.add_argument("--mode", default="bench")
     ap.add_argument("--max-turns", type=int, default=100)
     ap.add_argument("--no-sandbox", action="store_true")
-    ap.add_argument("--max-turns-without-edit", type=int, default=12)
     ap.add_argument("--empty-patch-retries", type=int, default=2)
     ap.add_argument("--keep-images", action="store_true",
                     help="Keep pulled images (default: remove after each instance)")
