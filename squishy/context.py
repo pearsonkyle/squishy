@@ -4,7 +4,7 @@ Ported from atlas-proxy/project.go and atlas-proxy/agent.go:buildSystemPrompt.
 """
  
 from __future__ import annotations
- 
+
 import json
 import os
 import re
@@ -19,9 +19,10 @@ from squishy.tokens import (
     estimate_message_tokens,
     message_chars,
 )
+from squishy.tool_restrictions import get_profile_tools, profile_shows
 from squishy.tools.fs import SKIP_DIRS
 
- 
+
 @dataclass
 class ProjectInfo:
     language: str = "unknown"
@@ -120,7 +121,10 @@ def build_system_prompt(
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
 
     has_idx = has_index(cwd)
-    has_gr = has_graph(cwd)
+    # A graph on disk is not enough: `minimal` and `shell` never show
+    # `explore`, and recommending it there is an instruction the model has no
+    # way to follow. Ask what the model will actually see.
+    has_gr = has_graph(cwd) and profile_shows(profile, "explore")
     rules = _rules_block(has_idx, profile, has_graph=has_gr)
     mode_block = _mode_block(mode, cwd, profile)
     project_line = _project_line(project)
@@ -300,29 +304,17 @@ def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
     used to narrate a five-phase state machine to the model; that machine is
     gone, and describing it cost ~250 tokens on every single request.
     """
-    if profile in ("minimal", "shell"):
-        # Narrow profiles don't expose save_note, so the bench framing below
-        # would name a tool they can't call.
-        if mode == "bench":
-            return (
-                "## Task\n"
-                "- Change the SOURCE code that implements the behavior. Editing "
-                "tests is never a fix.\n"
-                "- Reproduce the failure before you fix it: the smallest "
-                "snippet that triggers it, under /tmp so it stays out of the "
-                "diff. That reproduction is your oracle — unlike the graded "
-                "test, it cannot already be green.\n"
-                "- Don't add test files to the repo. Run the tests named in "
-                "the task; if one doesn't exist yet, implement the behavior "
-                "its name implies rather than hunting for it.\n"
-                "- A missing third-party package is an environment problem, not "
-            "your bug. But an ImportError naming a symbol from THIS repo is the "
-            "task telling you what to add — create it.\n"
-                "- Do not stop until you have actually edited a non-test source "
-                "file. Ending with no edit is a failed run."
-            )
-        return ""
+    # One bench block for every profile, with the `save_note` line added only
+    # where that tool is actually in the schema. It used to be two near-copies
+    # differing by exactly that line, and adding the `graph` profile silently
+    # picked the copy that names a tool `graph` does not expose — the
+    # duplication is what let that happen.
     if mode == "bench":
+        note_line = (
+            "- Use `save_note` for key findings so they survive context "
+            "compaction.\n"
+            if profile_shows(profile, "save_note") else ""
+        )
         return (
             "## Task\n"
             "- Change the SOURCE code that implements the behavior. Editing "
@@ -337,10 +329,14 @@ def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
             "- A missing third-party package is an environment problem, not "
             "your bug. But an ImportError naming a symbol from THIS repo is the "
             "task telling you what to add — create it.\n"
-            "- Use `save_note` for key findings so they survive context compaction.\n"
+            + note_line +
             "- Do not stop until you have actually edited a non-test source "
             "file. Ending with no edit is a failed run."
         )
+    # Narrow profiles get no per-mode prose at all: the delta they would carry
+    # is about tools they do not have.
+    if get_profile_tools(profile) is not None:
+        return ""
     if mode == "yolo":
         return (
             "## Mode: yolo\n"

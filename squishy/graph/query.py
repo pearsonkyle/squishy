@@ -100,7 +100,9 @@ def impact_of(graph: CodeGraph, symbol: str, depth: int = 2) -> str:
     return "\n".join(lines)
 
 
-def no_match_guidance(graph: CodeGraph, query: str) -> str:
+def no_match_guidance(
+    graph: CodeGraph, query: str, search_tool: str = "search_files"
+) -> str:
     """A miss that names the nearest symbols, not a dead end.
 
     "Try a shorter substring" is advice the model cannot act on without
@@ -117,13 +119,13 @@ def no_match_guidance(graph: CodeGraph, query: str) -> str:
         return (
             f"No symbols match {query!r}. Closest names in the graph: "
             + ", ".join(close)
-            + "\nCall explore on one of those, or search_files for the string if "
-            "it is not a Python symbol."
+            + f"\nCall explore on one of those, or {search_tool} for the string "
+            "if it is not a Python symbol."
         )
     return (
         f"No symbols match {query!r}, and nothing in the graph is close to it. "
-        "It may not be a Python symbol — search_files for the literal string, "
-        "or call repo_map for an overview."
+        f"It may not be a Python symbol — {search_tool} for the literal "
+        "string."
     )
 
 
@@ -133,6 +135,7 @@ def explore(
     query: str,
     limit: int = 3,
     max_source_lines: int | None = EXPLORE_MAX_SOURCE_LINES,
+    search_tool: str = "search_files",
 ) -> str:
     """One call: matching symbols' source, their callers/callees, their impact.
 
@@ -140,7 +143,7 @@ def explore(
     """
     scored = graph.search_scored(query, limit=limit)
     if not scored:
-        return no_match_guidance(graph, query)
+        return no_match_guidance(graph, query, search_tool)
     # An exact hit answers the question; the substring matches underneath it
     # are noise that stays in the transcript for the rest of the run.
     if scored[0][0] >= _EXACT_MATCH_SCORE:

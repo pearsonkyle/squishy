@@ -15,6 +15,9 @@ class ToolContext:
     files_read: dict[str, str] = field(default_factory=dict)
     files_read_meta: dict[tuple[str, int, Any], dict[str, Any]] = field(default_factory=dict)
     permission_mode: str = "edits"
+    # Which tools the model can actually see. Tool results consult this before
+    # naming a tool in their advice (see `tool_restrictions.profile_shows`).
+    tool_profile: str = "standard"
     sandbox_image: str = "python:3.11-slim"
     use_sandbox: bool = True
     notes: dict[str, str] = field(default_factory=dict)

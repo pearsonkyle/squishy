@@ -95,6 +95,7 @@ class Agent:
         self.tool_ctx = ToolContext(
             working_dir=self.config.working_dir,
             permission_mode=self.config.permission_mode,
+            tool_profile=self.config.tool_profile,
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
             max_tool_output_chars=self._effective_output_cap(),

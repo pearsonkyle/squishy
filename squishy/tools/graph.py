@@ -21,6 +21,7 @@ from squishy.graph.query import explore as _explore
 from squishy.graph.query import impact_of as _impact_of
 from squishy.graph.query import repo_map as _repo_map
 from squishy.graph.store import CodeGraph
+from squishy.tool_restrictions import profile_shows
 from squishy.tools.base import Tool, ToolContext, ToolResult
 
 DEFAULT_EXPLORE_LIMIT = 3
@@ -29,8 +30,8 @@ DEFAULT_IMPACT_DEPTH = 2
 MAX_IMPACT_DEPTH = 4
 
 _NO_GRAPH = (
-    "no code graph found. Run /init to build .squishy/graph.json, or use "
-    "`recall` and `search_files` instead."
+    "no code graph found. Run /init to build .squishy/graph.json, or find the "
+    "code by reading and searching directly."
 )
 
 
@@ -68,7 +69,15 @@ async def _explore_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         limit = _clip(args.get("limit", DEFAULT_EXPLORE_LIMIT), MAX_EXPLORE_LIMIT)
     except (TypeError, ValueError):
         limit = DEFAULT_EXPLORE_LIMIT
-    text = _explore(graph, Path(ctx.working_dir), query.strip(), limit=limit)
+    text = _explore(
+        graph, Path(ctx.working_dir), query.strip(), limit=limit,
+        # A dead end that names an invisible tool is a dead end twice over.
+        search_tool=(
+            "search_files"
+            if profile_shows(ctx.tool_profile, "search_files")
+            else "`grep` via run_command"
+        ),
+    )
     return ToolResult(
         True,
         data={"query": query, "result": text},

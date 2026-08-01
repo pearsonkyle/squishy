@@ -16,6 +16,7 @@ import shutil
 import tempfile
 from typing import Any
  
+from squishy.tool_restrictions import profile_shows
 from squishy.tools.base import Tool, ToolContext, ToolResult
  
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next"}
@@ -523,8 +524,13 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 "total_lines": len(lines),
                 "note": (
                     f"{path} is {len(lines)} lines — too long to return in one "
-                    "call. This is its symbol map; read the range you need with "
-                    "offset/limit, or call explore() on a symbol."
+                    "call. This is its symbol map; read the range you need "
+                    "with offset/limit"
+                    + (
+                        ", or call explore() on a symbol."
+                        if profile_shows(ctx.tool_profile, "explore")
+                        else "."
+                    )
                 ),
             },
             display=f"outline ({len(lines)} lines)",

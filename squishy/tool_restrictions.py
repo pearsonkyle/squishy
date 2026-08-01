@@ -95,6 +95,19 @@ def get_profile_tools(profile: str) -> frozenset[str] | None:
     return TOOL_PROFILES.get(profile)
 
 
+def profile_shows(profile: str, tool_name: str) -> bool:
+    """Would *tool_name* appear in *profile*'s schema?
+
+    Exists so prose never names a tool the model cannot see. Every message
+    the harness writes -- system prompt lines, tool-result hints, error
+    recovery advice -- has to answer this before naming a tool, or it becomes
+    another instruct-then-block: an instruction the model is unable to follow
+    and has no way to discover why.
+    """
+    narrow = TOOL_PROFILES.get(profile)
+    return narrow is None or tool_name in narrow
+
+
 def get_allowed_tools(mode: str) -> frozenset[str]:
     """Return set of tool names allowed in given mode."""
     if mode == "yolo":
