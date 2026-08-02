@@ -372,3 +372,66 @@ async def test_live_context_never_shows_the_model_a_phantom_tool_call(tmp_path):
         assert m.get("name") != "_squishy_context"
         for tc in m.get("tool_calls") or []:
             assert tc.get("function", {}).get("name") != "_squishy_context"
+
+
+async def test_bench_does_not_accept_stopping_without_a_change(tmp_path):
+    """A model that stops having changed nothing has not finished the task.
+
+    The reference agent's whole margin came from refusing this: resume the
+    same transcript, keep what the model learned, and let the turn budget be
+    the only bound. A count-based cap was tried first and spent three nudges
+    by turn 21 of 50, ending the run with 29 turns unused and no patch.
+    """
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.max_turns = 6
+    (tmp_path / "a.py").write_text("x = 1\n")
+
+    script = [
+        CompletionResult(text="I understand the bug now.", tool_calls=[]),
+        CompletionResult(text="Still thinking.", tool_calls=[]),
+        CompletionResult(tool_calls=[_tc("edit_file", {
+            "path": "a.py", "old_str": "x = 1", "new_str": "x = 2"})]),
+        CompletionResult(text="Fixed it.", tool_calls=[]),
+    ]
+    agent = Agent(cfg, FakeClient(script=script), display=None)  # type: ignore[arg-type]
+    result = await agent.run("fix it")
+
+    assert result.files_edited == ["a.py"], "the run must not have ended early"
+    nudges = [m for m in agent._full_log
+              if m.get("role") == "user" and "nothing to grade" in str(m.get("content", ""))]
+    assert len(nudges) == 2, "one per premature stop, not a fixed cap"
+
+
+async def test_the_run_ends_once_something_has_changed(tmp_path):
+    """The moment a change lands, a prose ending is a real ending."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.max_turns = 8
+    (tmp_path / "a.py").write_text("x = 1\n")
+
+    script = [
+        CompletionResult(tool_calls=[_tc("edit_file", {
+            "path": "a.py", "old_str": "x = 1", "new_str": "x = 2"})]),
+        CompletionResult(text="Fixed it.", tool_calls=[]),
+    ]
+    agent = Agent(cfg, FakeClient(script=script), display=None)  # type: ignore[arg-type]
+    result = await agent.run("fix it")
+    assert result.success
+    assert result.turns_used == 2, "no nagging after a real edit"
+
+
+async def test_an_interactive_question_is_never_nagged(tmp_path):
+    """`yolo` is unattended but not scored. A question may end in prose."""
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "yolo"
+    cfg.max_turns = 8
+    agent = Agent(cfg, FakeClient(script=[  # type: ignore[arg-type]
+        CompletionResult(text="It uses a hash map.", tool_calls=[]),
+    ]), display=None)
+    result = await agent.run("how does the cache work?")
+    assert result.success
+    assert result.turns_used == 1

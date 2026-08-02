@@ -154,7 +154,12 @@ def track_tool_outcome(
             st.recent_edit_fail_files.discard(rpath)
             agent.tool_ctx.edit_fail_files.discard(_abs(agent, rpath))
         if tc.name == "write_file":
-            st.files_created.add(str(tc.args.get("path", "?")))
+            # A /tmp repro script is not a change to the repository. Recording
+            # it here would satisfy every "have you changed anything" check --
+            # the same way a shell heredoc used to, which cost twelve
+            # container arms their entire turn budget.
+            if not outcome.get("data", {}).get("scratch"):
+                st.files_created.add(str(tc.args.get("path", "?")))
         elif tc.name == "edit_file":
             old = str(tc.args.get("old_str", ""))
             new = str(tc.args.get("new_str", ""))

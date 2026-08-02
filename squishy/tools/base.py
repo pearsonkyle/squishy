@@ -61,6 +61,10 @@ class ToolContext:
     pressure_notices: dict[str, int] = field(default_factory=dict)
     # Tags attached to the most recent tool result, for the per-call event.
     last_pressure: list[str] = field(default_factory=list)
+    # (tool, argument-signature) -> how many times it has been called. Drives
+    # the [repeat] notice; never cleared by trimming, because it is advice
+    # rather than a refusal and so cannot punish a legitimate re-read.
+    call_signatures: dict[str, int] = field(default_factory=dict)
     extra_env: dict[str, str] = field(default_factory=dict)
     # (abs_path, original_content); original_content is None when the entry
     # records a newly-created file (undo deletes it).
@@ -74,11 +78,26 @@ class ToolResult:
     data: dict[str, Any] = field(default_factory=dict)
     error: str = ""
     display: str = ""
- 
+    # Harness-authored text appended *outside* the JSON payload — currently
+    # the edit-pressure notices. It lived in `data` as one key among many and
+    # was measurably ignored: the graph arm took 43-50 `[budget]` notices and
+    # 74-85 `[probes]` notices across a 100-turn run and still never edited.
+    # Buried at the end of a 4,000-character JSON blob, and liable to be cut
+    # out entirely by `_short_json`'s middle-snip, it was not really being
+    # delivered. Plain text after the payload is what the reference agent did,
+    # and it is the last thing the model reads.
+    notice: str = ""
+
     def to_message(self, limit: int = 32_000) -> str:
-        if self.success:
-            return _short_json(self.data, limit)
-        return _short_json({"error": self.error}, limit)
+        # The notice is reserved out of the limit rather than competing with
+        # the payload for it, so a large read can never squeeze it out.
+        reserved = len(self.notice) + 2 if self.notice else 0
+        body = (
+            _short_json(self.data, max(0, limit - reserved))
+            if self.success
+            else _short_json({"error": self.error}, max(0, limit - reserved))
+        )
+        return f"{body}\n\n{self.notice}" if self.notice else body
  
  
 @dataclass

@@ -75,10 +75,18 @@ scolding it for making one. `tests/test_transcript_integrity.py` guards the
 regression. Loop-breaking now lives in the tools -- `read_file`'s span cache and
 `run_command`'s output-hash echo counter both answer inline.
 
-Only two things still inject: the empty-response retry and the
-post-compaction "your history was rewritten" notice. Nothing else may. The
-periodic no-edit-yet reminder used to be the third; it now rides on the tool
-result instead (see "Edit pressure lives in the tool result").
+Only three things still inject, and each one is a case a tool result cannot
+reach: the empty-response retry, the post-compaction "your history was
+rewritten" notice, and the bench-mode refusal to end a run with an unchanged
+tree. The last one qualifies precisely because there is no tool call to attach
+it to -- *not* calling a tool is the thing being answered. It is bench-only:
+`yolo` is unattended too, but a question there may legitimately end in prose,
+and nagging the user to edit something would be the harness inventing a goal.
+Bounded by `max_turns` and nothing else; a count cap was tried in the
+reference harness and spent its three nudges by turn 21 of 50.
+
+The periodic no-edit-yet reminder used to be a fourth; it now rides on the
+tool result instead (see "Edit pressure lives in the tool result").
 
 ### Context management (two layers)
 
@@ -154,6 +162,15 @@ carries it and no tool has to remember to:
   could see it. Resets on every source edit, because re-running a reproduction
   *after* an edit is the correct move.
 
+- `[repeat]` -- the identical call, byte for byte, a second time. Advice, not
+  a refusal, and it never forgets: `read_file`'s span cache *does* refuse
+  repeats but deliberately forgets after trimming, so a long run loses the
+  signal exactly when it needs it. A counter that never forgets is only safe
+  because it does not block. `run_command` is exempt -- re-running a test
+  after an edit is correct, and `shell.py` has its own output-hash counter.
+  Found on qiskit-terra-5662: the same non-matching `edit_file` issued twice
+  in consecutive turns, with nothing to say the second could not work.
+
 **A scratch write is not a source edit, through any path.** `write_file` knows
 this from its `scratch` flag; the shell needs `agent_state.writes_only_scratch`,
 because the shell is how a model writes a heredoc. Getting this wrong is
@@ -167,6 +184,18 @@ its own safety net is the instruct-then-block pattern inverted.
 The tool event carries a `pressure` list of the tags attached, and the bench
 driver totals them. Without it, "warned fifty times and ignored" and "never
 fired" are the same observation from outside.
+
+**Notices go outside the JSON payload**, as plain text after it, and their
+length is reserved out of the output cap rather than competing with it. As a
+key inside `data` they were measurably ignored -- 43-50 `[budget]` and 74-85
+`[probes]` notices across a 100-turn run that still never edited -- because
+they sat at the end of a 4,000-character blob that `_short_json` could snip.
+
+**A failed `edit_file` never dead-ends.** When the fuzzy matcher finds
+nothing, `_symbol_hint` names the exact line spans of the symbols the
+`old_str` mentioned, from the graph. The old fallback was "read the file
+first", which qiskit-terra-5662 had already done five times before its single
+edit attempt died on it at turn 73.
 
 This replaced a `[system]` user message injected every sixth turn (and the
 `max_turns_without_edit` knob that drove it). Same content, but paired with

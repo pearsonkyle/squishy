@@ -150,3 +150,35 @@ def test_the_bench_prompt_does_not_ban_what_the_tools_enable(tmp_path) -> None:
         if "## Task" in prompt:
             assert "Reproduce the failure" in prompt, profile
             assert "/tmp" in prompt, profile
+
+
+async def test_the_scratch_exception_cannot_be_used_to_escape(tmp_path) -> None:
+    """Widening the write guard must not widen it by more than the scratch dir.
+
+    `_is_scratch` resolves through symlinks before comparing, so a symlink
+    planted *inside* the scratch directory resolves to its real target and
+    fails the check — otherwise `write_file("/tmp/link/x")` would be an
+    arbitrary-write primitive handed to whatever the model decided to type.
+
+    The link points at /etc precisely because it is not a scratch directory;
+    pointing it anywhere under `tmp_path` would prove nothing, since on macOS
+    pytest's tmp_path already lives inside the system temp directory.
+    """
+    link = pathlib.Path("/tmp") / f"sq_evil_{os.getpid()}"
+    try:
+        link.symlink_to("/etc")
+    except (OSError, NotImplementedError):
+        return  # no symlink support; nothing to assert
+    try:
+        ctx = _ctx(tmp_path)
+        for path in (
+            f"{link}/sq_pwned",
+            "/tmp/../etc/sq_pwned",
+            "../escape.txt",
+            "/etc/sq_pwned",
+        ):
+            res = await dispatch("write_file", {"path": path, "content": "x"}, ctx)
+            assert not res.success, f"{path} must not be writable"
+        assert not pathlib.Path("/etc/sq_pwned").exists()
+    finally:
+        link.unlink(missing_ok=True)

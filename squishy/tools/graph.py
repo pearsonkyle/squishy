@@ -24,6 +24,10 @@ from squishy.graph.store import CodeGraph
 from squishy.tool_restrictions import profile_shows
 from squishy.tools.base import Tool, ToolContext, ToolResult
 
+# The echoed query is only there to anchor the result; a model that pastes a
+# whole function body into `query` should not be charged for it twice.
+MAX_ECHO_CHARS = 120
+
 DEFAULT_EXPLORE_LIMIT = 3
 MAX_EXPLORE_LIMIT = 8
 DEFAULT_IMPACT_DEPTH = 2
@@ -80,7 +84,7 @@ async def _explore_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     )
     return ToolResult(
         True,
-        data={"query": query, "result": text},
+        data={"query": query[:MAX_ECHO_CHARS], "result": text},
         display=f"{text.count('## ') or 'no'} match(es)",
     )
 
@@ -101,7 +105,7 @@ async def _impact_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     dependents = max(0, text.count("\n")) if text.startswith("Impact of") else 0
     return ToolResult(
         True,
-        data={"symbol": symbol, "result": text},
+        data={"symbol": symbol[:MAX_ECHO_CHARS], "result": text},
         display=f"{dependents} dependent(s)" if dependents else "nothing depends on it",
     )
 

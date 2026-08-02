@@ -64,7 +64,14 @@ log = logging.getLogger("squishy.agent")
 # answered all 25 refusals by calling it again — 25 turns burned, no patch,
 # while the ungated arm patched. Without any pressure at all, a shell run
 # explored for 80 turns and also produced nothing, so the nudge stays.
-_EDIT_NUDGE_EVERY = 6
+# What to say to a model that stopped without editing anything. Deliberately
+# short and imperative: it is read at the moment the model believes it is done.
+EMPTY_PATCH_NUDGE = (
+    "[system] You stopped, but no file has been changed — there is nothing to "
+    "grade, so this run currently scores zero. Do not summarize again. Edit "
+    "the non-test source file your analysis points at, right now, using the "
+    "best explanation you have. A partial fix scores more than none."
+)
 
 
 @dataclass
@@ -118,6 +125,14 @@ class Agent:
         self._check_index_staleness()
         if self.display is not None:
             self.display.set_mode(self.config.permission_mode)
+
+    def _is_constrained(self) -> bool:
+        """True in the non-interactive modes, where a run is scored.
+
+        `bench` and `yolo` run unattended against a turn budget; `edits` has a
+        human present who can simply say "keep going".
+        """
+        return self.config.permission_mode in ("bench", "yolo")
 
     def _context_window(self) -> int:
         """Effective context window in tokens.
@@ -469,6 +484,42 @@ class Agent:
             ), min_gap=0, force=True)
             return "continue"
 
+        # A model that stops without having changed anything has not finished
+        # the task; it has stopped. Under a turn budget that is a scored-zero
+        # run, and the reference agent's whole margin came from refusing to
+        # accept it: resume the same transcript, keep everything the model
+        # learned, and let the turn budget be the only bound.
+        #
+        # Bounded by `max_turns` and nothing else. A count-based cap was tried
+        # in the reference harness and is worse than it sounds -- each segment
+        # ends after a handful of turns, so three nudges were spent by turn 21
+        # of 50 and the run was declared over with 29 turns unused and no patch.
+        #
+        # This is an injected user turn, which the loop otherwise forbids. It
+        # qualifies under the standing exception: there is no tool call to
+        # attach it to, because not calling a tool is the thing being answered.
+        # `bench` only, not `yolo`. Both are unattended, but only bench scores
+        # a run by its diff -- in yolo a user can perfectly well ask a question
+        # whose answer is prose, and nagging them to edit something would be
+        # the harness inventing a goal the user did not set.
+        if (
+            is_bench
+            and not st.files_edited
+            # Creating a file is a fix too: an ImportError naming a symbol
+            # from this repo is the task telling the model what to add.
+            and not st.files_created
+            and not st.shell_writes
+            and turn < self.config.max_turns
+        ):
+            st.empty_patch_continues += 1
+            self.messages.append(prose_msg(completion.text, completion.reasoning))
+            if self.display:
+                self.display.flush_streaming_text()
+            self.messages.append({"role": "user", "content": EMPTY_PATCH_NUDGE})
+            if self.display is not None:
+                self.display.nudge(EMPTY_PATCH_NUDGE)
+            return "continue"
+
         st.prose_completions += 1
         self.messages.append(prose_msg(completion.text, completion.reasoning))
         if self.display:
@@ -486,7 +537,7 @@ class Agent:
         self._active_st = st
         self._active_turn = 0
         is_bench = self.config.permission_mode == "bench"
-        _is_constrained = self.config.permission_mode in ("bench", "yolo")
+        _is_constrained = self._is_constrained()
 
         if _is_constrained:
             for msg in self.messages:

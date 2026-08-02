@@ -59,3 +59,58 @@ async def test_a_real_match_still_just_works(ctx, tmp_path):
     }, ctx)
     assert res.success, res.error
     assert "total = 100" in (tmp_path / "m.py").read_text()
+
+
+async def test_a_failed_edit_names_the_symbol_s_real_lines(tmp_path):
+    """The dead-end case, answered from the graph.
+
+    qiskit-terra-5662's only edit attempt was at turn 73, searching for
+    `def _get_measure_link(self, qubit, clbit):` — a signature that had
+    changed. The fuzzy matcher found nothing, the hint was "read the file
+    first" (which it had done five times), and it never tried to edit again.
+    A run of 100 turns produced no patch off that one dead end.
+    """
+    from squishy.graph import build_repo_graph
+    from squishy.tools import dispatch
+    from squishy.tools.base import ToolContext
+
+    (tmp_path / "core.py").write_text(
+        "class Canvas:\n"
+        "    def _get_measure_link(self, qubit):\n"
+        "        return qubit\n"
+        "\n"
+        "    def other(self):\n"
+        "        return 2\n",
+        encoding="utf-8",
+    )
+    build_repo_graph(tmp_path)
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="yolo",
+                      use_sandbox=False)
+
+    res = await dispatch("edit_file", {
+        "path": "core.py",
+        # The real signature has no `clbit`, so no fuzzy block will match.
+        "old_str": "def _get_measure_link(self, qubit, clbit):\n"
+                   "        raise NotImplementedError\n"
+                   "        # padding to defeat the fuzzy matcher entirely\n",
+        "new_str": "x",
+    }, ctx)
+
+    assert not res.success
+    assert "_get_measure_link" in res.error
+    assert "lines 2-3" in res.error, res.error
+    assert "read_file" in res.error
+
+
+async def test_the_hint_degrades_without_a_graph(tmp_path):
+    """No graph must mean the old advice, not a broken message."""
+    from squishy.tools import dispatch
+    from squishy.tools.base import ToolContext
+
+    (tmp_path / "core.py").write_text("a = 1\n", encoding="utf-8")
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="yolo",
+                      use_sandbox=False)
+    res = await dispatch("edit_file", {
+        "path": "core.py", "old_str": "zzz\nyyy\nxxx\n", "new_str": "q"}, ctx)
+    assert not res.success
+    assert "old_str not found" in res.error

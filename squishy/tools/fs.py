@@ -370,6 +370,58 @@ def _collect_match_context(
     return "\n".join(out) if out else "(no match context available)"
  
  
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _symbol_hint(ctx: ToolContext, abs_path: str, old_str: str | None) -> str:
+    """Point a failed edit at the real line spans of the symbols it named.
+
+    Returns "" when there is no graph or nothing recognisable, so the caller
+    falls back to its generic advice rather than being blocked by a feature
+    that happens not to be available here.
+    """
+    try:
+        rel = os.path.relpath(abs_path, ctx.working_dir).replace(os.sep, "/")
+    except ValueError:
+        return ""
+    if rel.startswith(".."):
+        return ""
+    from squishy.tools.graph import graph_for
+
+    graph = graph_for(ctx)
+    if graph is None:
+        return ""
+    node = graph.get(rel)
+    if node is None:
+        return ""
+    wanted = set(_IDENT_RE.findall(old_str or ""))
+    children = list(graph.children(rel))
+    named = [c for c in children if c.name in wanted]
+    for child in list(children):
+        named += [m for m in graph.children(child.node_id) if m.name in wanted]
+    if named:
+        lines = "\n".join(
+            f"  {c.name}: lines {c.lineno}-{c.end_lineno}"
+            for c in sorted(named, key=lambda n: n.lineno)[:6]
+        )
+        return (
+            f" The symbols your old_str names are at these exact lines in "
+            f"{rel}:\n{lines}\n"
+            f"Read one of those ranges with read_file(offset/limit) and copy "
+            f"the text verbatim, including indentation."
+        )
+    if children:
+        lines = ", ".join(
+            f"{c.name} (L{c.lineno})"
+            for c in sorted(children, key=lambda n: n.lineno)[:12]
+        )
+        return (
+            f" Nothing in {rel} matches that text. It defines: {lines}. Read "
+            f"the one you meant with read_file(offset/limit) first."
+        )
+    return ""
+
+
 def _outline_for(ctx: ToolContext, abs_path: str) -> str:
     """The graph's symbol map for a file, or "" when it has none.
 
@@ -1006,7 +1058,15 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 )
 
         if not hint:
-            hint = " Read the file first and copy the exact text."
+            # Last resort, and the one that used to be a dead end. "Read the
+            # file first" is advice the model has usually already taken:
+            # qiskit-terra-5662's only edit attempt came at turn 73, after
+            # five reads of that same file, and it never tried again. The
+            # graph knows every symbol's exact span, so name them with their
+            # line numbers instead of sending it back to guess.
+            hint = _symbol_hint(ctx, abs_path, old_str) or (
+                " Read the file first and copy the exact text."
+            )
 
         return ToolResult(
             False,

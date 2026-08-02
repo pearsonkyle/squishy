@@ -80,7 +80,7 @@ async def dispatch(
     # Edit pressure rides on the result of the call that earned it. Applied
     # here rather than in each tool so every tool carries it and no tool has
     # to remember to.
-    return pressure.apply(ctx, tool.name, result)
+    return pressure.apply(ctx, tool.name, result, args)
 
 
 def openai_schemas(

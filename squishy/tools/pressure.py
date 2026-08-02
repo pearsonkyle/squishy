@@ -35,6 +35,34 @@ PROBE_LIMIT = 8
 
 _EDIT_TOOLS = frozenset({"edit_file", "write_file", "undo_edit"})
 
+# `run_command` is exempt: re-running a test after an edit is correct, and
+# `shell.py` already answers a genuinely echoing command with its output-hash
+# counter. Everything else repeating byte-for-byte is a loop.
+_REPEAT_EXEMPT = frozenset({"run_command"})
+_REPEAT_AT = 2
+
+_REPEAT = (
+    "[repeat] This is identical call #{n} — same tool, same arguments. The "
+    "result above is the same as last time and will not change. Take a "
+    "different step: a different query, a different range, or the edit itself."
+)
+
+_REPEAT_FAILED = (
+    "[repeat] This is identical call #{n}, and it failed the same way last "
+    "time. Repeating it cannot succeed. Read the exact current text with "
+    "read_file(offset/limit) and copy it verbatim, or edit a different anchor."
+)
+
+
+def _signature(name: str, args: dict[str, object]) -> str:
+    """A stable key for "the same call again", cheap to compute.
+
+    Argument *values* matter: `read_file` on two different paths is two
+    different calls, while the same path twice is the loop this catches.
+    """
+    parts = [f"{k}={str(v)[:200]}" for k, v in sorted(args.items())]
+    return f"{name}({','.join(parts)})"
+
 _PROBES = (
     "[probes] {n} commands run and no source file changed yet. Experiments "
     "are not converging on their own — make the edit your evidence already "
@@ -86,6 +114,29 @@ def budget_notice(used: int, budget: int) -> str:
     return template.format(used=used, budget=budget, left=left)
 
 
+def repeat_note(
+    ctx: ToolContext, name: str, args: dict[str, object], failed: bool
+) -> str:
+    """"You have already made this exact call" — advice, never a refusal.
+
+    The reference agent had this and squishy did not, and it shows: on
+    qiskit-terra-5662 the model issued the same non-matching `edit_file` twice
+    in consecutive turns and nothing told it the second one could not work.
+    `read_file`'s span cache does refuse repeats, but it deliberately forgets
+    after trimming, so a long run loses the signal exactly when it is needed.
+    This counter never forgets, because advice cannot punish a legitimate
+    re-read the way a refusal can.
+    """
+    if name in _REPEAT_EXEMPT:
+        return ""
+    key = _signature(name, args)
+    count = ctx.call_signatures.get(key, 0) + 1
+    ctx.call_signatures[key] = count
+    if count < _REPEAT_AT:
+        return ""
+    return (_REPEAT_FAILED if failed else _REPEAT).format(n=count)
+
+
 def pressure_note(ctx: ToolContext) -> tuple[str, list[str]]:
     """``(text, tags)`` — the notices this call earned, and their names.
 
@@ -107,22 +158,35 @@ def pressure_note(ctx: ToolContext) -> tuple[str, list[str]]:
     return "\n".join(parts), tags
 
 
-def apply(ctx: ToolContext, name: str, result: ToolResult) -> ToolResult:
-    """Record the call's outcome and attach any pressure notice to it."""
+def apply(
+    ctx: ToolContext,
+    name: str,
+    result: ToolResult,
+    args: dict[str, object] | None = None,
+) -> ToolResult:
+    """Record the call's outcome and attach any notices it earned."""
     record_outcome(ctx, name, result)
-    note, tags = pressure_note(ctx)
+    parts: list[str] = []
+    tags: list[str] = []
+    repeat = repeat_note(ctx, name, args or {}, failed=not result.success)
+    if repeat:
+        parts.append(repeat)
+        tags.append("repeat")
+    edit_note, edit_tags = pressure_note(ctx)
+    if edit_note:
+        parts.append(edit_note)
+        tags.extend(edit_tags)
     ctx.last_pressure = tags
-    if not note:
+    if not parts:
         return result
     for tag in tags:
         ctx.pressure_notices[tag] = ctx.pressure_notices.get(tag, 0) + 1
-    if result.success:
-        # Under its own key: appending to an existing `note`/`warning` would
-        # let a read-loop warning and a budget notice overwrite each other.
-        result.data["pressure"] = note
-    else:
-        result.error = f"{result.error}\n\n{note}" if result.error else note
+    # Outside the JSON payload, not inside it. See `ToolResult.notice`.
+    result.notice = "\n\n".join(parts)
     return result
 
 
-__all__ = ["PROBE_LIMIT", "apply", "budget_notice", "pressure_note", "record_outcome"]
+__all__ = [
+    "PROBE_LIMIT", "apply", "budget_notice", "pressure_note", "record_outcome",
+    "repeat_note",
+]

@@ -53,6 +53,8 @@ class LoopState:
     # profile this is the only edit signal there is — `files_edited` only ever
     # records edit_file/write_file.
     shell_writes: int = 0
+    # Times the loop refused to accept "stopped without editing" as an ending.
+    empty_patch_continues: int = 0
     recent_edit_fail_files: set[str] = field(default_factory=set)
     last_edit_turn: int = 0
     # FAIL_TO_PASS identifiers, when a bench harness supplies them. Surfaced to

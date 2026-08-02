@@ -81,16 +81,42 @@ async def test_the_notice_rides_on_the_result_of_the_call_that_earned_it(
     ctx.turns_used, ctx.turn_budget = 45, 50
     res = await dispatch("list_directory", {"path": "."}, ctx)
     assert res.success
-    assert "[budget]" in res.data["pressure"]
+    assert "[budget]" in res.to_message()
 
 
-async def test_a_failing_call_carries_the_notice_in_its_error(tmp_path) -> None:
+async def test_the_notice_is_the_last_thing_the_model_reads(tmp_path) -> None:
+    """Outside the JSON payload, not a key inside it.
+
+    Buried in `data`, the notice was measurably ignored: 43-50 `[budget]` and
+    74-85 `[probes]` notices across a 100-turn container run that still never
+    edited a file.
+    """
+    ctx = _ctx(tmp_path)
+    ctx.turns_used, ctx.turn_budget = 45, 50
+    msg = (await dispatch("list_directory", {"path": "."}, ctx)).to_message()
+    assert msg.rstrip().endswith("does not."), msg[-120:]
+    assert '"pressure"' not in msg, "it must not be a JSON key any more"
+
+
+async def test_a_big_payload_cannot_squeeze_the_notice_out(tmp_path) -> None:
+    """`_short_json` snips the middle of an oversized payload; the notice has
+    to be reserved out of the budget rather than compete for it."""
+    (tmp_path / "big.py").write_text("\n".join(f"x{i} = {i}" for i in range(5000)))
+    ctx = _ctx(tmp_path, max_tool_output_chars=1500)
+    ctx.turns_used, ctx.turn_budget = 45, 50
+    res = await dispatch("read_file", {"path": "big.py"}, ctx)
+    msg = res.to_message(ctx.max_tool_output_chars)
+    assert "[budget]" in msg
+
+
+async def test_a_failing_call_carries_the_notice_too(tmp_path) -> None:
     ctx = _ctx(tmp_path)
     ctx.turns_used, ctx.turn_budget = 45, 50
     res = await dispatch("read_file", {"path": "nope.py"}, ctx)
     assert not res.success
-    assert "[budget]" in res.error
-    assert "nope.py" in res.error, "the original error must survive"
+    msg = res.to_message()
+    assert "[budget]" in msg
+    assert "nope.py" in msg, "the original error must survive"
 
 
 async def test_pressure_never_overwrites_an_existing_note(tmp_path) -> None:
@@ -101,8 +127,9 @@ async def test_pressure_never_overwrites_an_existing_note(tmp_path) -> None:
     for _ in range(2):  # the second read is served from cache, with its own note
         res = await dispatch("read_file", {"path": "a.py", "offset": 0}, ctx)
     assert res.success
-    assert "[budget]" in res.data["pressure"]
-    assert "already read this file" in res.data["note"]
+    msg = res.to_message()
+    assert "[budget]" in msg
+    assert "already read this file" in msg
 
 
 async def test_the_notice_is_reported_on_the_tool_event(tmp_path) -> None:
@@ -138,3 +165,59 @@ async def test_the_notice_is_reported_on_the_tool_event(tmp_path) -> None:
     tags = {t for e in events if e.get("type") == "tool" for t in e.get("pressure", [])}
     assert "probes" in tags
     assert "budget" in tags
+
+
+async def test_an_identical_failing_edit_is_called_out(tmp_path) -> None:
+    """qiskit-terra-5662 issued the same non-matching edit_file twice in a
+    row and nothing told it the second could not work.
+
+    Advice, never a refusal: `read_file`'s span cache does refuse repeats but
+    deliberately forgets after trimming, so a long run loses the signal
+    exactly when it needs it. A counter that never forgets is only safe
+    because it does not block.
+    """
+    (tmp_path / "a.py").write_text("x = 1\n")
+    ctx = _ctx(tmp_path)
+    args = {"path": "a.py", "old_str": "nope\nnope\nnope\n", "new_str": "y"}
+
+    first = await dispatch("edit_file", dict(args), ctx)
+    assert not first.success
+    assert "[repeat]" not in first.to_message()
+
+    second = await dispatch("edit_file", dict(args), ctx)
+    assert not second.success
+    msg = second.to_message()
+    assert "[repeat]" in msg
+    assert "cannot succeed" in msg
+
+
+async def test_a_repeated_successful_call_is_called_out_more_gently(
+    tmp_path,
+) -> None:
+    build = tmp_path / "m.py"
+    build.write_text("def f():\n    return 1\n")
+    from squishy.graph import build_repo_graph
+    build_repo_graph(tmp_path)
+    ctx = _ctx(tmp_path)
+
+    await dispatch("explore", {"query": "f"}, ctx)
+    msg = (await dispatch("explore", {"query": "f"}, ctx)).to_message()
+    assert "[repeat]" in msg
+    assert "will not change" in msg
+
+
+async def test_different_arguments_are_not_a_repeat(tmp_path) -> None:
+    (tmp_path / "a.py").write_text("\n".join(f"x{i} = {i}" for i in range(50)))
+    ctx = _ctx(tmp_path)
+    await dispatch("read_file", {"path": "a.py", "offset": 0, "limit": 10}, ctx)
+    res = await dispatch("read_file", {"path": "a.py", "offset": 10, "limit": 10}, ctx)
+    assert "[repeat]" not in res.to_message(), "paging is not looping"
+
+
+async def test_run_command_is_exempt(tmp_path) -> None:
+    """Re-running a test after an edit is correct; shell.py has its own,
+    output-aware counter for genuinely echoing commands."""
+    ctx = _ctx(tmp_path)
+    for _ in range(3):
+        res = await dispatch("run_command", {"command": "true"}, ctx)
+    assert "[repeat]" not in res.to_message()

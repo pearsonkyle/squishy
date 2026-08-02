@@ -44,11 +44,16 @@ def test_read_only_commands_are_not_mistaken_for_writes(cmd):
     assert not looks_like_file_write(cmd)
 
 
-def _pressure(result):
-    """Every pressure notice the model was actually shown, in order."""
+def _pressure(agent):
+    """Every pressure notice the model was actually shown, in order.
+
+    Read from `_full_log`, not the returned transcript: `trim_history` drops
+    old tool results, so a long run can end with every notice trimmed out of
+    `result.messages` while the model saw all of them at the time.
+    """
     return [
         str(m.get("content", ""))
-        for m in result.messages
+        for m in agent._full_log
         if m.get("role") == "tool"
         and ("[budget]" in str(m.get("content", ""))
              or "[probes]" in str(m.get("content", "")))
@@ -73,8 +78,8 @@ async def _run(tmp_path, commands, max_turns=20):
 
 
 async def test_pure_exploration_gets_pushed(tmp_path):
-    agent, result = await _run(tmp_path, [f"ls -la {i}" for i in range(12)])
-    notices = _pressure(result)
+    agent, _result = await _run(tmp_path, [f"ls -la {i}" for i in range(12)])
+    notices = _pressure(agent)
     assert notices, "a shell run that never writes should be prodded"
     assert any("[probes]" in n for n in notices), "a run of commands with no edit"
     assert any("[budget]" in n for n in notices), "and the clock running down"
@@ -82,9 +87,9 @@ async def test_pure_exploration_gets_pushed(tmp_path):
 
 async def test_the_push_arrives_in_the_tool_result_not_a_user_turn(tmp_path):
     """The rule the whole loop is built around, asserted directly."""
-    _agent, result = await _run(tmp_path, [f"ls {i}" for i in range(12)])
+    agent, _result = await _run(tmp_path, [f"ls {i}" for i in range(12)])
     injected = [
-        m for m in result.messages
+        m for m in agent._full_log
         if m.get("role") == "user" and "[budget]" in str(m.get("content", ""))
     ]
     assert not injected, "pressure must never be an out-of-band user message"
@@ -96,7 +101,7 @@ async def test_a_run_that_writes_is_left_alone(tmp_path):
         tmp_path, ["ls -la", "cat > a.py <<'EOF'\nx = 2\nEOF"]
         + [f"git diff {i}" for i in range(10)])
     assert agent._active_st.shell_writes >= 1
-    assert not _pressure(result), "the model already edited; nagging it is noise"
+    assert not _pressure(agent), "the model already edited; nagging it is noise"
 
 
 @pytest.mark.parametrize("cmd", [
@@ -129,5 +134,5 @@ async def test_pressure_survives_a_scratch_repro_script(tmp_path):
     commands = ["cat > /tmp/sq_repro.py <<'EOF'\nprint(1)\nEOF"] + [
         f"grep -rn thing{i} src/" for i in range(12)
     ]
-    _agent, result = await _run(tmp_path, commands)
-    assert _pressure(result), "a /tmp script must not switch the brakes off"
+    agent, _result = await _run(tmp_path, commands)
+    assert _pressure(agent), "a /tmp script must not switch the brakes off"
