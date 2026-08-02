@@ -1,6 +1,7 @@
 """MCP type definitions: server configs, tool descriptors, connection state."""
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -59,9 +60,26 @@ class MCPServerConfig:
             env=d.get("env", {}),
             url=d.get("url", ""),
             headers=d.get("headers", {}),
-            timeout=int(d.get("timeout", 30)),
+            timeout=_coerce_timeout(d.get("timeout", 30)),
             disabled=bool(d.get("disabled", False)),
         )
+
+
+def _coerce_timeout(value: object, default: int = 30) -> int:
+    """Best-effort timeout coercion so a stray `"30s"` in .mcp.json doesn't
+    crash all MCP init with a ValueError."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value > 0 else default
+    if isinstance(value, float):
+        return int(value) if value > 0 else default
+    if isinstance(value, str):
+        m = re.match(r"\s*(\d+)", value)
+        if m:
+            n = int(m.group(1))
+            return n if n > 0 else default
+    return default
 
 
 # ── Connection state ──────────────────────────────────────────────────────────

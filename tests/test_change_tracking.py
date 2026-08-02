@@ -2,18 +2,12 @@
 
 from __future__ import annotations
 
-import json
-
-import pytest
+from conftest import FakeClient
 
 from squishy.agent import Agent
 from squishy.client import CompletionResult, ToolCall
 from squishy.config import Config
 from squishy.display import Display
-from squishy.plan_state import load_plan, plan_path
-from squishy.tools.base import ToolContext
-
-from conftest import FakeClient
 
 
 def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
@@ -22,7 +16,7 @@ def _tc(name: str, args: dict, call_id: str = "c1") -> ToolCall:
 
 async def test_file_operations_tracking_created(ctx):
     """Verify files_read dict is populated for read operations after write."""
-    from squishy.tools.fs import write_file, read_file
+    from squishy.tools.fs import read_file, write_file
 
     result = await write_file.run(
         {"path": "new.py", "content": "# New file\n"}, ctx
@@ -39,7 +33,7 @@ async def test_file_operations_tracking_created(ctx):
 
 async def test_file_operations_tracking_edited(ctx):
     """Verify files_read dict is populated after edit operations."""
-    from squishy.tools.fs import write_file, edit_file, read_file
+    from squishy.tools.fs import edit_file, read_file, write_file
 
     # Create file first
     await write_file.run({"path": "app.py", "content": "x = 1\n"}, ctx)
@@ -58,71 +52,8 @@ async def test_file_operations_tracking_edited(ctx):
     assert "app.py" in ctx.files_read
 
 
-async def test_plan_state_persistence_across_turns(tmp_path):
-    """Plan state is persisted after plan_task call in edits mode."""
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "edits"
-    cfg.max_turns = 10
-
-    script = [
-        CompletionResult(
-            tool_calls=[
-                _tc(
-                    "plan_task",
-                    {
-                        "problem": "Task 1",
-                        "solution": "Solution 1",
-                        "steps": ["Step A", "Step B"],
-                    },
-                )
-            ]
-        ),
-        # After plan_task, agent gets system prompt about unresolved steps
-        CompletionResult(
-            tool_calls=[_tc("update_plan", {"step_index": 1, "status": "done"})]
-        ),
-        CompletionResult(
-            tool_calls=[_tc("update_plan", {"step_index": 2, "status": "done"})]
-        ),
-        CompletionResult(text="Done", tool_calls=[]),
-    ]
-
-    fake = FakeClient(script=script)
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("Do task")
-
-    assert result.success
-
-    # Plan should be persisted to disk (approved by default in edits mode)
-    plan = load_plan(tmp_path)
-    assert plan is not None
-    assert len(plan.steps) == 2
-    assert plan.problem == "Task 1"
 
 
-async def test_consecutive_reads_tracking(tmp_path):
-    """Verify read tool calls increment the tracking counter."""
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "plan"
-    cfg.max_turns = 10
-
-    # Create test files
-    for i in range(5):
-        (tmp_path / f"file{i}.py").write_text(f"# file {i}\n")
-
-    cfg2 = Config()
-    cfg2.working_dir = str(tmp_path)
-    cfg2.permission_mode = "plan"
-    cfg2.max_turns = 5
-
-    fake = FakeClient(script=[CompletionResult(text="done", tool_calls=[])])
-    agent = Agent(cfg2, fake, Display())  # type: ignore[arg-type]
-
-    initial_count = agent.consecutive_reads_without_recall
-
-    assert initial_count == 0
 
 
 async def test_read_cache_invalidation_on_write(ctx, tmp_path):
@@ -152,7 +83,7 @@ async def test_read_cache_invalidation_on_write(ctx, tmp_path):
 
 async def test_read_cache_invalidation_on_edit(ctx, tmp_path):
     """Verify cache is cleared after edit_file operation."""
-    from squishy.tools.fs import read_file, write_file, edit_file
+    from squishy.tools.fs import edit_file, read_file, write_file
 
     # Create file
     await write_file.run({"path": "code.py", "content": "x = 1\n"}, ctx)
@@ -177,7 +108,7 @@ async def test_read_cache_invalidation_on_edit(ctx, tmp_path):
 
 async def test_multiple_edits_same_file_tracking(ctx, tmp_path):
     """Verify multiple edits to same file are tracked correctly."""
-    from squishy.tools.fs import write_file, edit_file, read_file
+    from squishy.tools.fs import edit_file, read_file, write_file
 
     # Create initial file
     await write_file.run({"path": "app.py", "content": "a = 1\nb = 2\nc = 3\n"}, ctx)
@@ -277,70 +208,7 @@ async def test_context_files_read_accumulates(tmp_path):
         assert f"# file {i}" in agent.tool_ctx.files_read[f"file{i}.py"]
 
 
-async def test_pending_plan_evidence_accumulation(tmp_path):
-    """Verify pending_plan_evidence list is cleared after plan_task."""
-    cfg = Config()
-    cfg.working_dir = str(tmp_path)
-    cfg.permission_mode = "edits"
-    cfg.max_turns = 10
-
-    script = [
-        CompletionResult(
-            tool_calls=[
-                _tc(
-                    "plan_task",
-                    {
-                        "problem": "Task",
-                        "solution": "Do it",
-                        "steps": ["Step 1"],
-                    },
-                )
-            ]
-        ),
-        # After plan_task, agent gets system prompt about unresolved steps
-        CompletionResult(
-            tool_calls=[_tc("update_plan", {"step_index": 1, "status": "done"})]
-        ),
-        CompletionResult(text="Done", tool_calls=[]),
-    ]
-
-    fake = FakeClient(script=script)
-    agent = Agent(cfg, fake, Display())  # type: ignore[arg-type]
-    result = await agent.run("Do task")
-
-    assert result.success
-    # Evidence should have been cleared after plan_task (it clears pending_plan_evidence)
-    assert len(agent.tool_ctx.pending_plan_evidence) == 0
 
 
-async def test_tool_context_mode_switching(ctx):
-    """Verify permission_mode changes take effect in tool dispatch."""
-    ctx.permission_mode = "plan"
-    from squishy.tools import check_permission
-    from squishy.tools.fs import read_file, write_file
-
-    # In plan mode: reads allowed, writes blocked
-    allowed, _ = check_permission(read_file, "plan")
-    assert allowed
-
-    allowed, reason = check_permission(write_file, "plan")
-    assert not allowed
-    assert "plan mode" in reason
-
-    # Switch to yolo: both should be allowed
-    ctx.permission_mode = "yolo"
-
-    allowed, _ = check_permission(read_file, "yolo")
-    assert allowed
-
-    allowed, _ = check_permission(write_file, "yolo")
-    assert allowed
 
 
-async def test_plan_switch_prompted_flag(ctx):
-    """Verify plan_switch_prompted flag tracks mode transitions."""
-    ctx.permission_mode = "plan"
-    ctx.plan_switch_prompted = True
-
-    # Flag should track whether we've prompted about mode switch
-    assert ctx.plan_switch_prompted is True

@@ -12,8 +12,20 @@ from dataclasses import dataclass
 
 from squishy.tools.fs import _resolve
 
-FILE_PATTERN = re.compile(r"@(\S+)")
+# Match @path references, but NOT the @ inside an email address or a path
+# (negative lookbehind for a word char / @ / /), and capture the run of
+# non-space chars. Trailing sentence punctuation is stripped afterwards so
+# `@app.py.` / `@app.py,` resolve to `app.py`.
+FILE_PATTERN = re.compile(r"(?<![\w@/])@(\S+)")
 """Regex pattern to match @filename references."""
+
+# Punctuation that is almost always sentence/markup, not part of a filename.
+_TRAILING_PUNCT = ".,;:!?\"')]}>"
+
+
+def _clean_ref(raw: str) -> str:
+    """Strip trailing sentence punctuation from a captured @reference."""
+    return raw.rstrip(_TRAILING_PUNCT)
 
 
 FILE_WRAPPER = """<file path="{path}" total_lines="{total_lines}">{content}
@@ -54,8 +66,9 @@ def parse_references_with_missing(
     references: list[FileReference] = []
     missing: list[str] = []
     seen: set[str] = set()
-    for path in FILE_PATTERN.findall(text):
-        if path in seen:
+    for raw in FILE_PATTERN.findall(text):
+        path = _clean_ref(raw)
+        if not path or path in seen:
             continue
         seen.add(path)
         abs_path = _resolve(path, working_dir)

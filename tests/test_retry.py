@@ -1,19 +1,18 @@
 """Retry and error-translation tests for the async client."""
  
 from __future__ import annotations
- 
+
 from typing import Any
- 
+
 import httpx
 import pytest
 from tenacity import wait_none
- 
+
 import squishy.client as client_mod
 from squishy.client import Client
 from squishy.errors import LLMError
- 
- 
- 
+
+
 class _FlakyCompletions:
     """Fake ``chat.completions.create`` that fails the first N calls then succeeds."""
  
@@ -124,6 +123,65 @@ async def test_client_retries_5xx_api_status_error():
 
     assert flaky.calls == 3
     assert result.text == "ok"
+
+
+async def test_client_retries_remote_protocol_error():
+    """A local server dropping the connection mid-generation raises
+    httpx.RemoteProtocolError (not ConnectError) — it must be retried, not
+    escape raw. This is the local-vLLM/LM-Studio disconnect case."""
+    err = httpx.RemoteProtocolError("server disconnected without sending a complete response")
+    client, flaky = _client_with_fake_openai(fail_n=2, exc=err, max_retries=4)
+    original_wait = client_mod.wait_exponential
+    client_mod.wait_exponential = lambda **_: wait_none()  # type: ignore[assignment]
+    try:
+        result = await client.complete([{"role": "user", "content": "hi"}], [], stream=False)
+    finally:
+        client_mod.wait_exponential = original_wait
+        await client.aclose()
+
+    assert flaky.calls == 3
+    assert result.text == "ok"
+
+
+async def test_client_wraps_unexpected_error_as_llmerror():
+    """Any unexpected (non-transient) exception must be translated to LLMError
+    so nothing untyped escapes the client seam."""
+    err = ValueError("something weird in the stream")
+    client, flaky = _client_with_fake_openai(fail_n=1, exc=err, max_retries=4)
+    original_wait = client_mod.wait_exponential
+    client_mod.wait_exponential = lambda **_: wait_none()  # type: ignore[assignment]
+    try:
+        with pytest.raises(LLMError, match="unexpected client error"):
+            await client.complete([{"role": "user", "content": "hi"}], [], stream=False)
+    finally:
+        client_mod.wait_exponential = original_wait
+        await client.aclose()
+
+    # Not transient → no retries.
+    assert flaky.calls == 1
+
+
+async def test_client_reverse_orphan_tool_message_fast_fails():
+    """A 400 for a role=tool message not preceded by tool_calls is
+    deterministic — fail-fast with the azure_strict marker, no retries."""
+    from openai import APIStatusError
+
+    resp = httpx.Response(400, request=httpx.Request("POST", "http://example.invalid/v1"))
+    err = APIStatusError(
+        "messages with role 'tool' must be a response to a preceding message with 'tool_calls'",
+        response=resp, body=None,
+    )
+    client, flaky = _client_with_fake_openai(fail_n=5, exc=err, max_retries=4)
+    original_wait = client_mod.wait_exponential
+    client_mod.wait_exponential = lambda **_: wait_none()  # type: ignore[assignment]
+    try:
+        with pytest.raises(LLMError, match="azure_strict_orphan_tool_calls"):
+            await client.complete([{"role": "user", "content": "hi"}], [], stream=False)
+    finally:
+        client_mod.wait_exponential = original_wait
+        await client.aclose()
+
+    assert flaky.calls == 1
 
 
 async def test_client_does_not_retry_4xx_api_status_error():

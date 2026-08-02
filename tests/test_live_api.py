@@ -1,10 +1,12 @@
 """Live integration tests for the squishy API."""
 
 import asyncio
+import functools
 import json
 import os
 import shutil
 import tempfile
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -14,7 +16,6 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from squishy.api import Squishy
-from squishy.plan_state import load_plan
 
 pytestmark = pytest.mark.smoke
 
@@ -24,11 +25,35 @@ def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
+@functools.lru_cache(maxsize=1)
+def _model() -> str:
+    """The model id to test against.
+
+    Resolved from the endpoint's own model list rather than a hardcoded
+    default. Asking an inference server for a model it does not have makes it
+    JIT-load something to satisfy the request — which is how these tests
+    silently pulled an unrelated model onto the user's machine.
+    """
+    explicit = os.environ.get("SQUISHY_MODEL")
+    if explicit:
+        return explicit
+    base = _env("SQUISHY_BASE_URL", "http://localhost:1234/v1").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base}/models", timeout=5) as resp:
+            data = json.load(resp)
+        served = [m["id"] for m in data.get("data", []) if m.get("id")]
+    except Exception:  # noqa: BLE001
+        served = []
+    if not served:
+        pytest.skip(f"no model available at {base}; set SQUISHY_MODEL")
+    return served[0]
+
+
 async def test_health_check():
     """Verify the API can connect to the LLM server."""
     print("\n=== Test: Health Check ===")
     async with Squishy(
-        model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+        model=_model(),
         base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
         api_key=_env("SQUISHY_API_KEY", "local"),
     ) as sq:
@@ -44,7 +69,7 @@ async def test_yolo_mode_simple_write():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -73,7 +98,7 @@ async def test_yolo_mode_file_edit():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -93,99 +118,10 @@ async def test_yolo_mode_file_edit():
     print("✅ yolo_mode_file_edit passed")
 
 
-async def test_plan_mode_read_only():
-    """Test plan mode requires plan approval before writes."""
-    print("\n=== Test: Plan Mode - Plan Approval Required ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        (working_dir / "app.py").write_text("x = 1\n")
-
-        async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="plan",
-            max_turns=10,
-        ) as sq:
-            result = await sq.run(
-                "First create a plan to read app.py, then read it",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Final text: {result.final_text[:300]}")
-        # In plan mode, the agent should present a plan but not auto-execute it
-        # The result may fail if it can't produce a plan_task, which is expected
-        print(f"Error (if any): {result.error or 'none'}")
-        # Plan mode should not auto-edit files
-        assert len(result.files_edited) == 0
-    print("✅ plan_mode_read_only passed")
 
 
-async def test_edits_mode_with_plan():
-    """Test edits mode auto-approves plan_task and tracks steps."""
-    print("\n=== Test: Edits Mode - Plan Tracking ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="edits",
-            max_turns=15,
-        ) as sq:
-            result = await sq.run(
-                "Create a todo app with two files: todo.py and README.md",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Files created: {result.files_created}")
-        print(f"Files edited: {result.files_edited}")
-        if result.plan_state:
-            progress = result.plan_state.get("progress", {})
-            print(f"Plan progress: {progress}")
-        if result.plan_state:
-            plan = load_plan(working_dir)
-            if plan:
-                print(f"Plan problem: {plan.problem}")
-                print(f"Plan steps: {len(plan.steps)}")
-                for i, step in enumerate(plan.steps, 1):
-                    print(f"  Step {i}: [{step.status}] {step.description}")
-        assert result.success, f"Task should succeed: {result.error}"
-    print("✅ edits_mode_with_plan passed")
 
 
-async def test_plan_mode_step_tracking():
-    """Test that plan mode can create plans and track step progress."""
-    print("\n=== Test: Plan Mode - Step Progress Tracking ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="edits",
-            max_turns=15,
-        ) as sq:
-            result = await sq.run(
-                "Create a simple Python module called utils.py with a function called greet that takes a name and prints 'Hello, {name}!'",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Files created: {result.files_created}")
-        print(f"Files edited: {result.files_edited}")
-        if result.plan_state:
-            plan = load_plan(working_dir)
-            if plan:
-                print(f"Plan problem: {plan.problem}")
-                progress = plan.progress()
-                print(f"Progress: {progress}")
-                for i, step in enumerate(plan.steps, 1):
-                    print(f"  Step {i}: [{step.status}] {step.description}")
-        assert result.success, f"Task should succeed: {result.error}"
-    print("✅ plan_mode_step_tracking passed")
 
 
 async def test_error_handling():
@@ -206,7 +142,7 @@ def divide(a, b):
 """)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="edits",
@@ -238,7 +174,7 @@ async def test_streaming_callback():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -265,7 +201,7 @@ async def test_multiple_turns():
 
         # Turn 1: Create a file
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -279,7 +215,7 @@ async def test_multiple_turns():
 
         # Turn 2: Modify the file
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -302,7 +238,7 @@ async def test_thinking_mode():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -337,7 +273,7 @@ async def test_session_persistence():
 
         # Turn 1: Create a file
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -354,7 +290,7 @@ async def test_session_persistence():
 
         # Turn 2: Read the file using the same session - context should be preserved
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -378,7 +314,7 @@ async def test_timeout_handling():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -403,49 +339,6 @@ async def test_timeout_handling():
     print("✅ timeout_handling passed")
 
 
-async def test_bench_mode():
-    """Test bench mode with phase tracking (explore → fix → verify)."""
-    print("\n=== Test: Bench Mode - Phase Tracking ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        # Create a buggy file for bench mode to fix
-        (working_dir / "calculator.py").write_text("""
-def add(a, b):
-    return a - b  # Bug: should be a + b
-
-def subtract(a, b):
-    return a - b
-
-def multiply(a, b):
-    return a * b
-
-def divide(a, b):
-    if b == 0:
-        raise ValueError("Cannot divide by zero")
-    return a / b
-""")
-        async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="bench",
-            max_turns=15,
-        ) as sq:
-            result = await sq.run(
-                "## Problem\nThe add function in calculator.py is broken. It subtracts instead of adding.\n## Hints\nFix the add function to correctly add two numbers.",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Files edited: {result.files_edited}")
-        print(f"Final phase: {result.final_phase}")
-        print(f"Explore turns: {result.explore_turns}")
-        print(f"Fix-verify cycles: {result.fix_verify_cycles}")
-        if result.files_edited:
-            content = (working_dir / result.files_edited[0]).read_text()
-            print(f"Fixed content:\n{content[:500]}")
-            assert "+" in content or "a + b" in content
-    print("✅ bench_mode passed")
 
 
 async def test_context_compaction():
@@ -460,7 +353,7 @@ async def test_context_compaction():
             )
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -522,7 +415,7 @@ class UserService:
 """)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -553,7 +446,7 @@ async def test_consecutive_error_recovery():
         (working_dir / "simple.py").write_text("# A simple file\nprint('hello')\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -585,7 +478,7 @@ async def test_tool_call_loop_detection():
         (working_dir / "data.txt").write_text("line1\nline2\nline3\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -619,7 +512,7 @@ async def test_sandbox_mode():
         working_dir = Path(tmp)
         try:
             async with Squishy(
-                model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+                model=_model(),
                 base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
                 api_key=_env("SQUISHY_API_KEY", "local"),
                 permission_mode="yolo",
@@ -649,7 +542,7 @@ async def test_mcp_tool_integration():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -673,34 +566,6 @@ async def test_mcp_tool_integration():
     print("✅ mcp_tool_integration passed")
 
 
-async def test_quality_gate():
-    """Test that quality gates catch degenerate tool call patterns."""
-    print("\n=== Test: Quality Gate ===")
-    with tempfile.TemporaryDirectory() as tmp:
-        working_dir = Path(tmp)
-        async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
-            base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
-            api_key=_env("SQUISHY_API_KEY", "local"),
-            permission_mode="yolo",
-            max_turns=10,
-            max_quality_retries=2,
-        ) as sq:
-            result = await sq.run(
-                "Create a file called quality_check.py with a function called validate that checks if a string is a valid email",
-                working_dir=str(working_dir),
-            )
-        print(f"Success: {result.success}")
-        print(f"Turns: {result.turns_used}")
-        print(f"Quality skips: {result.quality_skips}")
-        print(f"Tool call counts: {result.tool_call_counts}")
-        if result.files_created:
-            qc_file = next((f for f in result.files_created if "quality" in f), None)
-            if qc_file:
-                content = (working_dir / qc_file).read_text()
-                print(f"Quality check file:\n{content[:500]}")
-                assert "validate" in content
-    print("✅ quality_gate passed")
 
 
 async def test_token_usage_tracking():
@@ -709,7 +574,7 @@ async def test_token_usage_tracking():
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -721,8 +586,8 @@ async def test_token_usage_tracking():
             )
         print(f"Success: {result.success}")
         print(f"Tokens used: {result.tokens_used}")
-        print(f"Prompt tokens: tracked via display")
-        print(f"Completion tokens: tracked via display")
+        print("Prompt tokens: tracked via display")
+        print("Completion tokens: tracked via display")
         assert result.tokens_used > 0, "Token usage should be tracked"
         assert result.turns_used > 0, "Should have used at least one turn"
     print("✅ token_usage_tracking passed")
@@ -737,7 +602,7 @@ async def test_file_change_detection():
         (working_dir / "config.py").write_text("VERSION = '1.0.0'\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -774,7 +639,7 @@ async def test_show_diff_tool():
         subprocess.run(["git", "commit", "-m", "initial"], cwd=working_dir, capture_output=True)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -808,7 +673,7 @@ async def test_glob_files_tool():
         (working_dir / "tests").joinpath("test_utils.py").write_text("def test_util(): pass\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -826,7 +691,15 @@ async def test_glob_files_tool():
 
 
 async def test_recall_tool():
-    """Test that the recall tool works with an existing index."""
+    """Test that the recall tool works with an existing index.
+
+    The index is built here in the fixture (as ``/init`` would): ``/init`` is a
+    REPL slash command with no tool behind it, so asking the agent to run it
+    made this test measure how gracefully the model improvises past an
+    impossible instruction rather than whether ``recall`` works.
+    """
+    from squishy.index import build_index, save_index
+
     print("\n=== Test: Recall Tool ===")
     with tempfile.TemporaryDirectory() as tmp:
         working_dir = Path(tmp)
@@ -852,16 +725,19 @@ class UserService:
         return user
 """)
 
+        # Build the index up front, the way `/init` does.
+        save_index(str(working_dir), build_index(str(working_dir)))
+
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
             max_turns=15,
         ) as sq:
             result = await sq.run(
-                "First build an index with /init, then use recall to find the User class definition, "
-                "and finally read the file containing it",
+                "Use the recall tool to find the User class definition, "
+                "then read the file containing it.",
                 working_dir=str(working_dir),
             )
         print(f"Success: {result.success}")
@@ -880,7 +756,7 @@ async def test_scratchpad_tool():
         (working_dir / "app.py").write_text("x = 1\n")
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -923,7 +799,7 @@ class Square:
 """)
 
         async with Squishy(
-            model=_env("SQUISHY_MODEL", "qwen/qwen3.6-35b-a3b"),
+            model=_model(),
             base_url=_env("SQUISHY_BASE_URL", "http://localhost:1234/v1"),
             api_key=_env("SQUISHY_API_KEY", "local"),
             permission_mode="yolo",
@@ -956,10 +832,6 @@ async def main():
         # Permission modes
         test_yolo_mode_simple_write,
         test_yolo_mode_file_edit,
-        test_plan_mode_read_only,
-        test_edits_mode_with_plan,
-        test_plan_mode_step_tracking,
-        test_bench_mode,
         # Agent features
         test_error_handling,
         test_streaming_callback,
@@ -973,7 +845,6 @@ async def main():
         test_tool_call_loop_detection,
         test_sandbox_mode,
         test_mcp_tool_integration,
-        test_quality_gate,
         test_token_usage_tracking,
         test_file_change_detection,
         # Tool-specific tests

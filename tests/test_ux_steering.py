@@ -143,14 +143,6 @@ def test_start_thinking_skipped_during_active_stream():
 # -- Display.mode_changed -----------------------------------------------------
 
 
-def test_mode_changed_warns_on_plan_to_edits_escalation():
-    d, buf = _capture_display()
-    d.set_mode("plan")
-    d.mode_changed("edits")
-    out = buf.getvalue()
-    assert "mode → edits" in out
-    # The whole point of the warning: write tools are now allowed.
-    assert "write tools" in out
 
 
 def test_mode_changed_warns_on_yolo():
@@ -162,14 +154,6 @@ def test_mode_changed_warns_on_yolo():
     assert "yolo" in out  # yolo-specific warning line
 
 
-def test_mode_changed_no_warning_for_edits_to_plan_descalation():
-    d, buf = _capture_display()
-    d.set_mode("edits")
-    d.mode_changed("plan")
-    out = buf.getvalue()
-    assert "mode → plan" in out
-    # De-escalation: no warning needed because plan removes write tools.
-    assert "write tools" not in out
 
 
 # -- file_browser missing-reference tracking ---------------------------------
@@ -348,3 +332,16 @@ async def test_client_on_retry_callback_errors_dont_break_retry():
     # Retry budget still ran to completion despite the broken callback.
     assert result.text == "ok"
     assert client.last_call_retries == 2
+
+
+def test_graph_calls_show_what_they_were_asked():
+    """A bare `explore` line hides the only interesting part of the call.
+
+    Every other tool prints its target — the path, the pattern, the query —
+    so a run is readable at a glance. The graph tools were the exception.
+    """
+    from squishy.agent_state import brief
+    from squishy.client import ToolCall
+
+    assert brief(ToolCall(id="1", name="explore", args={"query": "budget_notice"})) == "budget_notice"
+    assert brief(ToolCall(id="2", name="impact_of", args={"symbol": "CodeGraph"})) == "CodeGraph"

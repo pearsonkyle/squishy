@@ -56,11 +56,11 @@ def test_external_deps_section_is_deduped_one_line(tmp_path):
     assert deps_block.count("requests") == 1
 
 
-def test_planning_workflow_has_no_nested_bold(tmp_path):
+def test_navigation_section_has_no_nested_bold(tmp_path):
     out = generate_agents_md(_build(tmp_path), cwd=str(tmp_path))
-    assert "## Planning workflow" in out
+    assert "## Navigation" in out
     # The block used to read "**Important**: ..." with bold mid-sentence.
-    block = out.split("## Planning workflow", 1)[1]
+    block = out.split("## Navigation", 1)[1]
     assert "**" not in block
 
 
@@ -143,3 +143,20 @@ def test_sessions_dir_is_skipped(tmp_path):
     assert "sessions/" not in out
     assert "abc123" not in out
     assert "real.py" in out
+
+
+def test_agents_md_permits_fallback_exploration():
+    """Generated AGENTS.md must prefer recall but NOT forbid fallback tools —
+    the never-block-exploration contract."""
+    import os
+    import tempfile
+
+    from squishy.index import build_index
+    from squishy.index.agents_md import generate_agents_md
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "m.py"), "w") as f:
+            f.write('"""M."""\ndef f(): return 1\n')
+        idx = build_index(tmp)
+        md = generate_agents_md(idx, cwd=tmp)
+    assert "fall back" in md.lower() or "fallback" in md.lower()
+    assert "Do not call read_file, list_directory, or search_files without" not in md

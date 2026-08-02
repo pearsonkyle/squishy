@@ -26,7 +26,34 @@ def meta_path(cwd: str | os.PathLike[str]) -> Path:
 
 
 def has_index(cwd: str | os.PathLike[str]) -> bool:
-    return index_path(cwd).is_file()
+    """True only if a *loadable* index exists.
+
+    A bare ``is_file()`` check returns True for a truncated/corrupt
+    ``index.json`` (e.g. an interrupted ``/init``), which makes the system
+    prompt and plan-mode enforcement push the model toward ``recall`` — which
+    then fails with "no index". Validating loadability keeps ``has_index`` and
+    ``recall`` consistent so the fallback path is granted cleanly.
+    """
+    ip = index_path(cwd)
+    if not ip.is_file():
+        return False
+    try:
+        json.loads(ip.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write *text* to *path* atomically (temp file + os.replace).
+
+    A direct ``write_text`` leaves a truncated file if the process dies
+    mid-write; ``os.replace`` is atomic on POSIX/Windows so readers only ever
+    see the old file or the complete new one.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def save_index(cwd: str | os.PathLike[str], index: Index) -> Path:
@@ -34,8 +61,8 @@ def save_index(cwd: str | os.PathLike[str], index: Index) -> Path:
     d.mkdir(parents=True, exist_ok=True)
     ip = d / INDEX_FILE
     mp = d / META_FILE
-    ip.write_text(json.dumps(index.to_dict(), indent=2, ensure_ascii=False))
-    mp.write_text(json.dumps(index.meta.to_dict(), indent=2, ensure_ascii=False))
+    _atomic_write(ip, json.dumps(index.to_dict(), indent=2, ensure_ascii=False))
+    _atomic_write(mp, json.dumps(index.meta.to_dict(), indent=2, ensure_ascii=False))
     return ip
  
  

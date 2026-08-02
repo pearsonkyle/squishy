@@ -6,9 +6,59 @@ from squishy.context import (
     build_system_prompt,
     compact_messages,
     detect_project,
+    normalize_messages,
     snip_old_tool_results,
     trim_history,
 )
+
+
+def _asst_tc(call_id, name="run_command"):
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": call_id, "type": "function",
+             "function": {"name": name, "arguments": "{}"}},
+        ],
+    }
+
+
+def test_normalize_drops_reverse_orphan_tool_message():
+    """A tool message whose id was never declared by a preceding assistant
+    (e.g. a synthetic result injected without its assistant call) is dropped."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "do it"},
+        {"role": "assistant", "content": "done"},  # no tool_calls
+        {"role": "tool", "tool_call_id": "auto-pytest-0", "name": "run_command", "content": "F"},
+        {"role": "user", "content": "[system] nudge"},
+    ]
+    out = normalize_messages(msgs)
+    assert not any(m.get("role") == "tool" for m in out)
+    assert [m["role"] for m in out] == ["system", "user", "assistant", "user"]
+
+
+def test_normalize_keeps_well_formed_pairs():
+    """A properly paired assistant tool_calls + tool result survives."""
+    msgs = [
+        {"role": "user", "content": "go"},
+        _asst_tc("c1"),
+        {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": "ok"},
+    ]
+    out = normalize_messages(msgs)
+    assert out == msgs
+
+
+def test_normalize_keeps_result_after_intervening_user():
+    """A user message between the assistant call and its result does not
+    orphan the result — its id was still declared earlier."""
+    msgs = [
+        _asst_tc("c1"),
+        {"role": "user", "content": "[system] nudge"},
+        {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": "ok"},
+    ]
+    out = normalize_messages(msgs)
+    assert any(m.get("role") == "tool" and m["tool_call_id"] == "c1" for m in out)
  
  
 def test_detect_node_nextjs(tmp_path):
@@ -234,33 +284,10 @@ def test_system_prompt_softer_recall_rule_when_no_index(tmp_path):
     assert "/init" in prompt
 
 
-def test_system_prompt_no_duplicated_planning_block(tmp_path):
-    """`## Planning` used to repeat what mode blocks already cover —
-    the planning rule now lives once inside `## Rules`."""
-    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
-    assert "## Planning" not in prompt
-    # The planning rule should appear exactly once (it's in `## Rules`).
-    assert prompt.count("update_plan(step_index=N") <= 1
 
 
-def test_system_prompt_drops_json_shape_example(tmp_path):
-    """The plan_task tool schema documents the JSON shape — repeating it
-    here just bloats the prompt."""
-    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
-    assert '```json' not in prompt
-    assert '"files_to_modify"' not in prompt
-    assert '"files_to_create"' not in prompt
 
 
-def test_system_prompt_drops_shell_allowlist_enumeration(tmp_path):
-    """The runtime error already enumerates the allowlist when the model
-    guesses wrong, so don't burn tokens spelling it all out in prose.
-    A short hint is fine; a full enumeration is not."""
-    prompt = build_system_prompt(str(tmp_path), detect_project(str(tmp_path)), mode="plan")
-    # The block used to list every binary explicitly: ls, cat, head, tail,
-    # wc, grep, rg, find, pwd, which, file, stat, tree, ruff check, mypy,
-    # pyright, git status/log/diff/show/branch/blame/ls-files, …
-    assert "stat" not in prompt or "tree" not in prompt or "blame" not in prompt
 
 
 def test_system_prompt_top_files_dropped_when_index_present(tmp_path):
@@ -455,3 +482,52 @@ async def test_compact_messages_pulls_tool_results_with_anchored_assistant():
     # The matching tool result should also be present
     tool_results = [m for m in result if m.get("role") == "tool" and m.get("tool_call_id") == "c1"]
     assert tool_results, "tool result paired with anchored assistant should also survive compaction"
+
+
+def test_normalize_merges_consecutive_user_nudges():
+    """Stacked [system] nudges (sent as role=user) must be coalesced —
+    strict-alternation templates (Mistral) reject consecutive user turns."""
+    msgs = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "do the thing"},
+        {"role": "user", "content": "[system] nudge A"},
+        {"role": "user", "content": "[system] nudge B"},
+    ]
+    out = normalize_messages(msgs)
+    roles = [m["role"] for m in out]
+    assert roles == ["system", "user"]
+    body = out[-1]["content"]
+    assert "do the thing" in body and "nudge A" in body and "nudge B" in body
+
+
+def test_normalize_does_not_merge_across_assistant():
+    msgs = [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "reply"},
+        {"role": "user", "content": "b"},
+    ]
+    assert [m["role"] for m in normalize_messages(msgs)] == ["user", "assistant", "user"]
+
+
+def test_normalize_never_merges_assistant_tool_calls():
+    """Merging assistant messages that carry tool_calls would break pairing."""
+    msgs = [
+        _asst_tc("c1"),
+        {"role": "tool", "tool_call_id": "c1", "name": "run_command", "content": "ok"},
+        _asst_tc("c2"),
+        {"role": "tool", "tool_call_id": "c2", "name": "run_command", "content": "ok"},
+    ]
+    out = normalize_messages(msgs)
+    assert len(out) == 4
+    assert sum(1 for m in out if m.get("tool_calls")) == 2
+
+
+def test_normalize_merges_consecutive_prose_assistants():
+    msgs = [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "part 1"},
+        {"role": "assistant", "content": "part 2"},
+    ]
+    out = normalize_messages(msgs)
+    assert [m["role"] for m in out] == ["user", "assistant"]
+    assert "part 1" in out[-1]["content"] and "part 2" in out[-1]["content"]

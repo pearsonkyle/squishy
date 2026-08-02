@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 from squishy.bench.swebench import (
     _common_prefix_len,
     _extract_test_context_bodies,

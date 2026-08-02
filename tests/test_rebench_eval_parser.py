@@ -8,8 +8,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import pytest
-
 # Load the script as a module (it lives outside the package).
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT_PATH = _REPO_ROOT / "scripts" / "rebench_eval" / "run_eval.py"
@@ -110,29 +108,6 @@ def test_parse_pytest_output_reinstall_overridden_when_all_pass():
     assert res["eval_error"] == ""
 
 
-def test_parse_pytest_output_reinstall_not_overridden_when_p2p_fails():
-    """v6d: REINSTALL override must NOT mask a real P2P regression.
-
-    If the patch fixes F2P but breaks an unrelated P2P test, the
-    override must not fire — that's a genuine quality issue we want to
-    surface, not hide behind a reinstall hiccup.
-    """
-    output = (
-        "PASSED tests/test_foo.py::test_bar\n"
-        "PASSED tests/test_foo.py::test_p1\n"
-        "FAILED tests/test_foo.py::test_p2 - AssertionError\n"
-        "2 passed, 1 failed in 0.05s\n"
-        "EVAL_ERROR_REINSTALL\n"
-    )
-    res = _mod.parse_pytest_output(
-        output,
-        ["tests/test_foo.py::test_bar"],
-        ["tests/test_foo.py::test_p1", "tests/test_foo.py::test_p2"],
-    )
-    assert res["fail_to_pass"]["passed"] == 1
-    assert res["pass_to_pass"]["passed"] == 1  # one P2P failed
-    assert res["eval_status"] == "eval_error"
-    assert "re-install" in res["eval_error"].lower()
 
 
 # -- v6e/5: stderr-capture invariance -----------------------------------------

@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-
-import pytest
 
 from squishy.index import build_index, save_index
 from squishy.tools.base import ToolContext
@@ -254,3 +251,28 @@ async def test_depth_one_shows_methods(tmp_path: Path) -> None:
             assert "children" in result
             method_names = [c.get("name") for c in result["children"]]
             assert "load" in method_names or "save" in method_names
+
+
+
+
+def test_is_downranked_paths():
+    from squishy.tools.recall import _is_downranked
+    assert _is_downranked("tests/test_foo.py")
+    assert _is_downranked("pkg/tests/helpers.py")
+    assert _is_downranked("vendor/lib/x.py")
+    assert _is_downranked("examples/demo.py")
+    assert _is_downranked("src/test_widget.py")
+    assert not _is_downranked("src/widget.py")
+    assert not _is_downranked("pkg/core.py")
+
+
+def test_score_downranks_test_paths_below_source():
+    """A source symbol should outrank a same-name test symbol."""
+    from squishy.index.model import Node
+    from squishy.tools.recall import _score, _tokens
+    src = Node(id="s", kind="function", name="parse_config", path="src/config.py")
+    tst = Node(id="t", kind="function", name="parse_config", path="tests/test_config.py")
+    q = "parse_config"
+    assert _score(src, q, _tokens(q)) > _score(tst, q, _tokens(q))
+
+

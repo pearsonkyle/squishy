@@ -35,3 +35,8 @@ tmp/
 temp/
 
 .DS_Store
+
+# Generated repo index
+.squishy/
+
+# Generated knowledge graph

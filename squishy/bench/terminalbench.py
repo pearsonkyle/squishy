@@ -20,7 +20,6 @@ to spawn that contract by changing how ``setup`` / ``verify`` execute.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import tempfile
 from collections import Counter
@@ -190,8 +189,6 @@ async def run_terminal_task(
         "files_created": task_result.files_created,
         "files_edited": task_result.files_edited,
         "commands_run": task_result.commands_run,
-        "plan_state": task_result.plan_state,
-        "plan_adherence": _plan_adherence(task_result.plan_state),
         "tool_counts": _tool_counts(task_result.messages),
     }
     artifacts: dict[str, Any] = {
@@ -230,29 +227,6 @@ async def run_terminal_task(
     )
 
 
-def _plan_adherence(plan_state: dict[str, Any] | None) -> dict[str, Any]:
-    """Compute a compact summary of how closely the agent followed its plan."""
-    if not plan_state:
-        return {"had_plan": False}
-    progress = plan_state.get("progress") or {}
-    total = int(progress.get("total") or 0)
-    done = int(progress.get("done") or 0)
-    blocked = int(progress.get("blocked") or 0)
-    skipped = int(progress.get("skipped") or 0)
-    pending = int(progress.get("pending") or 0)
-    completion_ratio = (done / total) if total else 0.0
-    return {
-        "had_plan": True,
-        "approved": bool(plan_state.get("approved")),
-        "total_steps": total,
-        "done": done,
-        "blocked": blocked,
-        "skipped": skipped,
-        "pending": pending,
-        "completion_ratio": round(completion_ratio, 3),
-    }
-
-
 def _tool_counts(messages: list[dict[str, Any]] | None) -> dict[str, int]:
     """Count tool calls per tool name from the recorded transcript."""
     counts: Counter[str] = Counter()
@@ -273,8 +247,6 @@ def _classify_error(task_result: TaskResult, verified: bool) -> str:
     if not verified:
         return "verify_failed"
     err = (task_result.error or "").lower()
-    if "plan_task" in err or "plan-mode" in err:
-        return "plan_mode_no_plan"
     if "max turns" in err:
         return "max_turns"
     if "consecutive tool failures" in err:
@@ -288,18 +260,8 @@ def _classify_error(task_result: TaskResult, verified: bool) -> str:
  
 def load_tasks(path: str | Path) -> list[TerminalTask]:
     """Load tasks from a JSONL or JSON file."""
-    p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    tasks: list[dict[str, Any]] = []
-    if p.suffix == ".jsonl":
-        for line in text.splitlines():
-            line = line.strip()
-            if line:
-                tasks.append(json.loads(line))
-    else:
-        data = json.loads(text)
-        tasks = data if isinstance(data, list) else [data]
-    return [TerminalTask.from_dict(t) for t in tasks]
+    from squishy.bench.runner import load_records
+    return [TerminalTask.from_dict(t) for t in load_records(path)]
  
  
 def _snapshot_workspace(workspace: Path) -> list[dict[str, Any]]:

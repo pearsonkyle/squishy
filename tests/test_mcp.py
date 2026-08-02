@@ -1,17 +1,19 @@
 """Tests for squishy.mcp — MCP integration."""
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from squishy.mcp.tools import (
+    _build_tool,
+    _make_mcp_runner,
+    _register_tools_into_squishy,
+)
 from squishy.mcp.types import MCPServerConfig, MCPTool, MCPTransport
-from squishy.mcp.tools import _build_tool, _make_mcp_runner, _register_tools_into_squishy, _mcp_tools
 from squishy.tools.base import Tool, ToolContext
-
 
 # ── types.py ──────────────────────────────────────────────────────────────────
 
@@ -146,56 +148,10 @@ class TestDynamicRegistration:
 
 # ── tool_restrictions.py ─────────────────────────────────────────────────────
 
-class TestMCPPermissions:
-    def test_mcp_tools_mode_gated(self):
-        from squishy.tool_restrictions import check_permission
-
-        # MCP tools blocked in plan mode
-        allowed, reason = check_permission("mcp__ctx7__resolve", "plan")
-        assert allowed is False, "MCP tool should be blocked in plan mode"
-        assert "plan mode" in reason
-
-        # MCP tools require prompt in edits mode
-        allowed, reason = check_permission("mcp__ctx7__resolve", "edits")
-        assert allowed is False
-        assert reason == "prompt"
-
-        # MCP tools allowed in yolo and bench
-        for mode in ("yolo", "bench"):
-            allowed, reason = check_permission("mcp__ctx7__resolve", mode)
-            assert allowed is True, f"MCP tool rejected in {mode} mode"
-            assert reason == ""
 
 
 # ── tools/__init__.py schemas ────────────────────────────────────────────────
 
-class TestSchemaInclusion:
-    def test_mcp_tools_in_schemas_all_modes(self):
-        from squishy.tools import ALL_TOOLS, REGISTRY, openai_schemas
-
-        mcp_tool = MCPTool(
-            server_name="test",
-            tool_name="schema_test",
-            qualified_name="mcp__test__schema_test",
-            description="schema inclusion test",
-            input_schema={"type": "object", "properties": {}},
-        )
-        tool = _build_tool(mcp_tool)
-        _register_tools_into_squishy([tool])
-
-        try:
-            # MCP tools excluded from plan mode schemas
-            plan_schemas = openai_schemas("plan")
-            plan_names = [s["function"]["name"] for s in plan_schemas]
-            assert "mcp__test__schema_test" not in plan_names, "MCP tool should not be in plan schemas"
-
-            # MCP tools included in other modes
-            for mode in ("edits", "yolo", "bench"):
-                schemas = openai_schemas(mode)
-                names = [s["function"]["name"] for s in schemas]
-                assert "mcp__test__schema_test" in names, f"MCP tool missing from {mode} schemas"
-        finally:
-            _register_tools_into_squishy([])
 
 
 # ── config.py ────────────────────────────────────────────────────────────────
@@ -262,3 +218,47 @@ class TestDispatch:
             assert result.data["content"] == "dispatched ok"
         finally:
             _register_tools_into_squishy([])
+
+
+# ── #6/#18: name resolution + timeout coercion ──────────────────────────────
+
+class TestMCPRobustness:
+    def test_call_tool_resolves_server_name_with_double_underscore(self):
+        """A server named 'my__srv' yields mcp__my__srv__tool; the naive
+        split('__', 2) misrouted it. Direct qualified-name match must work."""
+        from squishy.mcp.client import MCPClient, MCPManager
+        from squishy.mcp.types import MCPServerState
+        mgr = MCPManager()
+        cfg = MCPServerConfig(name="my__srv", transport=MCPTransport.STDIO)
+        client = MCPClient(cfg)
+        client._tools = [MCPTool(
+            server_name="my__srv", tool_name="do_thing",
+            qualified_name="mcp__my__srv__do_thing",
+            description="d", input_schema={},
+        )]
+        client.call_tool = MagicMock(return_value="ok")
+        client.state = MCPServerState.CONNECTED
+        client._transport = MagicMock(alive=True)
+        mgr._clients["my__srv"] = client
+        result = mgr.call_tool("mcp__my__srv__do_thing", {"a": 1})
+        assert result == "ok"
+        client.call_tool.assert_called_once_with("do_thing", {"a": 1})
+
+    def test_call_tool_unknown_raises(self):
+        from squishy.mcp.client import MCPManager
+        mgr = MCPManager()
+        with pytest.raises(RuntimeError):
+            mgr.call_tool("mcp__nope__x", {})
+
+    def test_timeout_coercion_from_string(self):
+        from squishy.mcp.types import _coerce_timeout
+        assert _coerce_timeout("30s") == 30
+        assert _coerce_timeout("45") == 45
+        assert _coerce_timeout("nonsense") == 30
+        assert _coerce_timeout(0) == 30
+        assert _coerce_timeout(True) == 30
+        assert _coerce_timeout(60) == 60
+
+    def test_config_from_dict_bad_timeout_does_not_raise(self):
+        cfg = MCPServerConfig.from_dict("s", {"type": "stdio", "command": "x", "timeout": "30s"})
+        assert cfg.timeout == 30

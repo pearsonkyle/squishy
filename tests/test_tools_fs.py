@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 from squishy.tools.fs import (
     edit_file,
     list_directory,
@@ -9,7 +8,6 @@ from squishy.tools.fs import (
     undo_edit,
     write_file,
 )
-
 
 
 async def test_write_and_read_roundtrip(ctx):
@@ -336,3 +334,72 @@ async def test_edit_file_no_unrecognized_hint_when_only_aliases(ctx):
     assert "new_str" in r.error
     # No unknown-keys clause should appear.
     assert "Unrecognized parameters" not in r.error
+
+
+async def test_edit_file_rejects_empty_old_str(ctx):
+    """edit_file with an empty old_str must be refused — with replace_all it
+    would splice new_str between every character and corrupt the file."""
+    from squishy.tools.fs import edit_file
+    await write_file.run({"path": "app.py", "content": "a = 1\nb = 2\n"}, ctx)
+    r = await edit_file.run(
+        {"path": "app.py", "old_str": "", "new_str": "X", "replace_all": True}, ctx
+    )
+    assert not r.success
+    assert "empty" in r.error.lower()
+    # File is untouched.
+    body = open(ctx.working_dir + "/app.py").read()
+    assert body == "a = 1\nb = 2\n"
+
+
+async def test_undo_of_write_file_removes_created_file(ctx):
+    """#12: undo after write_file must remove the created file, not revert an
+    unrelated earlier edit."""
+    await write_file.run({"path": "a.py", "content": "aaa\n"}, ctx)
+    await edit_file.run({"path": "a.py", "old_str": "aaa", "new_str": "bbb"}, ctx)
+    await write_file.run({"path": "b.py", "content": "new\n"}, ctx)
+
+    # Undo the most recent mutation: creation of b.py -> b.py removed.
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    assert r.data.get("removed") is True
+    import os
+    assert not os.path.exists(ctx.working_dir + "/b.py")
+    # a.py (the earlier edit) is untouched by this undo.
+    assert open(ctx.working_dir + "/a.py").read() == "bbb\n"
+
+    # Next undo reverts the a.py edit.
+    r = await undo_edit.run({}, ctx)
+    assert r.success
+    assert open(ctx.working_dir + "/a.py").read() == "aaa\n"
+
+
+async def test_undo_stack_is_bounded(ctx):
+    """The undo stack must not grow without bound."""
+    from squishy.tools.fs import _UNDO_STACK_CAP
+    for i in range(_UNDO_STACK_CAP + 20):
+        await write_file.run({"path": f"f{i}.py", "content": "x\n"}, ctx)
+    assert len(ctx.undo_stack) <= _UNDO_STACK_CAP
+
+
+async def test_bench_repro_refusal_offers_tmp_instead_of_blocking(tmp_path):
+    """Refuse the location, not the technique.
+
+    Reproducing the failure in a throwaway script is how the bug gets confirmed
+    at all — on msrest-for-python-43 it is the whole difference between the
+    reference agent (repro snippets, resolved) and squishy (none, 60 turns, no
+    patch). The one real objection is that a scratch file in the repo lands in
+    the graded diff, so the refusal must hand back the route that works rather
+    than telling the model to stop trying.
+    """
+    from squishy.tools.base import ToolContext
+
+    ctx = ToolContext(working_dir=str(tmp_path), permission_mode="bench",
+                      use_sandbox=False)
+    r = await write_file.run(
+        {"path": "repro_bug.py", "content": "print(1)\n"}, ctx)
+    assert not r.success
+    # Names the actual objection, and the working alternative.
+    assert "graded diff" in r.error
+    assert "/tmp/repro_bug.py" in r.error
+    # And must not withdraw the technique itself.
+    assert "not allowed" not in r.error

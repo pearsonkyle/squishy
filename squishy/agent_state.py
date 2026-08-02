@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -23,18 +24,10 @@ class TaskResult:
     elapsed_s: float = 0.0
     error: str = ""
     messages: list[dict[str, Any]] = field(default_factory=list)
-    plan_state: dict[str, Any] | None = None
     empty_responses: int = 0
-    quality_skips: int = 0
     prose_completions: int = 0
     tool_call_counts: dict[str, int] = field(default_factory=dict)
-    env_fix_files: list[str] = field(default_factory=list)
     edit_failures: int = 0
-    # Phase/budget diagnostics.
-    final_phase: str = ""
-    explore_turns: int = 0
-    fix_verify_cycles: int = 0
-    total_quality_violations: int = 0
     # Per-turn event log for post-hoc analysis.
     turn_log: list[dict[str, Any]] = field(default_factory=list)
     # Complete message log (pre-trim) for SFT training data export.
@@ -46,118 +39,43 @@ class LoopState:
     """Mutable counters shared across the agent loop and its sub-methods."""
     start: float
     consecutive_errors: int = 0
-    plan_nudges: int = 0
-    turns_without_plan_task: int = 0
     total_prompt_tokens: int = 0
     completion_tokens: int = 0
     files_created: set[str] = field(default_factory=set)
     files_edited: set[str] = field(default_factory=set)
     commands_run: int = 0
-    quality_retries: int = 0
-    total_quality_violations: int = 0
-    test_passed_after_edit: bool = False
     empty_responses: int = 0
-    quality_skips: int = 0
     total_tool_calls: dict[str, int] = field(default_factory=dict)
     prose_completions: int = 0
-    # Phase tracking (bench/yolo) — synced from PhaseState in bench mode.
-    phase: str = "explore"
-    explore_turns: int = 0
-    fix_verify_cycles: int = 0
-    # Goal-drift tracking (bench/yolo).
-    env_fix_files: set[str] = field(default_factory=set)
     problem_files: set[str] = field(default_factory=set)
-    env_error_count: int = 0
-    # Failed edit tracking.
-    edit_failures_per_file: dict[str, int] = field(default_factory=dict)
     total_edit_failures: int = 0
+    # Shell commands that looked like they modified a file. Under a shell-only
+    # profile this is the only edit signal there is — `files_edited` only ever
+    # records edit_file/write_file.
+    shell_writes: int = 0
+    # Times the loop refused to accept "stopped without editing" as an ending.
+    empty_patch_continues: int = 0
     recent_edit_fail_files: set[str] = field(default_factory=set)
-    # Identical-old_str-per-path tracking (catches edit loops that bypass
-    # repeated_tool_call detection because args.new_str varies). Maps
-    # `path -> (last_old_str_hash, consecutive_count)`.
-    last_edit_old_str_per_file: dict[str, tuple[str, int]] = field(default_factory=dict)
-    # Re-anchoring.
-    last_reanchor_turn: int = 0
-    problem_text: str | None = None
-    # FAIL_TO_PASS test identifiers for verifying the right tests are run.
+    last_edit_turn: int = 0
+    # FAIL_TO_PASS identifiers, when a bench harness supplies them. Surfaced to
+    # the model through the prompt; the loop itself no longer gates on them.
     fail_to_pass_tests: list[str] = field(default_factory=list)
-    # v6e: harness-supplied test command (V2's install_config.test_cmd).
-    # Empty string when not provided (V1, terminal-bench, interactive REPL).
-    # Consumed by maybe_post_edit_pytest_nudge to suggest the right runner
-    # for non-pytest projects (npm/phpunit/cargo) instead of hardcoding pytest.
+    # Harness-supplied test command (SWE-rebench V2's install_config.test_cmd).
     test_cmd: str = ""
     # Compaction-resilient loop detection.
     last_call_key: str = ""
     consecutive_identical: int = 0
-    unresolved_nudges: int = 0
+    # Nudge budget.
     last_nudge_turn: int = -3
     total_nudges: int = 0
-    # Test failure tracking across fix-verify cycles.
-    last_test_failure_count: int = -1  # -1 = no test run yet
-    last_test_failures: list[str] = field(default_factory=list)
+    nudges_this_turn: int = 0
     # Per-turn structured event log.
     turn_log: list[dict[str, Any]] = field(default_factory=list)
-    # Compaction count — used to detect loops that survive compaction.
     compaction_count: int = 0
     # LLM error count — used to retry transient failures in bench mode.
     llm_errors: int = 0
     # Cumulative tenacity retries across all completion calls in this loop.
-    # Read from `client.last_call_retries` after each completion.  When this
-    # crosses a threshold the agent injects a CRITICAL "wrap up now" nudge
-    # rather than letting upstream instability silently consume the budget.
     cumulative_retries: int = 0
-    # F2P finish-plan gate intercepts.  In bench mode, finish_plan is
-    # blocked once when the agent declares done without having actually
-    # passed the FAIL_TO_PASS tests.  After one intercept the gate releases
-    # so a degraded test environment cannot trap the agent forever.
-    f2p_finish_gate_intercepts: int = 0
-    # Last F2P-only failure count for cross-cycle progress tracking.
-    last_f2p_failure_count: int = -1
-    # Single-shot prose-completion gate.  When the agent prose-completes
-    # in bench/yolo mode after observing a test failure but without making
-    # any edits to fix it, the loop intercepts once and nudges the agent
-    # to either fix or call finish_plan(status="failure").  Released after
-    # one intercept so genuinely unfixable runs can still terminate.
-    no_progress_intercepts: int = 0
-    # F5: F2P file-coverage tracking.  ``f2p_files_covered`` records which
-    # FAIL_TO_PASS test files have been exercised by a passing test command
-    # (exit 0, no failures in test_summary).  ``test_passed_after_edit`` is
-    # only allowed to flip True when *every* distinct F2P file has been
-    # covered.  The gate intercepts ``finish_plan`` calls otherwise, with
-    # the same single-shot release as A5 so degraded environments don't
-    # trap the agent.  v27.2 fix for the scico-561 case where the agent
-    # ran the 2D test, saw it pass, and skipped the 3D test entirely.
-    f2p_files_covered: set[str] = field(default_factory=set)
-    f2p_coverage_intercepts: int = 0
-    # v2 auto-pytest finish gate.  ``last_edit_turn`` stamps the turn of the
-    # most recent successful edit_file/write_file; ``last_f2p_test_turn``
-    # stamps the turn of the most recent run_command pytest that hit any
-    # F2P file (regardless of pass/fail).  When the agent tries to finish
-    # in bench mode and ``last_edit_turn > last_f2p_test_turn``, the harness
-    # synthesizes a pytest run on the F2P tests so the model gets one more
-    # chance to react to real test output.  ``auto_pytest_runs`` caps the
-    # number of times the gate fires per instance.
-    last_edit_turn: int = 0
-    last_f2p_test_turn: int = 0
-    auto_pytest_runs: int = 0
-    # v5 pre-finish gate: failing F2P test details from the most recent
-    # F2P run.  Populated from ``test_summary`` when the agent's pytest
-    # output parses cleanly.  Empty list when the last F2P run didn't
-    # fail, the test runner isn't pytest, or no F2P run has happened yet.
-    # Each entry: ``{"test": "<nodeid>", "error": "<truncated assertion>"}``.
-    last_f2p_failures: list[dict[str, str]] = field(default_factory=list)
-    # v6b pre-finish gate: True when the most recent F2P-covering test
-    # command exited with collection / import errors but produced no
-    # parseable per-test failure lines.  Lets the gate emit a "fix
-    # collection before finishing" hint instead of falling silently
-    # through to legacy branches when ``last_f2p_failures`` is empty.
-    last_f2p_collection_error: bool = False
-    # v6c: True after the post-edit pytest nudge has fired once. The
-    # nudge surfaces the exact ``pytest <id1> <id2> ...`` invocation
-    # the moment the first successful edit lands in bench/yolo mode,
-    # so the model doesn't need to wait for a finish_plan intercept
-    # to learn what to run.
-    post_edit_pytest_nudge_sent: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +118,10 @@ def brief(tc: ToolCall) -> str:
         return f'"{a.get("pattern", "")}"'
     if tc.name == "glob_files":
         return str(a.get("pattern", ""))
-    if tc.name == "recall":
+    if tc.name in ("recall", "explore"):
         return str(a.get("query", ""))
+    if tc.name == "impact_of":
+        return str(a.get("symbol", ""))
     return ""
 
 
@@ -266,28 +186,52 @@ def is_test_path(path: str) -> bool:
 # Command classification
 # ---------------------------------------------------------------------------
 
-def is_test_command(cmd: str) -> bool:
-    """Return True if ``cmd`` looks like a test invocation (not just a path containing 'test').
+# Runner flags that inspect/collect rather than actually run the suite — an
+# exit-0 for one of these must NOT count as "tests passed".
+_META_RUNNER_FLAGS = frozenset({
+    "--version", "--help", "-h", "--collect-only", "--co", "--fixtures", "--markers",
+})
 
-    Requires an actual test runner keyword at the start of the command or after
-    a shell separator.  Simply having 'test_' in a file path (e.g. ``ls tests/``)
+
+def _runner_args(cmd: str) -> list[str] | None:
+    """If any &&/;/| segment is a genuine test-runner invocation — the runner as
+    the segment's leading token(s), not merely the word "pytest" appearing
+    inside a string — return the runner's argument tokens (everything after the
+    runner spec). Otherwise None.
+
+    This is what stops ``git commit -m "fix pytest failure"`` or
+    ``echo running pytest`` from being classified as a passing test run.
+    """
+    for seg in re.split(r"&&|\|\||;|\|", cmd):
+        seg = seg.strip()
+        if not seg:
+            continue
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            continue
+        if not toks:
+            continue
+        low = [t.lower() for t in toks]
+        if low[0] == "pytest":
+            return toks[1:]
+        if low[0] in ("python", "python3"):
+            if len(toks) >= 3 and low[1] == "-m" and low[2] in ("pytest", "unittest"):
+                return toks[3:]
+            # `python test_x.py` / `python ./test_x.py` — the script is the target.
+            if len(toks) >= 2 and os.path.basename(toks[1]).startswith("test_"):
+                return toks[1:]
+    return None
+
+
+def is_test_command(cmd: str) -> bool:
+    """Return True if ``cmd`` is a genuine test-runner invocation.
+
+    Requires a real runner as a segment's leading token — merely having
+    ``test_`` in a path (``ls tests/``) or ``pytest`` inside a commit message
     does not count.
     """
-    # Strip leading cd/env prefix to find the actual command.
-    text = cmd.strip()
-    while text.startswith("cd "):
-        for sep in ("&&", ";"):
-            idx = text.find(sep)
-            if idx != -1:
-                text = text[idx + len(sep):].strip()
-                break
-        else:
-            break
-    # Check if the command starts with a real test runner or runs a test script.
-    _RUNNERS = ("pytest", "python -m pytest", "python -m unittest", "unittest",
-                "python test_", "python3 test_", "python ./test_", "python3 ./test_")
-    text_lower = text.lower()
-    return any(text_lower.startswith(r) or f" {r}" in text_lower for r in _RUNNERS)
+    return _runner_args(cmd) is not None
 
 
 def test_covers_fail_to_pass(cmd: str, fail_to_pass: list[str]) -> bool:
@@ -311,9 +255,13 @@ def distinct_f2p_files(fail_to_pass: list[str]) -> set[str]:
     """
     out: set[str] = set()
     for tid in fail_to_pass:
-        if "::" not in tid:
-            continue
-        path = tid.split("::", 1)[0].replace("\\", "/").strip()
+        if "::" in tid:
+            path = tid.split("::", 1)[0].replace("\\", "/").strip()
+        else:
+            # Non-pytest / bare id (e.g. terminal-bench "test_foo"): use the id
+            # itself as the selector so coverage can still be satisfied — the
+            # old code skipped these, leaving the gate permanently unmet.
+            path = tid.replace("\\", "/").strip()
         if path:
             out.add(path)
     return out
@@ -333,17 +281,20 @@ def f2p_files_in_command(cmd: str, fail_to_pass: list[str]) -> set[str]:
     files = distinct_f2p_files(fail_to_pass)
     if not files:
         return set()
-    cmd_norm = cmd.replace("\\", "/")
-    cmd_lower = cmd_norm.lower()
 
-    # Bare pytest invocation (no positional path arg) — assume full suite.
-    # Heuristic: pytest is mentioned but no F2P test path appears as a
-    # substring AND no .py path appears anywhere on the line.
-    has_runner = ("pytest" in cmd_lower) or ("unittest" in cmd_lower)
-    has_any_path = ".py" in cmd_norm or "::" in cmd_norm
-    if has_runner and not has_any_path:
+    args = _runner_args(cmd)
+    if args is None:
+        # Not a genuine test-runner invocation (e.g. `git commit -m "…pytest…"`).
+        return set()
+    # A meta invocation (`pytest --version` / `--collect-only`) did not run the
+    # suite, so it covers nothing — this closes the exit-0 false-positive.
+    if any(a.lower() in _META_RUNNER_FLAGS for a in args):
+        return set()
+    # Bare runner with no positional path arg — assume it ran the whole suite.
+    if not any(not a.startswith("-") for a in args):
         return set(files)
 
+    cmd_norm = cmd.replace("\\", "/")
     covered: set[str] = set()
     for path in files:
         if path in cmd_norm:
@@ -356,3 +307,88 @@ def f2p_files_in_command(cmd: str, fail_to_pass: list[str]) -> set[str]:
     return covered
 
 
+
+
+# Shell fragments that indicate a command wrote to a file. Deliberately broad:
+# a false positive only means we skip one nudge, while a false negative means
+# nagging a model that has already done the work.
+_WRITE_CMD_RE = re.compile(
+    r"(?x)"
+    r"(?<![0-9])>>?\s*[\w./~$-]"       # `> file` / `>> file`, not `2>&1`
+    r"|\b(?:sed|perl)\b[^|;&]*\s-i"    # in-place edit
+    r"|\btee\b"
+    r"|\bpatch\b\s+-p\d"
+    r"|\bgit\s+apply\b"
+    r"|\bmv\b|\bcp\b"
+    r"|\.write\(|\.write_text\(|open\([^)]*['\"][wa]"
+)
+
+
+# A path that is not a change to the repository: a scratch directory, or a
+# device sink. `> /dev/null` is the one that cost the most -- it appears in
+# perfectly ordinary commands (`pytest -q > /dev/null`) and counted as a
+# source edit, which silently disarmed every brake for the rest of the run.
+_SCRATCH_PATH_RE = re.compile(
+    r"(?:/tmp/|/var/folders/|\$TMPDIR/|/private/tmp/|/dev/)"
+)
+# `cd /tmp && cat > repro.py` — the target is relative, so the path alone says
+# nothing. This is how the model actually writes scratch files: eleven of
+# qiskit-terra-5662's commands took this form and every one was scored as a
+# repo edit.
+_CD_SCRATCH_RE = re.compile(
+    r"^\s*cd\s+(?:/tmp|/var/folders/\S*|/private/tmp|\$TMPDIR)\S*\s*(?:&&|;)"
+)
+# Any path that is clearly NOT scratch: a bare or relative path token used as a
+# redirect / in-place target.
+_WRITE_TARGET_RE = re.compile(
+    r"(?:(?<![0-9])>>?\s*|\bsed\b[^|;&]*-i\s*(?:''|\S*)\s+|\btee\s+(?:-a\s+)?)"
+    r"([\w./~$-]+)"
+    # `python - <<EOF ... open("/tmp/x", "w")` is how this model writes a
+    # scratch file when it wants Python rather than a heredoc.
+    r"|(?:open|write_text)\s*\(\s*['\"]([^'\"]+)['\"]"
+)
+
+
+def writes_only_scratch(command: str) -> bool:
+    """True when every file this command writes lives in a scratch directory.
+
+    This is the difference between "the model fixed the bug" and "the model
+    wrote a reproduction script", and the harness *asks* for the second one.
+    Observed on cfn-lint-3965 and qiskit-terra-5662: turn 10 runs
+    `cat > /tmp/repro.py <<EOF`, that counts as a source edit, and every edit
+    brake switches off for the remaining ninety turns. Twelve arms ran to the
+    turn cap and not one of them ever called `edit_file`.
+
+    `write_file` already had this guard via its `scratch` flag; the shell path
+    did not, and the shell is how a model writes a heredoc.
+    """
+    command = command or ""
+    targets = [
+        g for match in _WRITE_TARGET_RE.findall(command)
+        for g in (match if isinstance(match, tuple) else (match,)) if g
+    ]
+    if not targets:
+        return False
+    # Inside a `cd <scratch> &&`, a relative target is a scratch target.
+    in_scratch_cwd = bool(_CD_SCRATCH_RE.match(command))
+    return all(
+        _SCRATCH_PATH_RE.search(t)
+        or (in_scratch_cwd and not t.startswith("/"))
+        for t in targets
+    )
+
+
+def looks_like_file_write(command: str) -> bool:
+    """True if *command* plausibly modified a file **in the repo**.
+
+    Used only to decide whether the agent still needs prodding toward making
+    an edit; it never gates or blocks anything, so over-matching is cheap --
+    with one exception. Scratch writes must not match: they are the instructed
+    behavior, and counting them silently disables the pressure that exists to
+    push toward a real edit.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    if not _WRITE_CMD_RE.search(command):
+        return False
+    return not writes_only_scratch(command)

@@ -16,9 +16,9 @@ is delegated to the upstream harness:
 """
  
 from __future__ import annotations
- 
-import asyncio
+
 import ast
+import asyncio
 import json as _json
 import logging
 import os
@@ -27,11 +27,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from squishy.api import Squishy
 from squishy.agent_state import distinct_f2p_files
+from squishy.api import Squishy
 from squishy.bench.runner import BenchResult
 from squishy.errors import BenchError
- 
+
 log = logging.getLogger("squishy.bench.swebench")
  
 # SWE-bench instances use github.com/<repo> with a specific base_commit.
@@ -188,7 +188,7 @@ async def install_deps(
         )
         try:
             _, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=300)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.communicate()
             log.warning("install timeout for %s: %s", instance["instance_id"], cmd[:80])
@@ -451,85 +451,10 @@ def _extract_test_context_bodies(
     return out
 
 
-# Back-compat alias — older callers / tests may import the old name.
-_extract_failing_test_bodies = _extract_test_context_bodies
-
-
-def _recall_from_index(workspace: str | Path, problem_text: str, limit: int = 8) -> list[dict]:
-    """Pre-query the repo index using the problem statement.
-
-    Returns a list of {kind, name, path, lines, summary} dicts for the
-    most relevant symbols/files, giving the agent a head start on where
-    to look and edit.
-
-    F4: When a recalled symbol is a class in a multi-class file, also
-    surface its sibling classes.  This is the v27.1→v27.2 fix for the
-    scico-561 case where the index returned ``XRayTransform2D`` from
-    ``_xray.py`` but the agent never realised the same file also
-    contained ``XRayTransform3D`` — both needed the same fix.
-    """
-    try:
-        from squishy.index.store import load_index
-        from squishy.tools.recall import _score, _tokens, _trim
-    except ImportError:
-        return []
-
-    idx = load_index(str(workspace))
-    if idx is None:
-        return []
-
-    q_lower = problem_text.strip().lower()[:500]
-    q_tokens = _tokens(problem_text)
-    if not q_tokens:
-        return []
-
-    scored: list[tuple[float, Any]] = []
-    for node in idx.root.walk():
-        if node.kind == "repo":
-            continue
-        s = _score(node, q_lower, q_tokens)
-        if s > 0:
-            scored.append((s, node))
-    scored.sort(key=lambda t: (-t[0], t[1].path, t[1].name))
-
-    # Build a path → file-node map once so F4 sibling-class lookup is O(1).
-    file_by_path: dict[str, Any] = {}
-    for node in idx.root.walk():
-        if node.kind == "file":
-            file_by_path[node.path] = node
-
-    # Prefer symbols (class/function/method) over files/dirs
-    results: list[dict] = []
-    seen_keys: set[str] = set()
-
-    def _emit(node: Any) -> bool:
-        key = f"{node.path}:{node.name}"
-        if key in seen_keys:
-            return False
-        seen_keys.add(key)
-        results.append(_trim(node, depth=0))
-        return True
-
-    for _, node in scored[:limit * 3]:
-        if len(results) >= limit:
-            break
-        if not _emit(node):
-            continue
-        # F4: if this is a class node, surface other class siblings in
-        # the same file so the agent doesn't fix one and miss the rest.
-        if node.kind != "class":
-            continue
-        file_node = file_by_path.get(node.path)
-        if file_node is None:
-            continue
-        for sib in file_node.children:
-            if sib.kind != "class" or sib.name == node.name:
-                continue
-            if len(results) >= limit:
-                break
-            _emit(sib)
-
-    return results
+# recall_from_index now lives in squishy.tools.recall (so the core loop never
+# imports from squishy.bench). Re-exported here under the historical name for
+# the bench call sites and existing tests.
+from squishy.tools.recall import recall_from_index as _recall_from_index
 
 
 def build_prompt(
@@ -1200,11 +1125,6 @@ def _extract_diagnostics(task_result: Any) -> dict[str, Any]:
         "empty_responses": getattr(task_result, "empty_responses", 0),
         "prose_responses": getattr(task_result, "prose_completions", 0),
         "system_nudges": system_nudges,
-        "quality_skips": getattr(task_result, "quality_skips", 0),
-        "final_phase": getattr(task_result, "final_phase", ""),
-        "explore_turns": getattr(task_result, "explore_turns", 0),
-        "fix_verify_cycles": getattr(task_result, "fix_verify_cycles", 0),
-        "quality_violations": getattr(task_result, "total_quality_violations", 0),
         "edit_failures": getattr(task_result, "edit_failures", 0),
     }
 

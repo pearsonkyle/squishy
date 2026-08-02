@@ -39,10 +39,9 @@ class TestEstimateTokens:
 class TestAgentTokenCounting:
     async def test_agent_counts_system_prompt_tokens(self, tmp_path) -> None:
         from squishy.agent import Agent
+        from squishy.client import CompletionResult
         from squishy.config import Config
         from squishy.display import Display
-
-        from squishy.client import CompletionResult
 
         class FakeClient:
             async def health(self) -> bool:

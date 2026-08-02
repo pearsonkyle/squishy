@@ -2,10 +2,19 @@
 
 Delegates to:
   agent_state.py     — TaskResult, LoopState, message helpers
-  agent_safety.py    — quality gates, informational nudges
-  agent_dispatch.py  — tool dispatch, plan approval, evidence
-  agent_phases.py    — turn budget, re-anchoring, problem caching
-  phase_machine.py   — phase-gated tool availability (bench mode)
+  agent_safety.py    — the nudge primitive
+  agent_dispatch.py  — tool dispatch and outcome tracking
+
+The loop deliberately does very little between the model and its tools:
+complete, dispatch, append, repeat. Everything it *used* to do in between —
+a quality gate, a phase machine, a plan protocol, goal-drift and edit-failure
+detectors, turn budgets, re-anchoring — was removed after measurement showed
+harness-generated refusals were the largest single failure bucket on
+SWE-rebench, and that the quality gate's "skip this turn" path erased the
+model's own tool call from its history (see agent_safety's module docstring).
+
+Loop-breaking now lives in the tools, where the response can ride back in the
+tool result instead of arriving as an out-of-band user message.
 """
 
 from __future__ import annotations
@@ -13,28 +22,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
-import shlex
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from squishy.agent_dispatch import run_tool, track_tool_outcome
-from squishy.agent_phases import (
-    cache_problem_text,
-    inject_turn_budget,
-    maybe_post_edit_pytest_nudge,
-    maybe_reanchor_problem,
-)
-from squishy.agent_safety import (
-    apply_quality_gate,
-    check_goal_drift,
-    detect_shell_file_read,
-    inject_nudge,
-    inject_test_failure_nudge,
-    needs_f2p_verification,
-    track_edit_failure,
-)
+from squishy.agent_safety import inject_nudge
 from squishy.agent_state import (
     LoopState,
     TaskResult,
@@ -42,76 +36,42 @@ from squishy.agent_state import (
     brief,
     call_key,
     extract_problem_files,
+    looks_like_file_write,
     prose_msg,
 )
-from squishy.phase_machine import PhaseState, advance, check_finish_plan_gate, check_transition
-from squishy.client import Client, CompletionResult, ToolCall
+from squishy.client import Client, CompletionResult
 from squishy.config import Config
-from squishy.context import build_system_prompt, compact_messages, detect_project, trim_history
+from squishy.context import (
+    build_system_prompt,
+    compact_messages,
+    detect_project,
+    normalize_messages,
+    trim_history,
+)
 from squishy.display import Display, estimate_tokens
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
+from squishy.graph import has_graph
 from squishy.index.store import has_index
-from squishy.plan_state import load_plan, render_plan_status
+from squishy.tool_aliases import normalize_call
 from squishy.tools import PromptFn, ToolContext, openai_schemas
 from squishy.tools.scratchpad import render_notes
 
 log = logging.getLogger("squishy.agent")
 
-
-# F3: heuristics for "the agent observed a test failure but did not edit
-# anything afterwards."  Strings/regexes are deliberately broad — false
-# positives waste at most one extra turn (the gate is single-shot), false
-# negatives let buggy patches ship.
-_TEST_FAIL_RE = re.compile(
-    r"(?ix)"
-    r"AssertionError"
-    r"|\bFAILED\b"
-    r"|\bERROR\b\s+(?:tests?/|test_)"
-    r"|\b\d+\s+failed\b"
-    r"|\b\d+\s+errors?\b"
-    r"|test\s+pass(?:ed)?\s*[:=]\s*false"
-    r"|\"failed\"\s*:\s*[1-9]"
-    r"|\"errors\"\s*:\s*[1-9]"
+# How often to remind a model that has not yet changed a file. This is the one
+# piece of edit pressure that survived, and it is a nudge rather than a gate:
+# the blocking version withdrew `run_command`, and on aiohttp the model
+# answered all 25 refusals by calling it again — 25 turns burned, no patch,
+# while the ungated arm patched. Without any pressure at all, a shell run
+# explored for 80 turns and also produced nothing, so the nudge stays.
+# What to say to a model that stopped without editing anything. Deliberately
+# short and imperative: it is read at the moment the model believes it is done.
+EMPTY_PATCH_NUDGE = (
+    "[system] You stopped, but no file has been changed — there is nothing to "
+    "grade, so this run currently scores zero. Do not summarize again. Edit "
+    "the non-test source file your analysis points at, right now, using the "
+    "best explanation you have. A partial fix scores more than none."
 )
-
-
-def _has_unaddressed_test_failure(
-    messages: list[dict[str, Any]], lookback: int = 12,
-) -> str | None:
-    """Return a short summary if the agent recently observed a test failure
-    via ``run_command`` and has NOT edited any file since.  Otherwise None.
-
-    Walks the trailing ``lookback`` messages; ignores anything older.
-    """
-    if not messages:
-        return None
-    tail = messages[-lookback:]
-    failure_summary: str | None = None
-    failure_idx: int = -1
-    for i, m in enumerate(tail):
-        if m.get("role") != "tool":
-            continue
-        if m.get("name") != "run_command":
-            continue
-        content = m.get("content", "")
-        if not isinstance(content, str) or not content:
-            continue
-        match = _TEST_FAIL_RE.search(content)
-        if match:
-            # Most recent failure wins.
-            failure_summary = match.group(0).strip()
-            failure_idx = i
-    if failure_summary is None or failure_idx < 0:
-        return None
-    # Did any edit_file/write_file land AFTER the failure was observed?
-    for j in range(failure_idx + 1, len(tail)):
-        m = tail[j]
-        if m.get("role") != "tool":
-            continue
-        if m.get("name") in ("edit_file", "write_file"):
-            return None
-    # Truncate the summary so the nudge stays terse.
-    return failure_summary[:120]
 
 
 @dataclass
@@ -120,9 +80,13 @@ class Agent:
     client: Client
     display: Display | None = None
     prompt_fn: PromptFn | None = None
+    # Optional structured-event sink (programmatic API). Receives dicts:
+    #   {"type": "turn", "turn": n}
+    #   {"type": "tool", "name": str, "args": dict, "success": bool}
+    #   {"type": "done", "success": bool, "turns": n}
+    on_event: Callable[[dict[str, Any]], None] | None = None
     tool_ctx: ToolContext = field(init=False)
     messages: list[dict[str, Any]] = field(default_factory=list)
-    consecutive_reads_without_recall: int = 0
     has_index: bool = field(init=False, default=False)
     session_id: str | None = None
     _last_persisted_idx: int = field(init=False, default=0)
@@ -138,9 +102,10 @@ class Agent:
         self.tool_ctx = ToolContext(
             working_dir=self.config.working_dir,
             permission_mode=self.config.permission_mode,
+            tool_profile=self.config.tool_profile,
             sandbox_image=self.config.sandbox_image,
             use_sandbox=self.config.use_sandbox,
-            plan=load_plan(self.config.working_dir),
+            max_tool_output_chars=self._effective_output_cap(),
         )
         self.has_index = has_index(self.config.working_dir)
         project = detect_project(self.config.working_dir)
@@ -149,6 +114,7 @@ class Agent:
             project,
             self.config.thinking,
             self.config.permission_mode,
+            self.config.tool_profile,
         )
         self.messages.append({"role": "system", "content": system_prompt})
 
@@ -159,10 +125,46 @@ class Agent:
         self._check_index_staleness()
         if self.display is not None:
             self.display.set_mode(self.config.permission_mode)
-        if self.display is not None and self.tool_ctx.plan is not None:
-            self.display.info(f"[plan] restored {self.tool_ctx.plan.id}")
-        if self.display is not None and self.config.permission_mode == "plan" and not self.has_index:
-            self.display.info("[plan] no index found; direct file exploration fallback is enabled")
+
+    def _is_constrained(self) -> bool:
+        """True in the non-interactive modes, where a run is scored.
+
+        `bench` and `yolo` run unattended against a turn budget; `edits` has a
+        human present who can simply say "keep going".
+        """
+        return self.config.permission_mode in ("bench", "yolo")
+
+    def _context_window(self) -> int:
+        """Effective context window in tokens.
+
+        Priority: explicit config override → value advertised by the endpoint →
+        ``assumed_context_window``. The fallback matters: many local servers
+        (LM Studio, llama.cpp) don't report ``context_length``, and without a
+        value the compaction safety valve and dynamic history sizing were
+        silently disabled — context then grew unbounded until the server errored.
+        """
+        if self.config.context_window > 0:
+            return self.config.context_window
+        reported = getattr(self.client, "context_window", 0) or 0
+        if reported > 0:
+            return reported
+        return max(0, self.config.assumed_context_window)
+
+    def _effective_output_cap(self) -> int:
+        """Per-tool-result char cap, made window-aware for small models.
+
+        The configured ``max_tool_output_chars`` (default 32k chars ≈ 9k tokens)
+        can single-handedly blow an 8k–16k context window with one big
+        ``read_file`` / ``run_command`` result. Cap a single result at ~1/8 of
+        the effective window (chars ≈ tokens×3.5), floored so it stays useful
+        and never raised above the configured value.
+        """
+        configured = self.config.max_tool_output_chars
+        ctx_tokens = self._context_window()
+        if ctx_tokens <= 0:
+            return configured
+        window_cap = int(ctx_tokens * 3.5 / 8)
+        return max(4000, min(configured, window_cap))
 
     def _check_index_staleness(self) -> None:
         if self.display is None:
@@ -174,12 +176,19 @@ class Agent:
         msg = describe_staleness(self.config.working_dir)
         if msg:
             self.display.info(msg)
+        elif self.has_index and not has_graph(self.config.working_dir):
+            # An index built before graphs existed leaves the graph tools
+            # hidden and the user with no way to notice: `describe_staleness`
+            # reports the index as fresh, because it is. Say it once.
+            self.display.info(
+                "[graph] no code graph yet — `explore`, `impact_of` and "
+                "`repo_map` are hidden. Run /init to build one."
+            )
 
     async def run(
         self, user_message: str, *, timeout: float | None = None,
     ) -> TaskResult:
         """Run one user turn to completion."""
-        self.consecutive_reads_without_recall = 0
         self.messages.append({"role": "user", "content": user_message})
         start = time.monotonic()
         try:
@@ -226,9 +235,6 @@ class Agent:
     # Result building and session persistence
     # ------------------------------------------------------------------
 
-    def _plan_snapshot(self) -> dict[str, Any] | None:
-        return self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else None
-
     def _sync_display_stats(self, st: LoopState, turn: int) -> None:
         if self.display:
             self.display.stats.prompt_tokens = st.total_prompt_tokens
@@ -254,14 +260,21 @@ class Agent:
         self, st: LoopState, *, success: bool, final_text: str = "", error: str = "",
         turn: int,
     ) -> TaskResult:
-        # Capture remaining messages before building result.
-        remaining = self.messages[self._full_log_idx:]
+        # Capture remaining messages before building result. The synthetic
+        # live-context pair (plan status / notes) is a view-only artifact and
+        # must never reach full_log (SFT export) or TaskResult.messages — it
+        # would teach a `_squishy_context` tool call that does not exist.
+        remaining = [
+            m for m in self.messages[self._full_log_idx:]
+            if not m.get(self._LIVE_CTX_MARKER)
+        ]
         if remaining:
             self._full_log.extend(remaining)
             self._full_log_idx = len(self.messages)
 
         self._persist_new_messages()
-        self._finish_session(st, status="completed" if success else "error")
+        self._finish_session(st, status="completed" if success else "error", turns=turn)
+        self._emit({"type": "done", "success": success, "turns": turn})
         return TaskResult(
             success=success, final_text=final_text, error=error,
             turns_used=turn,
@@ -270,18 +283,11 @@ class Agent:
             files_edited=sorted(st.files_edited),
             commands_run=st.commands_run,
             elapsed_s=time.monotonic() - st.start,
-            messages=list(self.messages),
-            plan_state=self._plan_snapshot(),
+            messages=[m for m in self.messages if not m.get(self._LIVE_CTX_MARKER)],
             empty_responses=st.empty_responses,
-            quality_skips=st.quality_skips,
             prose_completions=st.prose_completions,
             tool_call_counts=dict(st.total_tool_calls),
-            env_fix_files=sorted(st.env_fix_files),
             edit_failures=st.total_edit_failures,
-            final_phase=st.phase,
-            explore_turns=st.explore_turns,
-            fix_verify_cycles=st.fix_verify_cycles,
-            total_quality_violations=st.total_quality_violations,
             turn_log=list(st.turn_log),
             full_log=list(self._full_log),
         )
@@ -305,14 +311,22 @@ class Agent:
             log.debug("session persist failed for %s", self.session_id, exc_info=True)
         self._last_persisted_idx = len(self.messages)
 
-    def _finish_session(self, st: LoopState, *, status: str = "completed") -> None:
+    def _finish_session(
+        self, st: LoopState, *, status: str = "completed", turns: int | None = None,
+    ) -> None:
         if not self.session_id:
             return
+        # turn_log is only populated in bench/yolo, so fall back to the actual
+        # turn count passed by _build_result for interactive sessions (which
+        # otherwise always recorded turns=0 in meta.json).
+        turn_count = turns if turns is not None else (
+            st.turn_log[-1].get("turn", 0) if st.turn_log else 0
+        )
         try:
             from squishy.session import finish_session
             finish_session(
                 self.session_id, status=status,
-                turns=st.turn_log[-1].get("turn", 0) if st.turn_log else 0,
+                turns=turn_count,
                 tokens=st.total_prompt_tokens + st.completion_tokens,
                 root=getattr(self.config, "session_dir", None),
             )
@@ -323,7 +337,7 @@ class Agent:
     # Live-context injection (cache-stable system prefix)
     # ------------------------------------------------------------------
     #
-    # Plan-status and notes change between turns but we never want to touch
+    # Notes change between turns but we never want to touch
     # ``messages[0]`` after init — every byte change there evicts the vLLM
     # prefix cache (the most expensive thing the server does each turn).
     # Instead we strip+rebuild a synthetic ``(assistant tool_calls, tool
@@ -351,78 +365,86 @@ class Agent:
     def _refresh_live_context_pair(self) -> None:
         """Strip any prior live-context pair and append a fresh one.
 
-        Built from ``tool_ctx.plan`` (via ``render_plan_status``) and
-        ``tool_ctx.notes`` (via ``render_notes``). Returns without
-        appending when both are empty — the prior pair has already been
+        Built from ``tool_ctx.notes`` (via ``render_notes``). Returns without
+        appending when there are none — the prior pair has already been
         stripped, so the message list is back to canonical state.
 
         Must be called AFTER ``trim_history``/``compact_messages`` so the
         pair never participates in those routines.
         """
         self._strip_live_context_pair()
-        plan = self.tool_ctx.plan
-        parts: list[str] = []
-        if plan is not None:
-            parts.append(render_plan_status(plan))
-        if self.tool_ctx.notes:
-            parts.append(render_notes(self.tool_ctx.notes))
-        if not parts:
+        if not self.tool_ctx.notes:
             return
-        content = "\n\n".join(parts)
-        assistant = {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": self._LIVE_CTX_CALL_ID,
-                    "type": "function",
-                    "function": {
-                        "name": self._LIVE_CTX_TOOL_NAME,
-                        "arguments": "{}",
-                    },
-                }
-            ],
+        # A tail `system` message, not a fabricated (assistant tool_calls, tool
+        # result) pair. The pair put a call to `_squishy_context` — a tool that
+        # is in no schema we send — into the transcript the model reads, every
+        # single turn. Models imitate their own history: on
+        # msrest-for-python-43 the model duly called `_squishy_context` twice
+        # and got `unknown tool` back both times. The harness demonstrated a
+        # tool call and then refused it.
+        #
+        # `_build_result` already filtered this pair out of the SFT export for
+        # exactly this reason ("it would teach a `_squishy_context` tool call
+        # that does not exist") — but the live model was never covered by that
+        # guard, only the training data downstream of it.
+        #
+        # A system message keeps every property the pair was chosen for: it is
+        # appended at the tail so `messages[0]` is untouched and the vLLM prefix
+        # cache survives, it carries no `tool_call_id` so it cannot orphan, and
+        # `normalize_messages` passes non-assistant/tool roles through
+        # unchanged. It is also not a user turn, so the "feedback belongs in the
+        # tool result" rule is not at stake — this is standing context, not
+        # feedback on an action.
+        self.messages.append({
+            "role": "system",
+            "content": render_notes(self.tool_ctx.notes),
             self._LIVE_CTX_MARKER: True,
-        }
-        tool_result = {
-            "role": "tool",
-            "tool_call_id": self._LIVE_CTX_CALL_ID,
-            "name": self._LIVE_CTX_TOOL_NAME,
-            "content": content,
-            self._LIVE_CTX_MARKER: True,
-        }
-        self.messages.append(assistant)
-        self.messages.append(tool_result)
+        })
 
-    # ------------------------------------------------------------------
-    # v2 auto-pytest finish gate
-    # ------------------------------------------------------------------
+    def _forget_invisible_reads(self) -> None:
+        """Drop read-tracking for files whose content is no longer in history.
 
-    async def _auto_run_f2p_pytest(self, st: LoopState, turn: int) -> bool:
-        """Synthesize a run_command tool call that runs the F2P tests.
+        ``read_file`` refuses a re-read once the model has already been served
+        the same lines enough times. That is only fair while the model can
+        still see them. ``trim_history`` keeps the last N messages, so a read
+        from 30 turns ago is gone from the transcript while our bookkeeping
+        still counts it — and the model gets refused for trying to recover
+        content the harness deleted.
 
-        Used by the v2 finish gate when the agent tries to wrap up without
-        having actually run the failing tests since its last edit. The
-        result lands in ``self.messages`` naturally via ``run_tool``, so
-        the agent sees it as its own tool result on the next turn.
-
-        Returns True if a pytest run was actually dispatched.
+        ``agent_dispatch`` stamps ``_squishy_read_path`` on every successful
+        read_file tool message, so the surviving set is exactly the reads the
+        model can still see.
         """
-        if not st.fail_to_pass_tests:
-            return False
-        nodeids = list(st.fail_to_pass_tests)[:5]
-        cmd = (
-            "python -m pytest --tb=short --no-header -p no:cacheprovider "
-            + " ".join(shlex.quote(n) for n in nodeids)
-        )
-        tc = ToolCall(
-            id=f"auto-pytest-{st.auto_pytest_runs}",
-            name="run_command",
-            args={"command": cmd, "timeout": 120},
-        )
-        await run_tool(self, turn, tc)
-        st.auto_pytest_runs += 1
-        return True
+        ctx = self.tool_ctx
+        if not ctx.files_read_spans and not ctx.files_read_count:
+            return
+
+        visible: set[str] = set()
+        for m in self.messages:
+            rel = m.get("_squishy_read_path")
+            if rel:
+                visible.add(self._abs_read_path(str(rel)))
+
+        for path in list(ctx.files_read_spans):
+            if path not in visible:
+                del ctx.files_read_spans[path]
+        for path in list(ctx.files_read_count):
+            if path not in visible:
+                del ctx.files_read_count[path]
+        # The cache and its hit counter are keyed by (abs_path, offset, limit).
+        for key in list(ctx.files_read_meta):
+            if key[0] not in visible:
+                del ctx.files_read_meta[key]
+        for key in list(ctx.read_cache_hits):
+            if key[0] not in visible:
+                del ctx.read_cache_hits[key]
+
+    def _abs_read_path(self, rel: str) -> str:
+        p = os.path.join(self.config.working_dir, rel)
+        try:
+            return os.path.realpath(p)
+        except OSError:
+            return p
 
     # ------------------------------------------------------------------
     # Prose completion handling
@@ -434,92 +456,14 @@ class Agent:
         """Handle a completion with no tool calls.
 
         Returns a TaskResult to end the run, or "continue".
+
+        A model that stops calling tools is done. The loop used to argue with
+        it here — a finish gate that synthesized a pytest run, a single-shot
+        "you saw a failure and didn't fix it" intercept, and the plan
+        protocol's "call plan_task instead" — but the only case where the
+        model genuinely has nothing to say is the empty response, so that is
+        the only case still handled.
         """
-        in_plan = self.config.permission_mode == "plan"
-        plan = self.tool_ctx.plan
-
-        # Plan mode: prose-only not acceptable — agent must call plan_task.
-        if in_plan and not is_bench and plan is None:
-            if completion.text:
-                self.messages.append(prose_msg(completion.text, completion.reasoning))
-                if self.display:
-                    self.display.flush_streaming_text()
-            if st.plan_nudges >= self.config.max_plan_nudges:
-                msg = "plan-mode run finished without producing a plan_task"
-                if self.display:
-                    self.display.error(msg)
-                return self._build_result(st, success=False, error=msg, turn=turn)
-            st.plan_nudges += 1
-            # If the model wrote a plan as a JSON literal in prose, call
-            # that out specifically — the generic "call plan_task" nudge
-            # is easy for weak models to misread as "describe a plan".
-            looks_like_json_plan = _looks_like_json_plan(completion.text or "")
-            if looks_like_json_plan:
-                content = (
-                    "[system] You wrote a JSON plan inside your message, but "
-                    "that does NOT count as planning. The user can only see "
-                    "and approve plans submitted via the `plan_task` tool. "
-                    "Take the same fields you just printed and pass them as "
-                    "tool arguments to `plan_task`. Do not paste JSON in prose "
-                    "again; call the tool now."
-                )
-            else:
-                content = (
-                    "[system] You are in plan mode. Stop explaining and call "
-                    "`plan_task` now with problem, solution, and steps. "
-                    "Use your best current understanding instead of waiting "
-                    "for exhaustive research. `files_to_modify` and "
-                    "`files_to_create` may be partial or empty if uncertain. "
-                    "Do not respond with prose until the plan is approved."
-                )
-            self.messages.append({"role": "user", "content": content})
-            return "continue"
-
-        # Approved plan with unresolved steps — nudge to continue, but cap the
-        # number of nudges so the agent doesn't loop forever after producing a
-        # final answer (e.g., for an audit where steps are research-only).
-        if (
-            not is_bench
-            and plan is not None
-            and plan.approved
-            and self.config.permission_mode != "plan"
-            and plan.unresolved_steps()
-            and st.unresolved_nudges < 3
-        ):
-            st.unresolved_nudges += 1
-            if completion.text:
-                self.messages.append(prose_msg(completion.text, completion.reasoning))
-                if self.display:
-                    self.display.flush_streaming_text()
-            if st.plan_nudges < self.config.max_plan_nudges:
-                st.plan_nudges += 1
-                remaining = "; ".join(
-                    f"{i + 1}. {step.description}"
-                    for i, step in enumerate(plan.unresolved_steps()[:4])
-                )
-                self.messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "[system] You have an approved plan with unresolved steps. "
-                            "Either call `update_plan` to mark each remaining step "
-                            "(`done`/`skipped`/`blocked`) and continue, or call "
-                            "`finish_plan` to resolve all remaining steps at once "
-                            "and end the task. Do not just repeat the same prose. "
-                            f"Remaining: {remaining}"
-                        ),
-                    }
-                )
-                return "continue"
-            # Nudges exhausted — accept the prose answer and finish so we don't
-            # loop indefinitely on research/audit tasks.
-            st.prose_completions += 1
-            self._sync_display_stats(st, turn)
-            return self._build_result(
-                st, success=True, final_text=completion.text, turn=turn,
-            )
-
-        # Empty response.
         if not (completion.text or "").strip():
             st.consecutive_errors += 1
             st.empty_responses += 1
@@ -528,97 +472,58 @@ class Agent:
                 if self.display:
                     self.display.error(msg)
                 return self._build_result(st, success=False, error=msg, turn=turn)
-            if is_bench and st.consecutive_errors >= 3:
-                self.messages.append({
-                    "role": "user",
-                    "content": (
-                        "[system] CRITICAL: You have produced multiple empty responses. "
-                        "You MUST act NOW. Either:\n"
-                        "1. Call `read_file` on the file mentioned in the problem statement, OR\n"
-                        "2. Call `edit_file` with your best fix attempt, OR\n"
-                        "3. Respond with a plain text summary if you already fixed the bug.\n"
-                        "Do NOT produce another empty response."
-                    ),
-                })
-            else:
-                self.messages.append({
-                    "role": "user",
-                    "content": (
-                        "[system] Your last response was empty. You must either "
-                        "call a tool or respond with a text summary of what you did. "
-                        "Continue working on the task."
-                    ),
-                })
+            # Record the empty turn before nudging. It is a truthful record of
+            # what the model produced, and without it the nudge is adjacent to
+            # the previous user message — `_merge_adjacent_same_role` would
+            # then glue the correction onto the task statement itself, which
+            # is the anchor everything else is careful to protect.
+            self.messages.append(prose_msg(""))
+            inject_nudge(self, st, turn, (
+                "[system] Your last response was empty. Either call a tool or "
+                "reply with a plain-text summary of what you did."
+            ), min_gap=0, force=True)
             return "continue"
 
-        # Normal text-only completion — agent is done.
-        # F3: in bench/yolo, intercept once if the agent observed a test
-        # failure via run_command but never edited anything to fix it.
-        # This catches the v27 regression where the model ran a repro
-        # script, saw "Adjoint test pass: False", and shipped the patch
-        # anyway.  Single-shot so genuinely unfixable runs can terminate.
+        # A model that stops without having changed anything has not finished
+        # the task; it has stopped. Under a turn budget that is a scored-zero
+        # run, and the reference agent's whole margin came from refusing to
+        # accept it: resume the same transcript, keep everything the model
+        # learned, and let the turn budget be the only bound.
+        #
+        # Bounded by `max_turns` and nothing else. A count-based cap was tried
+        # in the reference harness and is worse than it sounds -- each segment
+        # ends after a handful of turns, so three nudges were spent by turn 21
+        # of 50 and the run was declared over with 29 turns unused and no patch.
+        #
+        # This is an injected user turn, which the loop otherwise forbids. It
+        # qualifies under the standing exception: there is no tool call to
+        # attach it to, because not calling a tool is the thing being answered.
+        # `bench` only, not `yolo`. Both are unattended, but only bench scores
+        # a run by its diff -- in yolo a user can perfectly well ask a question
+        # whose answer is prose, and nagging them to edit something would be
+        # the harness inventing a goal the user did not set.
         if (
-            self.config.permission_mode in ("bench", "yolo")
-            and st.no_progress_intercepts < 1
+            is_bench
+            and not st.files_edited
+            # Creating a file is a fix too: an ImportError naming a symbol
+            # from this repo is the task telling the model what to add.
+            and not st.files_created
+            and not st.shell_writes
+            and turn < self.config.max_turns
         ):
-            failure = _has_unaddressed_test_failure(self.messages)
-            if failure:
-                # Persist the prose first so the nudge has the agent's
-                # last words for grounding.
-                if completion.text:
-                    self.messages.append(
-                        prose_msg(completion.text, completion.reasoning)
-                    )
-                    if self.display:
-                        self.display.flush_streaming_text()
-                st.no_progress_intercepts += 1
-                injected = inject_nudge(
-                    self, st, turn,
-                    "[system] You observed a test failure "
-                    f"({failure!r}) but did not call `edit_file` or "
-                    "`write_file` after it.  Either fix the underlying "
-                    "bug now with `edit_file`, or call "
-                    "`finish_plan(status=\"failure\")` if the bug is "
-                    "genuinely unfixable.",
-                    min_gap=0, force=True,
-                )
-                if injected:
-                    return "continue"
-
-        # v2 auto-pytest finish gate (Site A — natural finish).  In bench
-        # mode, if the agent edited but never ran F2P pytest since the
-        # last edit, synthesize a pytest run and nudge the model to react.
-        # Capped by max_auto_pytest_runs so this can't loop indefinitely.
-        if (
-            self.config.permission_mode == "bench"
-            and needs_f2p_verification(st)
-            and st.auto_pytest_runs < self.config.max_auto_pytest_runs
-        ):
-            if completion.text:
-                self.messages.append(
-                    prose_msg(completion.text, completion.reasoning)
-                )
-                if self.display:
-                    self.display.flush_streaming_text()
-            ran = await self._auto_run_f2p_pytest(st, turn)
-            if ran:
-                inject_nudge(
-                    self, st, turn,
-                    "[system] You tried to finish without running the failing "
-                    "tests. I ran them for you — see the run_command tool "
-                    "result above. Address what you see: either edit_file / "
-                    "write_file to fix what the test reports, or call "
-                    "finish_plan(status=\"failure\") if it is genuinely "
-                    "unfixable.",
-                    min_gap=0, force=True,
-                )
-                return "continue"
-
-        st.prose_completions += 1
-        if completion.text:
+            st.empty_patch_continues += 1
             self.messages.append(prose_msg(completion.text, completion.reasoning))
             if self.display:
                 self.display.flush_streaming_text()
+            self.messages.append({"role": "user", "content": EMPTY_PATCH_NUDGE})
+            if self.display is not None:
+                self.display.nudge(EMPTY_PATCH_NUDGE)
+            return "continue"
+
+        st.prose_completions += 1
+        self.messages.append(prose_msg(completion.text, completion.reasoning))
+        if self.display:
+            self.display.flush_streaming_text()
         self._sync_display_stats(st, turn)
         return self._build_result(st, success=True, final_text=completion.text, turn=turn)
 
@@ -632,95 +537,53 @@ class Agent:
         self._active_st = st
         self._active_turn = 0
         is_bench = self.config.permission_mode == "bench"
-        _is_constrained = self.config.permission_mode in ("bench", "yolo")
+        _is_constrained = self._is_constrained()
 
-        # Extract problem file paths and cache problem text before compaction.
         if _is_constrained:
             for msg in self.messages:
                 if msg.get("role") == "user" and not str(msg.get("content", "")).startswith("[system]"):
                     st.problem_files = extract_problem_files(str(msg.get("content", "")))
                     break
-            cache_problem_text(self, st)
 
-        # Phase machine (bench mode only — interactive modes are unaffected).
-        ps: PhaseState | None = None
-        if is_bench:
-            ps = PhaseState(
-                max_explore_turns=self.config.max_explore_turns,
-                max_plan_turns=self.config.max_plan_turns,
-                max_fix_verify_cycles=self.config.max_fix_verify_cycles,
-                # F5: surface FAIL_TO_PASS to the phase machine so its
-                # check_transition can require coverage of every distinct
-                # F2P file before flipping test_passed_after_edit True.
-                fail_to_pass=list(st.fail_to_pass_tests),
-            )
-
-        def _plan_active() -> bool:
-            p = self.tool_ctx.plan
-            return p is not None and p.approved
-
-        _cached_perm_mode = self.config.permission_mode
-        _cached_plan_active = _plan_active()
-        _cached_phase = ps.phase if ps else None
-        _cached_schemas = openai_schemas(
-            _cached_perm_mode, plan_active=_cached_plan_active,
-            phase=_cached_phase,
+        # The schema is built once and never changes. Recomputing it per turn
+        # only ever served gates that withdrew tools mid-run, and withdrawal
+        # does not work: a model keeps calling a tool from its history after
+        # it leaves the schema. A stable schema also keeps the prompt prefix
+        # byte-identical turn over turn, so the server's prefix cache stays warm.
+        _has_idx = has_index(self.config.working_dir)
+        _has_graph = has_graph(self.config.working_dir)
+        # `recall` is added back on top of a narrow profile when an index
+        # exists. The graph tools are not: `graph` already lists `explore`,
+        # `standard` shows them all, and quietly widening `minimal` would make
+        # the two profiles incomparable in exactly the A/B this repo runs.
+        schemas = openai_schemas(
+            self.config.permission_mode,
+            profile=self.config.tool_profile,
+            extra_tools=frozenset({"recall"}) if _has_idx else frozenset(),
+            has_index=_has_idx,
+            has_graph=_has_graph,
         )
 
         for turn in range(1, self.config.max_turns + 1):
             self._active_turn = turn
-            # Done phase (bench): no tools available, model must produce prose.
-            if ps and ps.phase == "done":
-                # v2 auto-pytest finish gate (Site B — done phase).  Same
-                # logic as Site A: edited but no F2P pytest since.  If the
-                # gate fires, kick the phase machine back to execute and
-                # let the agent react.
-                if (
-                    self.config.permission_mode == "bench"
-                    and needs_f2p_verification(st)
-                    and st.auto_pytest_runs < self.config.max_auto_pytest_runs
-                ):
-                    ran = await self._auto_run_f2p_pytest(st, turn)
-                    if ran:
-                        inject_nudge(
-                            self, st, turn,
-                            "[system] You tried to finish without running the "
-                            "failing tests. I ran them for you — see the "
-                            "run_command tool result above. Address what you "
-                            "see: either edit_file / write_file to fix what "
-                            "the test reports, or call "
-                            "finish_plan(status=\"failure\") if it is "
-                            "genuinely unfixable.",
-                            min_gap=0, force=True,
-                        )
-                        ps.phase = "execute"
-                        continue
-                if self.display:
-                    self.display.warn("done phase — force finishing")
-                return self._build_result(
-                    st, success=True,
-                    final_text="Fix applied and verified.",
-                    turn=turn,
-                )
+            self._emit({"type": "turn", "turn": turn})
+
+            # Publish the clock so tool results can carry edit pressure. This
+            # replaced an injected `[system]` reminder every sixth turn: same
+            # message, but paired with the call that earned it instead of
+            # arriving out of band, and scaled to the budget actually left
+            # rather than to a fixed period. See `tools/pressure.py`.
+            self.tool_ctx.turns_used = turn
+            self.tool_ctx.turn_budget = (
+                self.config.max_turns if _is_constrained else 0
+            )
+            # Shell writes are edits the tools cannot see: under a shell-only
+            # profile every change goes through `run_command`, and pressuring a
+            # model that has already patched the file is how you get it undone.
+            if st.files_edited or st.shell_writes:
+                self.tool_ctx.source_edited = True
 
             self.tool_ctx.permission_mode = self.config.permission_mode
-            now_plan_active = _plan_active()
-            now_phase = ps.phase if ps else None
-            if (
-                self.config.permission_mode != _cached_perm_mode
-                or now_plan_active != _cached_plan_active
-                or now_phase != _cached_phase
-            ):
-                _cached_perm_mode = self.config.permission_mode
-                _cached_plan_active = now_plan_active
-                _cached_phase = now_phase
-                _cached_schemas = openai_schemas(
-                    _cached_perm_mode, plan_active=_cached_plan_active,
-                    phase=_cached_phase,
-                )
-                if self.display is not None:
-                    self.display.set_mode(self.config.permission_mode)
-            schemas = _cached_schemas
 
             # Strip any prior live-context pair so it never appears in
             # full_log snapshots, persistence, trim_history, or
@@ -733,107 +596,80 @@ class Agent:
                 self._full_log.extend(new_msgs)
                 self._full_log_idx = len(self.messages)
 
-            # Compaction + trim.
-            msg_count_before = len(self.messages)
+            # Persist BEFORE trim reindexes the list and the blind index reset
+            # below. Without this the just-appended user message is marked
+            # persisted-but-never-written, and every path that `continue`s drops
+            # its whole turn from the session log / --resume / training export.
+            self._persist_new_messages()
+
+            # Compaction + trim. Uses the *effective* window so endpoints that
+            # don't advertise context_length still get compaction and dynamic
+            # history sizing.
+            ctx = self._context_window()
             did_compact = False
-            if getattr(self.client, "context_window", 0) > 0:
+            if ctx > 0:
                 compacted_msgs = await compact_messages(
                     self.messages, self.client,
-                    context_limit=self.client.context_window,
+                    context_limit=ctx,
                     threshold=self.config.compaction_threshold,
                 )
                 if len(compacted_msgs) < len(self.messages):
                     did_compact = True
                 self.messages[:] = compacted_msgs
-            # Dynamic history sizing: scale with the model's context window
-            # so 128k models keep more history than 32k models.  Bounded so
-            # we don't blow up on absurdly long contexts.  Compaction at
-            # 70% remains the second safety valve.
-            ctx = getattr(self.client, "context_window", 0) or 0
+            # Dynamic history sizing: scale with the model's context window so
+            # 128k models keep more history than 32k models. Bounded so we
+            # don't blow up on absurdly long contexts.
             if ctx > 0:
                 dyn_max = max(10, min(60, ctx // 4096))
                 hist_cap = max(self.config.max_history_messages, dyn_max)
             else:
                 hist_cap = self.config.max_history_messages
-            self.messages[:] = trim_history(
-                self.messages, max_messages=hist_cap,
-            )
+            self.messages[:] = trim_history(self.messages, max_messages=hist_cap)
             self._last_persisted_idx = len(self.messages)
             self._full_log_idx = len(self.messages)
 
-            # Rebuild the live-context pair AFTER trim/compact. The pair
-            # carries plan-status + notes for the model but is kept out of
-            # the canonical history so the system prefix stays byte-stable
-            # turn-over-turn (vLLM prefix cache stays warm).
+            # Forget reads whose content trimming just dropped. The read guards
+            # exist to stop a model circling over content it already has — so
+            # they have to be measured against what the model can still SEE,
+            # not against everything it ever read. Tracking that never expires
+            # turns a correct re-read (the tool result scrolled out of history)
+            # into "Refused: you have already read these lines", which was the
+            # top tool failure in three consecutive sweeps. Compaction already
+            # had this fix; trimming drops the same content without ever
+            # setting did_compact, so it needs it too.
+            self._forget_invisible_reads()
+
+            # Rebuild the live-context pair AFTER trim/compact. The pair carries
+            # notes for the model but is kept out of the canonical history so
+            # the system prefix stays byte-stable turn-over-turn.
             self._refresh_live_context_pair()
 
             if did_compact:
                 st.compaction_count += 1
 
-                # Force-finish if too many compactions without any edits.
-                if _is_constrained and st.compaction_count >= 5 and not st.files_edited:
-                    msg = (
-                        f"force finishing: {st.compaction_count} context compactions "
-                        "without any file edits"
-                    )
-                    if self.display:
-                        self.display.warn(msg)
-                    return self._build_result(st, success=False, error=msg, turn=turn)
+                # Compaction summarizes file bodies away wholesale, so drop the
+                # read tracking entirely rather than per-path.
+                had_reads = bool(self.tool_ctx.files_read_count)
+                self.tool_ctx.files_read_count.clear()
+                self.tool_ctx.read_cache_hits.clear()
+                self.tool_ctx.files_read_spans.clear()
+                self.tool_ctx.files_read_meta.clear()
 
-            # Compaction reminder (informational — lists already-read files).
-            if did_compact and self.tool_ctx.files_read_count:
-                wd = self.tool_ctx.working_dir
-                read_files = sorted(
-                    os.path.relpath(p, wd) if os.path.isabs(p) else p
-                    for p in self.tool_ctx.files_read_count.keys()
-                )
-                if len(read_files) > 15:
-                    read_files = read_files[:15] + [f"... and {len(read_files) - 15} more"]
-                inject_nudge(self, st, turn, (
-                    f"[system] Context was compacted. Files you already read in this session: "
-                    f"{', '.join(read_files)}. "
-                    "If you need to edit a file but don't remember the exact content for "
-                    "old_str, call read_file again to get the precise text — do NOT guess. "
-                    "Use save_note to persist important content across compactions."
-                ), min_gap=5, force=True)
+                # The one thing a tool result cannot tell the model: that the
+                # harness rewrote its history underneath it.
+                if had_reads or self.tool_ctx.notes:
+                    inject_nudge(self, st, turn, (
+                        "[system] Context was compacted — earlier file contents "
+                        "are no longer in your history. Re-read any file you "
+                        "need to edit rather than recalling it from memory."
+                    ), min_gap=5, force=True)
 
-            # Re-inject index-recall pointers after compaction (bench only).
-            # The original "## Relevant Code (from index)" section lives in
-            # the first user message; once compaction summarises it the
-            # model loses the breadcrumb trail to where the bug likely
-            # lives.  Re-surface a compact pointer list so the model can
-            # navigate without re-running recall by hand.  Pointers only
-            # — no file bodies — to keep the nudge cheap.
-            if did_compact and is_bench and st.problem_text:
-                try:
-                    from squishy.bench.swebench import _recall_from_index
-                    pointers = _recall_from_index(
-                        self.config.working_dir, st.problem_text, limit=5,
-                    )
-                except Exception:  # noqa: BLE001
-                    pointers = []
-                if pointers:
-                    lines = ["[system] Post-compaction recall — likely-relevant code:"]
-                    for p in pointers:
-                        line_info = ""
-                        if p.get("lines"):
-                            line_info = f" (L{p['lines'][0]}-{p['lines'][1]})"
-                        lines.append(
-                            f"- `{p['path']}`{line_info}: "
-                            f"{p.get('kind', 'file')} `{p['name']}`"
-                        )
-                    lines.append(
-                        "Use `read_file` to re-load whichever of these you "
-                        "need; do not guess at file contents from memory."
-                    )
-                    inject_nudge(
-                        self, st, turn, "\n".join(lines),
-                        min_gap=5, force=True,
-                    )
+            # Enforce the assistant/tool pairing invariant on the exact list we
+            # send, so no malformed transcript reaches the endpoint.
+            self.messages[:] = normalize_messages(self.messages)
 
-            # LLM call. In interactive modes, show a spinner so a slow
-            # first token / cold model doesn't look like a hung process.
-            # The spinner cancels itself on the first streamed chunk.
+            # LLM call. In interactive modes, show a spinner so a slow first
+            # token / cold model doesn't look like a hung process.
             if self.display is not None and not _is_constrained:
                 self.display.start_thinking()
             try:
@@ -846,9 +682,8 @@ class Agent:
                     self.display.flush_streaming_text()
                     self.display.error(f"LLM error: {e}")
                 # Content-filter rejections and Azure-strict schema violations
-                # (orphan tool_calls) are deterministic — no point retrying.
-                # Fail-fast so the bench harness moves to the next instance
-                # instead of burning the per-task budget on a guaranteed-fail prompt.
+                # are deterministic — no point retrying. Fail fast so the bench
+                # harness moves on instead of burning the per-task budget.
                 err_str = str(e).lower()
                 if (
                     "content_filter" in err_str
@@ -869,31 +704,32 @@ class Agent:
                 self.display.flush_streaming_text()
 
             # Retry-storm short-circuit: tenacity may have eaten dozens of
-            # seconds inside the call.  Accumulate the per-call retry count
-            # and escalate when upstream is clearly unstable so we don't burn
-            # the whole task_timeout in silence (v25 gemma-1 lost ~900s here).
+            # seconds inside the call. Escalate when upstream is clearly
+            # unstable so we don't burn the whole task_timeout in silence.
             call_retries = getattr(self.client, "last_call_retries", 0)
             if call_retries:
                 st.cumulative_retries += call_retries
-                if is_bench:
-                    if st.cumulative_retries >= 24:
-                        # Hard ceiling: bail to capture-on-error path so the
-                        # workspace diff (any partial edits) still survives.
-                        raise AgentTimeout(
-                            f"retry storm: {st.cumulative_retries} cumulative "
-                            f"upstream retries — aborting to preserve partial work"
-                        )
-                    if st.cumulative_retries >= 12:
-                        inject_nudge(self, st, turn, (
-                            f"[system] CRITICAL: the upstream LLM API has been "
-                            f"unstable ({st.cumulative_retries} cumulative retries). "
-                            "Wrap up immediately — submit your best current edit "
-                            "and stop. Do NOT call additional tools unless you have "
-                            "no patch yet."
-                        ), min_gap=0, force=True)
+                if is_bench and st.cumulative_retries >= 24:
+                    # Bail to the capture-on-error path so the workspace diff
+                    # (any partial edits) still survives.
+                    raise AgentTimeout(
+                        f"retry storm: {st.cumulative_retries} cumulative "
+                        f"upstream retries — aborting to preserve partial work"
+                    )
 
             st.total_prompt_tokens += completion.prompt_tokens
             st.completion_tokens += completion.completion_tokens
+            # Emitted per-turn so a harness can accumulate usage as it happens.
+            # Sourcing metrics from TaskResult alone loses them on the common
+            # weak-model paths (turn cap, timeout, upstream error).
+            self._emit({
+                "type": "usage", "turn": turn,
+                "prompt_tokens": completion.prompt_tokens,
+                "completion_tokens": completion.completion_tokens,
+                "total_prompt_tokens": st.total_prompt_tokens,
+                "total_completion_tokens": st.completion_tokens,
+                "tool_calls": len(completion.tool_calls or []),
+            })
 
             # --- No tool calls: prose-only completion ---
             if not completion.tool_calls:
@@ -902,9 +738,22 @@ class Agent:
                     return result
                 continue
 
-            self.messages.append(assistant_msg(completion.text, completion.tool_calls, completion.reasoning))
+            # Tolerance layer: map alternate tool/parameter vocabularies (bash,
+            # grep, str_replace, file_path, …) onto squishy's canonical tools so
+            # a model fine-tuned on a different harness isn't penalized.
+            for tc in completion.tool_calls:
+                tc.name, tc.args = normalize_call(tc.name, tc.args)
 
-            # --- Loop detection (all modes) ---
+            self.messages.append(
+                assistant_msg(completion.text, completion.tool_calls, completion.reasoning)
+            )
+
+            # --- Loop detection ---
+            # The only surviving loop check at this layer, and it ends the run
+            # rather than trying to talk the model out of it. Per-tool echo
+            # counters (read_file spans, run_command output hashes) handle the
+            # softer cases inline, where the response reaches the model as a
+            # tool result instead of an injected user turn.
             current_key = call_key(completion.tool_calls)
             if current_key == st.last_call_key:
                 st.consecutive_identical += 1
@@ -924,62 +773,34 @@ class Agent:
                     final_text="Fix applied." if st.files_edited else "",
                     turn=turn,
                 )
-            # Mid-loop nudge (interactive modes only).
-            if not _is_constrained and st.consecutive_identical >= 2:
-                self.messages.append({
-                    "role": "user",
-                    "content": (
-                        f"[system] You repeated the same tool call "
-                        f"{st.consecutive_identical + 1} times in a row with no "
-                        "new information. Either try a different action, call "
-                        "`finish_plan` if the work is done, or respond with a "
-                        "plain-text summary to end the turn. Do not repeat "
-                        "this call again."
-                    ),
-                })
-
-            # --- Quality gate ---
-            gate = apply_quality_gate(self, completion.tool_calls, st, turn)
-            if isinstance(gate, TaskResult):
-                return gate
-            if gate == "skip":
-                continue
 
             # --- Dispatch tools ---
-            plan_task_called_this_turn = False
-            local_read_without_recall = 0
-            dispatched_pairs: list[tuple[ToolCall, dict[str, Any]]] = []
-
+            dispatched = 0
             for tc in completion.tool_calls:
-                if tc.name == "plan_task":
-                    plan_task_called_this_turn = True
                 st.total_tool_calls[tc.name] = st.total_tool_calls.get(tc.name, 0) + 1
 
                 outcome = await run_tool(self, turn, tc)
-                dispatched_pairs.append((tc, outcome))
-
-                # Informational feedback.
-                inject_test_failure_nudge(self, st, tc, outcome, turn=turn)
-                check_goal_drift(self, st, tc, outcome, turn=turn)
-                edit_loop_result = track_edit_failure(self, st, tc, outcome, turn=turn)
-                if edit_loop_result is not None:
-                    self._sync_display_stats(st, turn)
-                    return edit_loop_result
-                detect_shell_file_read(self, st, tc, outcome, turn=turn)
+                dispatched += 1
+                # Snapshot before the next dispatch overwrites it.
+                pressure_tags = list(self.tool_ctx.last_pressure)
+                if (
+                    tc.name == "run_command"
+                    and outcome.get("success")
+                    and looks_like_file_write(str(tc.args.get("command", "")))
+                ):
+                    st.shell_writes += 1
+                self._emit({
+                    "type": "tool", "name": tc.name,
+                    "args": dict(tc.args) if isinstance(tc.args, dict) else tc.args,
+                    "success": bool(outcome.get("success")),
+                    # Truncated: enough for a harness to bucket failures by
+                    # cause without carrying whole tool outputs.
+                    "error": str(outcome.get("error") or "")[:300],
+                    # Which edit-pressure notices this result carried, so a
+                    # harness can tell "warned and ignored" from "never fired".
+                    "pressure": list(pressure_tags),
+                })
                 track_tool_outcome(self, st, tc, outcome, turn=turn)
-
-                if tc.name in ("read_file", "list_directory", "search_files") and outcome["success"]:
-                    local_read_without_recall += 1
-
-                # Plan-approved terminal event (interactive plan mode).
-                if outcome.get("plan_approved") and self.config.permission_mode == "plan":
-                    self._sync_display_stats(st, turn)
-                    plan = self.tool_ctx.plan.to_dict() if self.tool_ctx.plan is not None else {}
-                    return self._build_result(
-                        st, success=True,
-                        final_text=f"Plan approved: {plan.get('problem', '')}".strip(),
-                        turn=turn,
-                    )
 
                 if st.consecutive_errors >= self.config.max_consecutive_errors:
                     msg = f"{self.config.max_consecutive_errors} consecutive tool failures — stopping."
@@ -987,137 +808,25 @@ class Agent:
                         self.display.error(msg)
                     return self._build_result(st, success=False, error=msg, turn=turn)
 
-            # Recall-first enforcement (plan mode only).
-            if self.config.permission_mode == "plan" and not is_bench:
-                recall_skip_budget = self.config.max_recall_skip_turns
-                self.consecutive_reads_without_recall += local_read_without_recall
-                if self.has_index and self.consecutive_reads_without_recall >= recall_skip_budget:
-                    if self.consecutive_reads_without_recall == recall_skip_budget:
-                        warning_msg = (
-                            f"You've called read tools {recall_skip_budget} times without using `recall`. "
-                            "In plan mode, you MUST use `recall(query=...)` first to navigate the codebase. "
-                            "The index at `.squishy/index.json` enables efficient file lookup."
-                        )
-                        if self.display:
-                            self.display.warn(warning_msg)
-                    self.messages.append({
-                        "role": "user",
-                        "content": (
-                            "[system] Too many read calls without `recall`. Call `recall(query=...)` now "
-                            "to find relevant files, or call `plan_task` if you have enough information. "
-                            "Do not call read_file, list_directory, or search_files again until you use recall."
-                        ),
-                    })
-                    self.consecutive_reads_without_recall = 0
-                    continue
-
-            # Reset identical-call counter when an edit succeeded this turn.
+            # A successful edit is real progress — don't let identical
+            # verification commands around it trip the loop detector.
             if _is_constrained and any(
-                tc.name == "edit_file" and outcome.get("success")
-                for tc, outcome in dispatched_pairs
-            ):
+                tc.name in ("edit_file", "write_file") for tc in completion.tool_calls
+            ) and st.files_edited:
                 st.consecutive_identical = 0
                 st.last_call_key = ""
 
-            # Plan-mode investigation nudge (interactive only).
-            if self.config.permission_mode == "plan" and not is_bench:
-                active_plan = self.tool_ctx.plan
-                if plan_task_called_this_turn:
-                    st.turns_without_plan_task = 0
-                elif active_plan is None:
-                    st.turns_without_plan_task += 1
-                    if st.turns_without_plan_task >= self.config.max_plan_investigation_turns:
-                        if st.plan_nudges < self.config.max_plan_nudges:
-                            st.plan_nudges += 1
-                            st.turns_without_plan_task = 0
-                            self.messages.append({
-                                "role": "user",
-                                "content": (
-                                    "[system] You have investigated enough. Stop calling "
-                                    "read tools and call `plan_task` now. Use the evidence "
-                                    "you already have instead of waiting for exhaustive "
-                                    "research. `files_to_modify` and `files_to_create` may "
-                                    "be partial or empty if uncertain. Do not read any more "
-                                    "files before calling `plan_task`."
-                                ),
-                            })
-                            continue
-                        else:
-                            msg = "plan-mode run finished without producing a plan_task"
-                            if self.display:
-                                self.display.error(msg)
-                            return self._build_result(st, success=False, error=msg, turn=turn)
-
-            # --- Phase transitions (bench mode) ---
-            if ps:
-                # F2P finish-plan gate: block finish_plan when the agent
-                # claims done without having actually passed the FAIL_TO_PASS
-                # tests.  Releases after one intercept so a degraded test env
-                # cannot trap the agent forever.
-                gate_msg = check_finish_plan_gate(
-                    ps, dispatched_pairs,
-                    st.fail_to_pass_tests,
-                    st.f2p_finish_gate_intercepts,
-                    max_intercepts=self.config.max_finish_gate_intercepts,
-                    last_f2p_failures=st.last_f2p_failures,
-                    last_f2p_collection_error=st.last_f2p_collection_error,
-                )
-                if gate_msg:
-                    st.f2p_finish_gate_intercepts += 1
-                    inject_nudge(self, st, turn, gate_msg, min_gap=0, force=True)
-                    # Do NOT transition to done — skip check_transition this turn.
-                    # The agent will get another shot to run the right tests.
-                    continue
-                transition = check_transition(ps, dispatched_pairs)
-                # Always sync diagnostics from phase machine to LoopState.
-                st.phase = ps.phase
-                st.explore_turns = ps.explore_turns
-                st.fix_verify_cycles = ps.fix_verify_cycles
-                st.test_passed_after_edit = ps.test_passed_after_edit
-                # F5: keep LoopState's coverage view in sync with the phase
-                # machine's authoritative tally for the diagnostics export.
-                st.f2p_files_covered = set(ps.f2p_files_covered)
-                if transition.force_finish:
-                    if self.display:
-                        self.display.warn(
-                            f"phase: exhausted fix-verify budget ({ps.fix_verify_cycles} cycles)"
-                        )
-                    return self._build_result(
-                        st,
-                        success=transition.force_finish_success,
-                        final_text="Fix applied. Agent exhausted edit-verify cycle budget." if ps.has_edit else "",
-                        turn=turn,
-                    )
-                if transition.new_phase:
-                    advance(ps, transition)
-                    # Re-sync after advance (phase changed).
-                    st.phase = ps.phase
-                # Inject informational notification (phase change or in-phase nudge).
-                if transition.notification:
-                    inject_nudge(self, st, turn, transition.notification, min_gap=2)
-
-            # Turn budget + re-anchoring (informational).
-            inject_turn_budget(self, st, turn)
-            maybe_reanchor_problem(self, st, turn)
-            maybe_post_edit_pytest_nudge(self, st, turn)
-
             # Per-turn event log (bench/yolo only).
             if _is_constrained:
-                tools_this_turn = [
-                    {"name": tc.name, "args_summary": brief(tc) or str(tc.args.get("command", ""))[:80]}
-                    for tc in completion.tool_calls
-                ]
                 st.turn_log.append({
                     "turn": turn,
-                    "phase": ps.phase if ps else st.phase,
-                    "tools": tools_this_turn,
-                    "dispatched": len(dispatched_pairs),
-                    "blocked": len(completion.tool_calls) - len(dispatched_pairs),
-                    "consecutive_identical": st.consecutive_identical,
-                    "quality_violations": st.total_quality_violations,
+                    "tools": [
+                        {"name": tc.name,
+                         "args_summary": brief(tc) or str(tc.args.get("command", ""))[:80]}
+                        for tc in completion.tool_calls
+                    ],
+                    "dispatched": dispatched,
                     "files_edited": len(st.files_edited),
-                    "fix_verify_cycles": ps.fix_verify_cycles if ps else st.fix_verify_cycles,
-                    "explore_turns": ps.explore_turns if ps else st.explore_turns,
                     "elapsed_s": round(time.monotonic() - st.start, 1),
                 })
 
@@ -1129,6 +838,18 @@ class Agent:
             self.display.warn(msg)
             self._sync_display_stats(st, self.config.max_turns)
         return self._build_result(st, success=False, error=msg, turn=self.config.max_turns)
+
+    def _emit(self, event: dict[str, Any]) -> None:
+        """Send a structured lifecycle event to the optional on_event sink.
+
+        Never lets a caller's sink break the loop.
+        """
+        if self.on_event is None:
+            return
+        try:
+            self.on_event(event)
+        except Exception:  # noqa: BLE001
+            log.debug("on_event sink raised", exc_info=True)
 
     async def _on_text(self, chunk: str) -> None:
         if self.display:
@@ -1160,16 +881,3 @@ class Agent:
         )
         # Restart the spinner so the wait between retries isn't silent.
         self.display.start_thinking(label="retrying")
-
-
-def _looks_like_json_plan(text: str) -> bool:
-    """Heuristic: did the model write a plan_task JSON literal in prose?
-
-    The signature we care about is the simultaneous presence of the three
-    plan_task field names quoted as JSON keys. We don't try to parse —
-    just to detect the failure mode and route to a sharper nudge.
-    """
-    if not text or "{" not in text:
-        return False
-    needles = ('"problem"', '"solution"', '"steps"')
-    return all(n in text for n in needles)

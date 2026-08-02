@@ -1,15 +1,16 @@
 """Async shell execution tool. Docker sandbox when available, subprocess otherwise."""
  
 from __future__ import annotations
- 
+
 import asyncio
+import hashlib
 import os
 import re
 import shutil
 from typing import Any
- 
+
 from squishy.tools.base import Tool, ToolContext, ToolResult
- 
+
 DEFAULT_TIMEOUT = 60
 OUTPUT_CAP_STDOUT = 8000
 OUTPUT_CAP_STDERR = 4000
@@ -209,6 +210,29 @@ def _docker_available() -> bool:
     return shutil.which("docker") is not None
  
  
+
+# `cd /repo &&` prefixes and `| head -N` tails vary while the underlying query
+# does not, so a model can loop forever without ever repeating a command
+# byte-for-byte. Normalizing both is what lets repeat detection see the loop.
+_CD_PREFIX_RE = re.compile(r"^\s*cd\s+[^\s;&|]+\s*&&\s*")
+_HEAD_TAIL_RE = re.compile(r"\s*\|\s*head(\s+-n)?\s*-?\d*\s*$")
+
+
+def _command_key(command: str) -> str:
+    """Collapse cosmetic variation so equivalent commands hash alike."""
+    c = command.strip()
+    prev = None
+    while prev != c:
+        prev = c
+        c = _CD_PREFIX_RE.sub("", c)
+        c = _HEAD_TAIL_RE.sub("", c)
+    return " ".join(c.split())
+
+
+# Identical results tolerated before run_command starts pushing back.
+_ECHO_WARN_AT = 2
+_ECHO_REFUSE_AT = 4
+
 async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     command = args.get("command")
     if not isinstance(command, str):
@@ -300,6 +324,31 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     _esc = "\\"
     display = f"exit={exit_code}" + (f" {_esc}[sandbox]" if sandboxed else "")
     if success:
+        # Loop detection for the shell. The file tools break read loops with
+        # their cache and refusal ladder; a shell-only profile has none of
+        # that, and a repeated `grep` succeeds forever. Observed live: 27
+        # commands, most of them the same grep, right file located at turn 13,
+        # no edit ever made.
+        echo_key = f"{_command_key(command)}\x00{hashlib.blake2b(stdout_text.encode('utf-8', 'replace'), digest_size=8).hexdigest()}"
+        echoes = ctx.command_echoes.get(echo_key, 0) + 1
+        ctx.command_echoes[echo_key] = echoes
+        if echoes >= _ECHO_REFUSE_AT:
+            return ToolResult(
+                False,
+                data=data,
+                error=(
+                    f"Refused: this command has returned the same output "
+                    f"{echoes} times. You already have this information — act "
+                    f"on it. Edit the file you identified, then check "
+                    f"`git diff`."
+                ),
+                display=display,
+            )
+        if echoes >= _ECHO_WARN_AT:
+            data["note"] = (
+                f"You have run this command {echoes} times with identical "
+                f"output. Use what you have rather than looking again."
+            )
         return ToolResult(True, data=data, display=display)
     # Non-zero exit: report failure so the model can't mistake a crashing
     # command for success. stdout/stderr remain in `data` so it can diagnose.
@@ -316,14 +365,29 @@ async def _run_command(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
 run_command = Tool(
     name="run_command",
-    description="Run a shell command and capture stdout/stderr/exit code. "
-                "Sandboxed in Docker when available.",
+    description=(
+        "Run a shell command and return its stdout, stderr, and exit code. "
+        "Use it to run tests, inspect the tree, and search — it covers "
+        "anything without a dedicated tool."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "command": {"type": "string"},
-            "timeout": {"type": "integer", "default": DEFAULT_TIMEOUT},
-            "cwd": {"type": "string"},
+            "command": {
+                "type": "string",
+                "description": (
+                    "Command to run. Already executes in the working directory, "
+                    "so no leading `cd` is needed."
+                ),
+            },
+            "timeout": {
+                "type": "integer", "default": DEFAULT_TIMEOUT,
+                "description": "Seconds to allow before the command is killed.",
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Subdirectory to run in, relative to the working directory.",
+            },
         },
         "required": ["command"],
     },

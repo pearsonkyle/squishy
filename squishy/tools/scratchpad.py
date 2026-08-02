@@ -1,7 +1,7 @@
 """`save_note` tool — persist findings across conversation history trims.
 
 Notes are stored on ToolContext.notes and injected as a synthetic system
-message each turn, surviving history trimming the same way plan-status
+message each turn, surviving history trimming the same way live-context
 messages do.
 """
 
@@ -13,6 +13,7 @@ from squishy.tools.base import Tool, ToolContext, ToolResult
 
 MAX_NOTES = 10
 MAX_NOTE_CHARS = 2000
+MAX_NOTE_KEY_CHARS = 100
 NOTES_TAG = "<notes>"
 NOTES_END_TAG = "</notes>"
 
@@ -46,15 +47,30 @@ async def _save_note(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     key = key.strip()
     content = content.strip()
 
+    # Refuse to clobber harness-reserved keys (e.g. FAIL_TO_PASS metadata),
+    # which downstream nudges depend on.
+    if key in ctx.reserved_note_keys:
+        return ToolResult(False, error=(
+            f"`{key}` is reserved by the harness and cannot be overwritten — "
+            "choose a different note key."
+        ))
+
+    # Cap key length so a huge key can't permanently inflate every turn's
+    # live-context (render_notes re-emits all keys each turn).
+    if len(key) > MAX_NOTE_KEY_CHARS:
+        key = key[:MAX_NOTE_KEY_CHARS]
     # Cap content length
     if len(content) > MAX_NOTE_CHARS:
         content = content[:MAX_NOTE_CHARS] + "…(truncated)"
 
-    # Evict oldest if at capacity (and this is a new key)
+    # Evict oldest NON-reserved note if at capacity (and this is a new key).
     evicted_key = None
     if key not in ctx.notes and len(ctx.notes) >= MAX_NOTES:
-        evicted_key = next(iter(ctx.notes))
-        del ctx.notes[evicted_key]
+        evicted_key = next(
+            (k for k in ctx.notes if k not in ctx.reserved_note_keys), None
+        )
+        if evicted_key is not None:
+            del ctx.notes[evicted_key]
 
     ctx.notes[key] = content
     data: dict[str, Any] = {"key": key, "saved": True, "total_notes": len(ctx.notes)}
@@ -69,21 +85,16 @@ async def _save_note(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 save_note = Tool(
     name="save_note",
     description=(
-        "Persist a finding for future reference. Notes survive conversation "
-        "trimming so you do not lose important context. Use this to record: "
-        "key findings, relevant file paths, important data, decisions, "
-        "or any insight you want to remember across turns."
+        "Persist a short note (key + content) that survives context trimming. "
+        "Use for findings, file paths, or decisions to remember across turns."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "key": {
-                "type": "string",
-                "description": "Short label (e.g., 'bug_location', 'test_file', 'root_cause')",
-            },
+            "key": {"type": "string", "description": "Short label, e.g. 'root_cause'"},
             "content": {
                 "type": "string",
-                "description": "The content to remember",
+                "description": "The note itself — keep it short; it is re-sent every turn.",
             },
         },
         "required": ["key", "content"],

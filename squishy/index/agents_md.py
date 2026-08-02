@@ -16,8 +16,6 @@ from pathlib import Path
 
 from squishy.index.model import Index, Node
 
-
-
 # Directories that are noise in the project overview: VCS internals,
 # build artifacts, virtualenvs, dependency caches, and squishy's own
 # generated session/index storage.
@@ -314,18 +312,17 @@ def generate_agents_md(index: Index, *, include_imports: bool = True, cwd: str =
                 lines.append(", ".join(name for name, _ in deps))
                 lines.append("")
 
-    # Planning workflow — minimal markup, no nested bold.
-    lines.append("## Planning workflow")
-    lines.append("")
-    lines.append("In plan mode:")
+    # Navigation workflow — minimal markup, no nested bold.
+    lines.append("## Navigation")
     lines.append("")
     lines.append("1. recall(query=...) first — use the index to find relevant files")
     lines.append("2. 1-2 targeted reads to understand the problem")
-    lines.append("3. plan_task(problem=..., solution=..., steps=[...])")
     lines.append("")
     lines.append(
-        "Do not call read_file, list_directory, or search_files without first "
-        "calling recall. The index lives at .squishy/index.json."
+        "Prefer recall(query=...) to locate code fast. If the index misses or "
+        "returns nothing useful, fall back to search_files / glob_files / "
+        "read_file — exploration is never blocked. The index lives at "
+        ".squishy/index.json."
     )
     lines.append("")
 

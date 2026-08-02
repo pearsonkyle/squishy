@@ -24,16 +24,16 @@ from squishy.config import Config
 from squishy.display import MODE_COLORS, Display, Stats
 from squishy.errors import AgentCancelled, AgentTimeout, LLMError
 from squishy.file_browser import format_reference_list, inject_references_with_missing
-from squishy.plan_state import clear_plan
 from squishy.session import (
     create_session,
     export_training_to_file,
     list_sessions,
     load_messages,
+    restore_for_replay,
 )
+from squishy.tool_restrictions import TOOL_PROFILES
 from squishy.tools.base import Tool
 
-EXECUTE_APPROVED_PLAN_PROMPT = "Execute the approved plan."
 
 # Slash commands that take no arguments — typing extra text is almost
 # always a typo (e.g. ``/clear all``) that we silently swallowed before.
@@ -42,8 +42,6 @@ _NO_ARG_SLASH_CMDS: frozenset[str] = frozenset({
     "/help",
     "/clear", "/new",
     "/status",
-    "/plan",
-    "/exit-plan",
     "/session",
     "/sessions",
 })
@@ -77,12 +75,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--timeout", type=float, default=None, help="Task timeout in seconds")
     p.add_argument("--request-timeout", type=float, default=120.0)
     p.add_argument("--max-retries", type=int, default=4)
-    p.add_argument("--plan", action="store_true", help="Start in plan mode (default, read-only)")
     p.add_argument("--edits", action="store_true", help="Start in edits mode")
     p.add_argument("--yolo", action="store_true", help="Start in yolo mode (no prompts)")
+    p.add_argument(
+        "--tools", dest="tool_profile", choices=sorted(TOOL_PROFILES), default="standard",
+        help="Tool profile: standard (all tools the mode allows) or minimal "
+             "(shell + file primitives only)",
+    )
     p.add_argument("--no-sandbox", action="store_true", help="Disable Docker sandbox for run_command")
     p.add_argument("--sandbox", action="store_true", help="Enable Docker sandbox for run_command")
     p.add_argument("--thinking", action="store_true", help="Allow <think> blocks")
+    p.add_argument(
+        "--context-window", type=int, default=None,
+        help="Context window in tokens (default: auto-detect, else assume 32768). "
+             "Set this when your endpoint doesn't advertise context_length.",
+    )
     p.add_argument("--message", "-m", help="Non-interactive: send one message, print result, exit")
     p.add_argument("--init", action="store_true", help="Build .squishy/index.json before the REPL")
     p.add_argument("--no-summaries", action="store_true", help="When indexing, skip LLM summaries")
@@ -118,18 +125,19 @@ def _build_config(args: argparse.Namespace) -> Config:
         cfg.max_turns = args.max_turns
     if args.temperature is not None:
         cfg.temperature = args.temperature
-    if args.plan:
-        cfg.permission_mode = "plan"
     elif args.yolo:
         cfg.permission_mode = "yolo"
     elif args.edits:
         cfg.permission_mode = "edits"
+    cfg.tool_profile = getattr(args, "tool_profile", "standard")
     if args.no_sandbox:
         cfg.use_sandbox = False
     if args.sandbox:
         cfg.use_sandbox = True
     if args.thinking:
         cfg.thinking = True
+    if args.context_window is not None:
+        cfg.context_window = args.context_window
     if args.init:
         cfg.auto_init = True
     if args.no_summaries:
@@ -214,12 +222,23 @@ async def _amain() -> None:
             cfg.model = discovered_model
             client.model = discovered_model
         display.banner(cfg.base_url, cfg.model)
-        # Use the discovered context window so the % usage display is meaningful.
-        # Falls back to 0 (no % shown) for endpoints that don't expose it.
-        display.stats.context_window = client.context_window
+        # Show % usage against the window the agent actually budgets against:
+        # explicit override → endpoint-advertised → assumed default.
+        display.stats.context_window = (
+            cfg.context_window
+            or client.context_window
+            or cfg.assumed_context_window
+        )
 
         if cfg.auto_init:
-            await _run_init(cfg, client, display, summaries=cfg.index_summaries)
+            # A failed --init build must not abort startup — the REPL/one-shot
+            # can still run (recall just won't be available).
+            try:
+                await _run_init(cfg, client, display, summaries=cfg.index_summaries)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                display.warn("[index] --init cancelled")
+            except Exception as e:  # noqa: BLE001
+                display.error(f"[index] --init failed: {e}")
 
         # Initialize MCP servers (non-blocking).
         try:
@@ -249,14 +268,7 @@ async def _amain() -> None:
         approval_session: PromptSession[str] = PromptSession()
 
         async def prompt_fn(tool: Tool, args_: dict):
-            # For plan_task, free-text input is sent back to the model as
-            # decline-with-feedback so it can revise the plan. Spell that
-            # out — "feedback" alone reads like a separate menu option.
-            label = (
-                "  approve? [y=yes / N=no / type feedback to revise / ^C=cancel] "
-                if tool.name == "plan_task"
-                else "  approve? [y/N, ^C cancels] "
-            )
+            label = "  approve? [y/N, ^C cancels] "
             # Make sure any in-flight streaming markdown is finalised before
             # we hand the terminal to prompt_toolkit, otherwise the live
             # region and the prompt fight for the same screen rows.
@@ -269,25 +281,28 @@ async def _amain() -> None:
                     display.info("declined.")
                     return False
                 # Ctrl+C is intentionally *not* caught here. We want it to
-                # propagate up through _handle_plan_approval and the agent
-                # loop so the entire turn is cancelled and the user lands
+                # propagate up through the agent loop so the whole turn
+                # is cancelled and the user lands
                 # back at the REPL prompt — instead of the agent silently
                 # treating it as "n" and continuing to chug.
             stripped = (reply or "").strip()
             lowered = stripped.lower()
-            if lowered in ("y", "yes"):
-                return True
-            if lowered in ("", "n", "no"):
-                return False
-            # Anything else is treated as a decline with free-text feedback
-            # the agent can use to revise its plan.
-            if tool.name == "plan_task":
-                return ("feedback", stripped)
-            return False
+            return lowered in ("y", "yes")
 
  
         if args.message:
-            await _run_one(cfg, client, display, prompt_fn, args.message, args.timeout, mode_cycler)
+            # -m is a one-shot ("send one message, print result, exit"). Only
+            # wire the interactive approval prompt when stdin is a real TTY —
+            # otherwise (piped/CI/non-TTY) a shell approval would block forever
+            # on a prompt that can never be answered. Non-TTY falls back to
+            # auto-approve, matching the stdin-pipe branch below.
+            interactive = sys.stdin.isatty()
+            await _run_one(
+                cfg, client, display,
+                prompt_fn if interactive else None,
+                args.message, args.timeout,
+                mode_cycler if interactive else None,
+            )
             return
 
         if not sys.stdin.isatty():
@@ -327,7 +342,7 @@ async def _run_direct_command(cmd: str, timeout: float = 120.0) -> int:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=timeout
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(Exception):
@@ -356,72 +371,6 @@ async def _run_direct_command(cmd: str, timeout: float = 120.0) -> int:
         sys.stderr.flush()
 
     return proc.returncode if proc.returncode is not None else 1
-
-
-async def _show_exit_plan(cfg: Config, display: Display, plan: dict | None) -> None:
-    """Show the active plan and offer to switch into edits mode."""
-    if cfg.permission_mode != "plan":
-        display.warn("/exit-plan only works in plan mode")
-        return
-    if not plan:
-        display.info("no active plan — ask the agent to produce one first")
-        return
-
-    display.plan_panel(plan)
-    await _prompt_switch_to_edits(
-        cfg,
-        display,
-        prompt_text="  Switch to edits mode and execute the plan? [Y/n] ",
-        success_text="[bold green]✓ Switched to edits mode[/]",
-    )
-
-
-async def _prompt_switch_to_edits(
-    cfg: Config,
-    display: Display,
-    *,
-    prompt_text: str,
-    success_text: str,
-) -> None:
-    # Use prompt_toolkit instead of asyncio.to_thread(input) so Ctrl+C
-    # raises cleanly without leaving an orphan input thread blocked on
-    # stdin (which freezes the terminal).
-    session: PromptSession[str] = PromptSession()
-    try:
-        reply = await session.prompt_async(prompt_text)
-    except (EOFError, KeyboardInterrupt):
-        display.info("Cancelled.")
-        return
-    if (reply or "").strip().lower() in ("", "y", "yes"):
-        cfg.permission_mode = "edits"
-        display.set_mode("edits")
-        display.info(success_text)
-    else:
-        display.info("Staying in plan mode.")
-
-
-async def _auto_execute_plan(agent: Agent, cfg: Config, display: Display, timeout: float | None) -> None:
-    """If a plan was just approved, auto-switch to edits mode and execute it."""
-    plan = agent.tool_ctx.plan
-    if not (
-        cfg.permission_mode == "plan"
-        and plan is not None
-        and plan.approved
-        and not agent.tool_ctx.plan_switch_prompted
-    ):
-        return
-    agent.tool_ctx.plan_switch_prompted = True
-    cfg.permission_mode = "edits"
-    display.set_mode("edits")
-    display.info("[bold green]✓ Switched to edits mode[/]")
-    try:
-        await agent.run(EXECUTE_APPROVED_PLAN_PROMPT, timeout=timeout)
-    except AgentTimeout as e:
-        display.error(str(e))
-    except AgentCancelled:
-        display.warn("cancelled")
-    except LLMError as e:
-        display.error(f"LLM error: {e}")
 
 
 def _create_session_for_agent(
@@ -453,9 +402,6 @@ def _create_session_for_agent(
 
 
 async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycler=None):  # type: ignore[no-untyped-def]
-    # One-shot invocations should not pick up a leftover plan from a previous
-    # interactive run.
-    clear_plan(cfg.working_dir)
     session_id = _create_session_for_agent(cfg, cfg.model, display)
     agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
     cycler = mode_cycler or _NullModeCycler()
@@ -481,13 +427,6 @@ async def _run_one(cfg, client, display, prompt_fn, message, timeout, mode_cycle
         display.error(f"LLM error: {e}")
         return
 
-    try:
-        async with cycler:
-            await _auto_execute_plan(agent, cfg, display, timeout)
-    except (AgentCancelled, KeyboardInterrupt):
-        display.flush_streaming_text()
-        display.warn("cancelled")
-
 
 class _NullModeCycler:
     """No-op stand-in used when the mode cycler isn't available
@@ -508,7 +447,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     def _cycle(event):  # type: ignore[no-untyped-def]
         new_mode = cfg.cycle_mode()
         # Print the change so the user sees it inline — silently swapping
-        # plan→edits while a tool is queued is the easiest way to give
+        # edits→yolo while a tool is queued is the easiest way to give
         # the agent unintended write permissions. ``mode_changed`` calls
         # ``set_mode`` internally so we don't double-set.
         display.mode_changed(new_mode)
@@ -523,19 +462,26 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
     current_agent = None
     if resume_id:
         try:
-            prev_messages = load_messages(resume_id, root=cfg.session_dir)
-            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=resume_id)
-            # Replace the fresh messages with the loaded ones.
+            # Restore stored dict-args tool_calls back to the OpenAI wire
+            # format (JSON-string arguments) so the resumed transcript is valid
+            # to send to the endpoint.
+            prev_messages = restore_for_replay(
+                load_messages(resume_id, root=cfg.session_dir)
+            )
+            # Build WITHOUT the session id so __post_init__ doesn't append a
+            # fresh system prompt into the resumed session's on-disk log; wire
+            # the id up only after the loaded transcript replaces messages.
+            current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=None)
             current_agent.messages = prev_messages
+            current_agent.session_id = resume_id
             current_agent._last_persisted_idx = len(prev_messages)
+            current_agent._full_log_idx = len(prev_messages)
             display.info(f"[session] resumed {resume_id[:12]}… ({len(prev_messages)} messages)")
         except Exception as e:  # noqa: BLE001
             display.error(f"failed to resume session {resume_id}: {e}")
             display.info("starting a fresh session instead.")
             resume_id = None
     if current_agent is None:
-        # Fresh interactive session — never inherit a plan from a previous run.
-        clear_plan(cfg.working_dir)
         session_id = _create_session_for_agent(cfg, display.model or cfg.model, display)
         current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
         if session_id:
@@ -578,12 +524,10 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         if line == "/help":
             display.info(
                 "  /help                     — show this help\n"
-                "  /mode <plan|edits|yolo>   — switch permission mode\n"
+                "  /mode <edits|yolo>        — switch permission mode\n"
                 "  /status                   — show current config\n"
-                "  /plan                     — show active plan progress\n"
-                "  /exit-plan                — exit plan mode with detailed plan\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
-                "  /init [--no-summaries]    — build/refresh repo index\n"
+                "  /init [--no-summaries]    — build/refresh repo index + code graph\n"
                 "  /mcp [list|reload|add|remove] — manage MCP servers\n"
                 "  /session                  — show current session UUID\n"
                 "  /sessions                 — list recent sessions\n"
@@ -600,10 +544,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
             cw = display.stats.context_window
             display.stats = Stats()
             display.stats.context_window = cw
-            # Drop any persisted plan so the next agent starts fresh —
-            # otherwise __post_init__ will silently reload the prior plan
-            # and the user sees "[plan] restored …" right after /clear.
-            clear_plan(cfg.working_dir)
             # Rebuild agent with fresh conversation history and new session.
             session_id = _create_session_for_agent(cfg, display.model or cfg.model, display)
             current_agent = Agent(cfg, client, display, prompt_fn=prompt_fn, session_id=session_id)
@@ -616,32 +556,27 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         if line == "/status":
             display.status(cfg.permission_mode)
             continue
-        if line == "/plan":
-            # Show active plan progress
-            plan = current_agent.tool_ctx.plan
-            if plan:
-                display.plan_panel(plan.to_dict())
-            else:
-                display.info("no active plan")
-            continue
-        if line == "/exit-plan":
-            plan = current_agent.tool_ctx.plan
-            await _show_exit_plan(cfg, display, plan.to_dict() if plan else None)
-            continue
         if line.startswith("/init"):
             _, _, rest = line.partition(" ")
             summaries = cfg.index_summaries and "--no-summaries" not in rest.split()
-            await _run_init(cfg, client, display, summaries=summaries)
+            # Fault-isolate: a mid-build indexing failure must not kill the
+            # whole REPL. Ctrl+C returns cleanly to the prompt.
+            try:
+                await _run_init(cfg, client, display, summaries=summaries)
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                display.warn("[index] /init cancelled")
+            except Exception as e:  # noqa: BLE001
+                display.error(f"[index] /init failed: {e}")
             continue
         if line.startswith("/mode"):
             _, _, rest = line.partition(" ")
             rest = rest.strip()
-            if rest in ("plan", "edits", "yolo"):
+            if rest in ("edits", "yolo"):
                 cfg.permission_mode = rest
                 display.set_mode(rest)
                 display.info(f"mode → {rest}")
             else:
-                display.warn("usage: /mode plan|edits|yolo")
+                display.warn("usage: /mode edits|yolo")
             continue
         if line.startswith("/mcp"):
             _, _, mcp_rest = line.partition(" ")
@@ -739,13 +674,6 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
         except LLMError as e:
             display.error(f"LLM error: {e}")
             continue
-
-        try:
-            async with cycler:
-                await _auto_execute_plan(current_agent, cfg, display, timeout)
-        except (AgentCancelled, KeyboardInterrupt):
-            display.flush_streaming_text()
-            display.warn("cancelled")
 
 
 async def _handle_mcp_command(rest: str, display: Display) -> None:
@@ -879,3 +807,22 @@ async def _run_init(cfg: Config, client: Client, display: Display, *, summaries:
     from squishy.index.store import index_path
 
     display.info(f"[index] saved → {index_path(cfg.working_dir)}")
+
+    # The call/import/inherit graph, built from the same tree in the same
+    # command. Kept separate from the index because it answers different
+    # questions (who calls this, what breaks if I change it) and because it is
+    # Python-only, while the index covers every language.
+    display.info("[graph] building…")
+    try:
+        from squishy.graph import build_repo_graph, graph_path
+
+        graph = build_repo_graph(cfg.working_dir)
+        s = graph.stats()
+        display.info(
+            f"[graph] {s['nodes']} nodes, {s['edges']} edges → "
+            f"{graph_path(cfg.working_dir)}"
+        )
+    except Exception as e:  # noqa: BLE001
+        # A repo with no Python, or one that fails to parse, still gets a
+        # working index — the graph is an enhancement, not a prerequisite.
+        display.warn(f"[graph] skipped: {e}")

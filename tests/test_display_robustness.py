@@ -57,25 +57,6 @@ def test_write_preview_handles_brackets():
     assert "arr[0]" in out
 
 
-def test_plan_panel_handles_brackets_in_problem_and_steps():
-    d, buf = _capture_display()
-    d.plan_panel({
-        "plan": "Fix [bug-123]",
-        "problem": "list[int] confusion in foo[bar]",
-        "solution": "use dict[str, list[int]] instead",
-        "steps": [
-            {"description": "rewrite foo[0] handler", "status": "done"},
-            "patch bar[1] callsite",
-        ],
-        "files_to_create": ["new[file].py"],
-        "files_to_modify": ["mod[ule].py"],
-    })
-    out = buf.getvalue()
-    # All bracketed strings must survive.
-    assert "list[int]" in out
-    assert "foo[0]" in out
-    assert "mod[ule].py" in out
-    assert "[bug-123]" in out
 
 
 def test_turn_header_handles_brackets_in_brief():
@@ -107,4 +88,25 @@ def test_flush_streaming_text_skips_truly_empty_buffer():
     d.flush_streaming_text()
     assert d._stream_buffer == ""
     # No live ever started, no print ever happened.
-    assert "" == buf.getvalue() or buf.getvalue().strip() == ""
+    assert buf.getvalue() == "" or buf.getvalue().strip() == ""
+
+
+def test_status_lines_keep_their_bracketed_tags():
+    """`[index] walking…` must not print as ` walking…`.
+
+    Rich reads square brackets as markup, so every tagged status line lost its
+    tag — the one piece of information that says which subsystem is talking.
+    `run_command`'s sandbox badge already had to escape by hand; doing it in
+    `info`/`warn`/`error` fixes the whole class.
+    """
+    from rich.console import Console
+
+    from squishy.display import Display
+
+    d = Display()
+    d.console = Console(file=io.StringIO(), width=100, force_terminal=False)
+    d.info("[index] 55 files, 517 symbols")
+    d.warn("[graph] skipped: no python files")
+    out = d.console.file.getvalue()
+    assert "[index]" in out
+    assert "[graph]" in out

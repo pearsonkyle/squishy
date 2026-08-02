@@ -131,8 +131,17 @@ def _build_dir_tree(file_nodes: list[Node], root_path: Path) -> Node:
             name=os.path.basename(d) if d else root_path.name or ".",
             path=d,
         )
- 
-    # Ensure every ancestor directory exists.
+
+    # Always seed the repo-root ("") node. Without it, a repo whose root holds
+    # no indexable file (only subdirs / dotfiles / binaries) has no "" dir, so
+    # the attach phase below promotes every top-level dir into `roots` and
+    # `roots[0]` keeps only the first — silently dropping all other subtrees.
+    if "" not in dir_nodes:
+        dir_nodes[""] = Node(
+            id="dir:.", kind="dir", name=root_path.name or ".", path="",
+        )
+
+    # Ensure every ancestor directory exists (stop at the "" root, now seeded).
     for d in list(dir_nodes.keys()):
         parent = os.path.dirname(d)
         while parent and parent not in dir_nodes:
@@ -213,7 +222,7 @@ async def _build_index_async(
     file_nodes: list[Node] = []
     by_ext: dict[str, int] = defaultdict(int)
     symbol_count = 0
-    for rec, (node, count) in zip(records, results):
+    for rec, (node, count) in zip(records, results, strict=False):
         by_ext[rec.ext or "<none>"] += 1
         if node is not None:
             file_nodes.append(node)

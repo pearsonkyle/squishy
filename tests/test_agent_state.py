@@ -5,9 +5,10 @@ from squishy.agent_state import (
     extract_problem_files,
     is_test_command,
     path_matches_problem,
+)
+from squishy.agent_state import (
     test_covers_fail_to_pass as _test_covers_fail_to_pass,
 )
-
 
 # -- _test_covers_fail_to_pass ------------------------------------------------
 
@@ -111,3 +112,22 @@ class TestPathMatchesProblem:
 
     def test_backslash_normalized(self):
         assert path_matches_problem("src\\utils.py", {"src/utils.py"}) is True
+
+
+# -- #4: pytest-substring false positives --------------------------------------
+
+def test_is_test_command_ignores_pytest_in_commit_message():
+    from squishy.agent_state import is_test_command
+    assert is_test_command('git commit -m "fix pytest failure"') is False
+    assert is_test_command("echo running pytest soon") is False
+    assert is_test_command("grep pytest setup.cfg") is False
+
+
+def test_f2p_coverage_rejects_non_run_pytest():
+    from squishy.agent_state import f2p_files_in_command
+    f2p = ["tests/a.py::t1", "tests/b.py::t2"]
+    assert f2p_files_in_command('git commit -m "pytest"', f2p) == set()
+    assert f2p_files_in_command("pytest --version", f2p) == set()
+    assert f2p_files_in_command("pytest --collect-only", f2p) == set()
+    # A real bare run still covers the whole suite.
+    assert f2p_files_in_command("pytest -x", f2p) == {"tests/a.py", "tests/b.py"}

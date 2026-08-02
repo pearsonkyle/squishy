@@ -4,17 +4,25 @@ Ported from atlas-proxy/project.go and atlas-proxy/agent.go:buildSystemPrompt.
 """
  
 from __future__ import annotations
- 
+
 import json
 import os
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from squishy.graph import has_graph
 from squishy.index.store import has_index
+from squishy.tokens import (
+    CHARS_PER_TOKEN,
+    PER_MSG_OVERHEAD,
+    estimate_message_tokens,
+    message_chars,
+)
+from squishy.tool_restrictions import get_profile_tools, profile_shows
 from squishy.tools.fs import SKIP_DIRS
 
- 
+
 @dataclass
 class ProjectInfo:
     language: str = "unknown"
@@ -95,6 +103,7 @@ def build_system_prompt(
     project: ProjectInfo,
     thinking: bool = False,
     mode: str = "edits",
+    profile: str = "standard",
 ) -> str:
     """Assemble the system prompt.
 
@@ -112,12 +121,15 @@ def build_system_prompt(
     thinking_line = "" if thinking else "Do not emit <think> blocks. Be concise.\n"
 
     has_idx = has_index(cwd)
-    rules = _rules_block(has_idx)
-    mode_block = _mode_block(mode, cwd)
+    # A graph on disk is not enough: `minimal` and `shell` never show
+    # `explore`, and recommending it there is an instruction the model has no
+    # way to follow. Ask what the model will actually see.
+    has_gr = has_graph(cwd) and profile_shows(profile, "explore")
+    rules = _rules_block(has_idx, profile, has_graph=has_gr)
+    mode_block = _mode_block(mode, cwd, profile)
     project_line = _project_line(project)
     index_block = _index_header(cwd)
     top_files_block = "" if has_idx else _top_level_files_block(cwd)
-    mcp_block = _mcp_block()
     instructions_block = load_agent_instructions(cwd)
 
     parts = [
@@ -133,19 +145,36 @@ def build_system_prompt(
     parts = [p for p in parts if p]
     body = "\n\n".join(parts)
     # Tail blocks already start with their own leading "\n" or are empty.
-    return body + index_block + top_files_block + mcp_block + instructions_block
+    # MCP tools are NOT listed in prose here: they're already in the tool
+    # schema (with names + descriptions), so a prose block would only
+    # duplicate them and waste context.
+    return body + index_block + top_files_block + instructions_block
 
 
-def _rules_block(has_idx: bool) -> str:
+# One line, because it has to earn its place in every request. It says the
+# three things that changed behavior in the A/B runs: call it first, one call
+# answers the whole "how does this work" question, and trust the answer
+# instead of re-reading the file to confirm it.
+_GRAPH_LINE = (
+    "- `explore(query=...)` answers a code question in one call — the symbol's "
+    "source, its callers and callees, and what depends on it. Reach for it "
+    "before crawling files, and trust what it returns.\n"
+)
+
+
+def _rules_block(
+    has_idx: bool, profile: str = "standard", *, has_graph: bool = False
+) -> str:
     """Core rules. Recall guidance is folded in here so it's not
     repeated inside every mode block."""
+    if profile == "shell":
+        return _shell_rules_block()
+    if profile in ("minimal", "graph"):
+        return _minimal_rules_block(has_idx, has_graph=has_graph)
     recall_line = (
         "- Use `recall(query=...)` to navigate the codebase before reading files; an index lives at `.squishy/index.json`."
         if has_idx
         else "- No repo index yet. Use targeted `read_file`/`list_directory`/`search_files` to navigate; suggest `/init` to enable `recall`."
-    )
-    plan_line = (
-        "- For non-trivial work call `plan_task` early; after the plan is approved, call `update_plan(step_index=N, status=\"done\")` per step and `finish_plan` once at the end. Don't repeat `update_plan` on the same step."
     )
     return (
         "## Rules\n"
@@ -156,8 +185,57 @@ def _rules_block(has_idx: bool) -> str:
         "- Don't re-read a file you've already read unless you need a different range.\n"
         "- `@filename` in user input injects that file inline wrapped in `<file>` tags.\n"
         "- When the task is done, reply with a plain-text summary and no tool call.\n"
-        f"{recall_line}\n"
-        f"{plan_line}"
+        f"{_GRAPH_LINE if has_graph else ''}"
+        f"{recall_line}"
+    )
+
+
+def _shell_rules_block() -> str:
+    """Rules for the `shell` profile — one tool, so almost nothing to say.
+
+    Everything happens through `run_command`, which is the interface these
+    models have seen most. The only thing worth stating is how to edit a file
+    without an edit tool, since that is the one operation a shell makes
+    awkward.
+    """
+    return (
+        "## Rules\n"
+        "- `run_command` is your only tool. Use it to read, search, edit, and "
+        "run tests.\n"
+        "- Inspect code with `cat`, `sed -n '10,40p' file`, `grep -rn`, `ls`.\n"
+        "- To change a file, apply a patch or rewrite it — e.g. "
+        "`python - <<'EOF'` with a small script, or `cat > file <<'EOF'`. "
+        "Verify the change with `git diff` afterwards.\n"
+        "- Commands run in the project root; no `cd` prefix needed.\n"
+        "- When the task is done, reply with a plain-text summary and no tool call."
+    )
+
+
+def _minimal_rules_block(has_idx: bool, *, has_graph: bool = False) -> str:
+    """Rules for the `minimal` tool profile.
+
+    Deliberately short. The profile exposes `run_command`, `read_file`,
+    `edit_file`, `write_file` (plus `recall` when an index exists), so there
+    is nothing to say about planning, phases, or the browsing tools — the
+    shell covers listing, globbing, and grepping. Everything a tool schema
+    already documents is omitted rather than restated.
+    """
+    recall_line = (
+        "- `recall(query=...)` searches a prebuilt index of this repo — use it "
+        "to locate code before reading files.\n"
+        if has_idx else ""
+    )
+    return (
+        "## Rules\n"
+        "- Read a file before you edit it.\n"
+        "- `edit_file` for existing files, `write_file` only for new ones.\n"
+        "- Use relative paths; the shell already runs in the working dir.\n"
+        "- `run_command` covers listing, globbing, and grepping — use it for "
+        "anything there isn't a dedicated tool for.\n"
+        f"{_GRAPH_LINE if has_graph else ''}"
+        f"{recall_line}"
+        "- Verify your change by running the relevant tests.\n"
+        "- When the task is done, reply with a plain-text summary and no tool call."
     )
 
 
@@ -215,73 +293,59 @@ def load_agent_instructions(cwd: str) -> str:
     return "".join(parts)
 
 
-def _mode_block(mode: str, cwd: str = "") -> str:
+def _mode_block(mode: str, cwd: str = "", profile: str = "standard") -> str:
     """Per-mode rules.
 
-    Each block is the *delta* on top of `## Rules` — anything already
-    in the core ruleset (recall, planning, update_plan, etc.) is not
-    repeated. Workflow examples and JSON shape blocks were dropped
-    because the tool schemas already document them.
+    Each block is the *delta* on top of `## Rules` — anything already in the
+    core ruleset is not repeated. Workflow examples and JSON shape blocks were
+    dropped because the tool schemas already document them.
+
+    The bench block is now the same short task framing for every profile. It
+    used to narrate a five-phase state machine to the model; that machine is
+    gone, and describing it cost ~250 tokens on every single request.
     """
-    if mode == "plan":
-        return (
-            "## Mode: plan (read-only)\n"
-            "- For any task that touches files, call `plan_task` first; don't write prose before the plan is approved.\n"
-            "- Skip `plan_task` only for trivial reads (e.g. one file, no edits).\n"
-            "- Aim for `plan_task` within 2-3 turns: recall → 1-2 targeted reads → plan.\n"
-            "- Prefer the dedicated tools (`list_directory`, `read_file`, `search_files`, `glob_files`) — they always work. `run_command` accepts a small read-only allowlist (linters, `git` reads, `pytest --collect-only`, common inspection binaries); the dispatcher lists the exact set if you guess wrong.\n"
-            "- The shell already runs in the project root — don't prefix commands with `cd /abs/path && …` (use a relative path or pass `cwd`). `python -c \"…\"` and other arbitrary scripts are rejected; use the dedicated read tools instead.\n"
-            "- After approval the user switches you into edits mode to execute the plan."
-        )
+    # One bench block for every profile, with the `save_note` line added only
+    # where that tool is actually in the schema. It used to be two near-copies
+    # differing by exactly that line, and adding the `graph` profile silently
+    # picked the copy that names a tool `graph` does not expose — the
+    # duplication is what let that happen.
     if mode == "bench":
-        return (
-            "## Mode: bench (phase-gated)\n"
-            "- Tools are managed by phase. You progress through phases automatically:\n"
-            "  1. **explore** — read-only tools + run_command. Use `recall` to search the index, "
-            "read relevant files, run the failing tests to see the error.\n"
-            "  2. **plan** — only `plan_task`, `save_note`, `recall`. Call `plan_task` with your fix strategy.\n"
-            "  3. **execute** — editing tools available. Read the target file, apply your fix with `edit_file`, "
-            "then run tests. Call `update_plan` after completing each step.\n"
-            "  4. **verify** — check test results. If tests pass, call `finish_plan`. "
-            "If tests fail, you return to execute.\n"
-            "  5. **done** — the agent finishes automatically.\n"
-            "- Phase transitions happen automatically based on your actions.\n"
-            "- Do NOT create reproduction scripts or new test files. Run the LISTED failing tests.\n"
-            "- Do NOT fix import/environment errors — they are NOT the bug.\n"
-            "- Fix the SOURCE code, not the tests.\n"
-            "- If the listed failing tests are not found, study the problem statement for expected behavior.\n"
-            "- Pay close attention to function signatures, argument order, and types.\n"
-            "- Use `save_note` for key findings so they survive context compaction.\n"
-            "- After editing, run the specific test that exercises the bug. `show_diff` before finishing."
+        note_line = (
+            "- Use `save_note` for key findings so they survive context "
+            "compaction.\n"
+            if profile_shows(profile, "save_note") else ""
         )
+        return (
+            "## Task\n"
+            "- Change the SOURCE code that implements the behavior. Editing "
+            "tests is never a fix.\n"
+            "- Reproduce the failure before you fix it: the smallest snippet "
+            "that triggers it, under /tmp so it stays out of the diff. That "
+            "reproduction is your oracle — unlike the graded test, it cannot "
+            "already be green.\n"
+            "- Don't add test files to the repo. Run the tests named in the "
+            "task; if one doesn't exist yet, implement the behavior its name "
+            "implies rather than hunting for it.\n"
+            "- A missing third-party package is an environment problem, not "
+            "your bug. But an ImportError naming a symbol from THIS repo is the "
+            "task telling you what to add — create it.\n"
+            + note_line +
+            "- Do not stop until you have actually edited a non-test source "
+            "file. Ending with no edit is a failed run."
+        )
+    # Narrow profiles get no per-mode prose at all: the delta they would carry
+    # is about tools they do not have.
+    if get_profile_tools(profile) is not None:
+        return ""
     if mode == "yolo":
         return (
             "## Mode: yolo\n"
-            "- All tools available, no approval prompts — be careful with destructive commands.\n"
-            "- For non-trivial work follow the plan-then-execute loop from `## Rules` (plan_task → update_plan per step → finish_plan)."
+            "- All tools available, no approval prompts — be careful with "
+            "destructive commands."
         )
     return (
         "## Mode: edits\n"
-        "- `run_command` requires per-call user approval.\n"
-        "- If a plan was approved, follow it (see `## Rules` for the update_plan / finish_plan flow)."
-    )
-
-
-def _mcp_block() -> str:
-    """Return a system prompt section listing available MCP tools."""
-    try:
-        from squishy.mcp.tools import get_mcp_tools
-        tools = get_mcp_tools()
-    except Exception:
-        return ""
-    if not tools:
-        return ""
-    lines = [f"- `{t.name}`: {t.description}" for t in tools]
-    return (
-        "\n## MCP Tools\n"
-        "External tools available via MCP (Model Context Protocol):\n"
-        + "\n".join(lines) + "\n"
-        "Call these tools by name like any built-in tool.\n"
+        "- `run_command` requires per-call user approval."
     )
 
 
@@ -486,6 +550,83 @@ def trim_history(messages: list[dict[str, Any]], max_messages: int = 10) -> list
     return system + first_user + tail
 
 
+def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Enforce the assistant↔tool pairing invariant on an outgoing message list.
+
+    Two failure modes exist and different sites can introduce either:
+
+    * **Forward orphan** — an ``assistant`` message with ``tool_calls`` whose
+      paired ``tool`` responses are missing (trimming/compaction dropped them).
+      Handled by :func:`_strip_orphan_assistant_tool_calls`.
+    * **Reverse orphan** — a ``role="tool"`` message whose ``tool_call_id`` was
+      never declared by any preceding ``assistant`` ``tool_calls`` (a synthetic
+      result injected without its paired assistant call, or a tool message left
+      at the head of a compaction split). Strict endpoints (Azure/OpenAI) 400 on
+      both. This drops reverse orphans.
+
+    Runs once immediately before every ``client.complete`` in the loop, so the
+    transcript is well-formed regardless of which nudge/gate mutated it. Returns
+    a new list; does not mutate the input.
+    """
+    msgs = _strip_orphan_assistant_tool_calls(messages)
+    declared: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for m in msgs:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    declared.add(tc["id"])
+            out.append(m)
+        elif m.get("role") == "tool":
+            tcid = m.get("tool_call_id", "")
+            if tcid and tcid in declared:
+                out.append(m)
+            # else: reverse orphan — drop it.
+        else:
+            out.append(m)
+    return _merge_adjacent_same_role(out)
+
+
+def _merge_adjacent_same_role(
+    msgs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Coalesce directly-adjacent same-role user/assistant messages.
+
+    Several gates can each append a ``[system]`` nudge (they are sent as
+    ``role="user"``) within one turn, producing consecutive user messages.
+    Templates that require strict alternation — Mistral/Ministral among them —
+    reject the whole request with "conversation roles must alternate user and
+    assistant roles", which surfaced live as an APIError mid-run. Merging is
+    also a small token win.
+
+    Assistant messages are merged only when neither carries ``tool_calls``, so
+    tool-call pairing is never disturbed. Tool messages are left untouched.
+    """
+    out: list[dict[str, Any]] = []
+    for m in msgs:
+        role = m.get("role")
+        if role not in ("user", "assistant") or not out:
+            out.append(m)
+            continue
+        prev = out[-1]
+        if prev.get("role") != role:
+            out.append(m)
+            continue
+        if role == "assistant" and (prev.get("tool_calls") or m.get("tool_calls")):
+            out.append(m)
+            continue
+        prev_content = prev.get("content")
+        cur_content = m.get("content")
+        if not isinstance(prev_content, str) or not isinstance(cur_content, str):
+            out.append(m)
+            continue
+        merged = dict(prev)
+        joined = "\n\n".join(p for p in (prev_content, cur_content) if p)
+        merged["content"] = joined
+        out[-1] = merged
+    return out
+
+
 def _strip_orphan_assistant_tool_calls(
     msgs: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
@@ -547,24 +688,10 @@ def _strip_orphan_assistant_tool_calls(
 # ── Layer 2: LLM-based context compaction ────────────────────────────────
 
 
-def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
-    """Estimate token count from message contents.
-
-    Uses ~3.5 chars/token (better for code-heavy content) plus 4-token
-    overhead per message for role/formatting added by the API.
-    """
-    total = 0
-    for m in messages:
-        chars = 0
-        content = m.get("content", "")
-        if isinstance(content, str):
-            chars += len(content)
-        for tc in m.get("tool_calls", []):
-            if isinstance(tc, dict):
-                func = tc.get("function", {})
-                chars += len(func.get("name", "")) + len(func.get("arguments", ""))
-        total += int(chars / 3.5) + 4  # per-message overhead
-    return total
+# Token estimation lives in squishy.tokens (single source of the 3.5
+# chars/token heuristic). Kept as a module-local alias for readability and
+# back-compat with any importer of _estimate_message_tokens.
+_estimate_message_tokens = estimate_message_tokens
 
 
 def find_compaction_split(
@@ -575,18 +702,11 @@ def find_compaction_split(
     Walks backwards from end, accumulating token estimates, and returns
     the index where the recent portion reaches keep_ratio of total tokens.
     """
-    total = _estimate_message_tokens(messages)
+    total = estimate_message_tokens(messages)
     target = int(total * keep_ratio)
     running = 0
     for i in range(len(messages) - 1, -1, -1):
-        m = messages[i]
-        content = m.get("content", "")
-        chars = len(content) if isinstance(content, str) else 0
-        for tc in m.get("tool_calls", []):
-            if isinstance(tc, dict):
-                func = tc.get("function", {})
-                chars += len(func.get("name", "")) + len(func.get("arguments", ""))
-        running += int(chars / 3.5) + 4
+        running += int(message_chars(messages[i]) / CHARS_PER_TOKEN) + PER_MSG_OVERHEAD
         if running >= target:
             return i
     return 0
@@ -746,6 +866,12 @@ async def compact_messages(
     # Re-inject the protected first user message right after system messages
     # so it survives compaction and remains visible to the model.
     protected_msgs = [protected] if protected is not None else []
+    # The split is chosen purely by token count, so `recent` can begin with a
+    # `role="tool"` message whose assistant tool_calls was summarized into
+    # `old` — a reverse orphan the strict endpoints reject. Drop any such
+    # leading tool messages (mirrors trim_history's tail guard).
+    while recent and recent[0].get("role") == "tool":
+        recent = recent[1:]
     # Final orphan-strip on `recent`: the anchored-pull above tries to keep
     # tool-result pairs together, but if any tool messages were dropped
     # mid-conversation an orphan can remain.  Strict endpoints (Azure) reject.

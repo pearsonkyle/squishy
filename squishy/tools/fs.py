@@ -13,8 +13,10 @@ import fnmatch
 import os
 import re
 import shutil
+import tempfile
 from typing import Any
  
+from squishy.tool_restrictions import profile_shows
 from squishy.tools.base import Tool, ToolContext, ToolResult
  
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next"}
@@ -40,10 +42,225 @@ def _safe_resolve(path: str, cwd: str) -> tuple[str, str | None]:
     try:
         os.path.commonpath([real_abs, real_cwd])
     except ValueError:
-        return "", f"path outside working directory: {path}"
+        return "", _escape_error(path, cwd)
     if not (real_abs == real_cwd or real_abs.startswith(real_cwd + os.sep)):
-        return "", f"path outside working directory: {path}"
+        return "", _escape_error(path, cwd)
     return abs_path, None
+
+
+# Both the system temp directory and a literal /tmp. They are the same
+# directory on Linux (so, in every bench container), but not on macOS, where
+# `gettempdir()` is a per-user path under /var/folders and /tmp resolves to
+# /private/tmp. Every prompt in this repo says "/tmp" — honoring only
+# `gettempdir()` would make the instruction work in the container and fail on
+# the machine the developer is testing on.
+_SCRATCH_DIRS = tuple({
+    os.path.realpath(p)
+    for p in (tempfile.gettempdir(), "/tmp")
+    if os.path.isdir(p)
+})
+
+
+def _is_scratch(path: str) -> bool:
+    """True for an absolute path under a scratch directory.
+
+    The bench prompt and `write_file`'s own refusal both tell the model to put
+    reproduction scripts in /tmp, so they stay out of the graded diff. Until
+    this existed, following that instruction returned "path outside working
+    directory" — the harness refusing the exact action it had just demanded,
+    which is the failure mode this codebase keeps rediscovering.
+    """
+    if not os.path.isabs(path):
+        return False
+    real = os.path.realpath(os.path.normpath(path))
+    return any(
+        real == root or real.startswith(root + os.sep) for root in _SCRATCH_DIRS
+    )
+
+
+def _resolve_writable(path: str, cwd: str) -> tuple[str, str | None, bool]:
+    """``(abs_path, error, is_scratch)`` — repo paths plus the scratch dir."""
+    if _is_scratch(path):
+        return os.path.normpath(path), None, True
+    abs_path, err = _safe_resolve(path, cwd)
+    return abs_path, err, False
+
+
+# Directories never worth walking when hunting for a mistyped path.
+_MISS_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", ".squishy", "node_modules", "__pycache__",
+    "venv", ".venv", "target", "build", "dist", ".tox", ".mypy_cache",
+    ".pytest_cache", "vendor", ".idea", ".gradle",
+})
+_MISS_MAX_CANDIDATES = 5
+
+
+def _path_candidates(path: str, cwd: str) -> list[str]:
+    """Plausible cwd-relative paths the model *meant* by *path*.
+
+    A bare "file not found" is a dead end: observed live, a model that wanted
+    `vyper/ast/natspec.py` asked for `vyper/vyper/ast/natspec.py` (the repo
+    directory and the package share a name) and burned ~20 turns never
+    recovering, because nothing in the error told it what was wrong.
+
+    Two cheap, high-yield repairs, then a bounded basename search:
+      * strip a leading component that duplicates the repo directory name;
+      * reinterpret a rooted path as repo-relative (`/vyper/x` -> `x`).
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(rel: str) -> None:
+        rel = rel.strip("/")
+        if not rel or rel in seen:
+            return
+        if os.path.isfile(os.path.join(cwd, rel)):
+            seen.add(rel)
+            out.append(rel)
+
+    root = os.path.basename(os.path.realpath(cwd))
+    parts = [p for p in path.replace("\\", "/").split("/") if p not in ("", ".")]
+
+    # `<root>/rest` and `/<root>/rest` -> `rest`
+    if parts and parts[0] == root:
+        add("/".join(parts[1:]))
+    # A rooted path that is really repo-relative.
+    if os.path.isabs(path):
+        add("/".join(parts))
+        for i in range(1, len(parts)):
+            add("/".join(parts[i:]))
+    # Any doubled component (`a/a/b` -> `a/b`).
+    for i in range(len(parts) - 1):
+        if parts[i] == parts[i + 1]:
+            add("/".join(parts[:i] + parts[i + 1:]))
+
+    if out:
+        return out[:_MISS_MAX_CANDIDATES]
+
+    # Fall back to finding the basename anywhere in the tree.
+    target = parts[-1] if parts else ""
+    if not target:
+        return []
+    for dirpath, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [d for d in dirnames
+                       if d not in _MISS_SKIP_DIRS and not d.startswith(".")]
+        if target in filenames:
+            add(os.path.relpath(os.path.join(dirpath, target), cwd))
+            if len(out) >= _MISS_MAX_CANDIDATES:
+                break
+    return out[:_MISS_MAX_CANDIDATES]
+
+
+def _escape_error(path: str, cwd: str) -> str:
+    """An 'outside the working directory' message with a way forward.
+
+    Absolute paths the model invents are usually the right file under a wrong
+    root (`/test/fast-check/src/x.ts` for a repo checked out elsewhere). The
+    refusal must stand — but pointing at the real path costs nothing and saves
+    the model from guessing another root.
+    """
+    base = f"path outside working directory: {path}"
+    candidates = _path_candidates(path, cwd)
+    if candidates:
+        return f"{base}. Did you mean: {', '.join(candidates)}?"
+    return f"{base}. Paths must be relative to {cwd}."
+
+
+def _not_found_error(path: str, cwd: str, abs_path: str) -> str:
+    """A 'file not found' the model can actually act on."""
+    if os.path.isdir(abs_path):
+        try:
+            entries = sorted(os.listdir(abs_path))[:20]
+        except OSError:
+            entries = []
+        listing = f" Contains: {', '.join(entries)}" if entries else ""
+        return (f"{path} is a directory, not a file. Pass a file path, or use "
+                f"`list_directory` to browse it.{listing}")
+    candidates = _path_candidates(path, cwd)
+    if candidates:
+        return (f"file not found: {path}. Did you mean: "
+                f"{', '.join(candidates)}?")
+    # `foo.py` that is really the package `foo/`. Common where a module was
+    # split into a package: observed live, a model asked for
+    # `src/wtforms/widgets.py` four times across two arms, each time getting a
+    # bare "file not found" while `src/wtforms/widgets/` sat right there. The
+    # module list is the actual answer, so return it rather than the generic
+    # "paths are relative to..." boilerplate.
+    pkg = _package_for_module(path, cwd)
+    if pkg is not None:
+        pkg_path, modules = pkg
+        listing = f" It contains: {', '.join(modules)}." if modules else ""
+        return (f"file not found: {path}, but `{pkg_path}` is a package "
+                f"directory — that module was split into a package.{listing}")
+    return (f"file not found: {path}. Paths are relative to the working "
+            f"directory ({cwd}) — don't prefix them with the repo name.")
+
+
+def _package_for_module(path: str, cwd: str) -> tuple[str, list[str]] | None:
+    """If ``path`` looks like ``foo.py`` and ``foo/`` is a directory, return
+    ``(foo/, [its module files])``. Otherwise None.
+
+    Applies the same leading-component repairs as :func:`_path_candidates`, so
+    ``/wtforms/src/wtforms/widgets.py`` resolves against ``src/wtforms/widgets/``
+    even though the model rooted it at the repo name.
+    """
+    base, ext = os.path.splitext(path)
+    if not ext or not base:
+        return None
+
+    root = os.path.basename(os.path.realpath(cwd))
+    parts = [p for p in base.replace("\\", "/").split("/") if p not in ("", ".")]
+    if not parts:
+        return None
+
+    rels: list[str] = ["/".join(parts)]
+    if parts[0] == root:
+        rels.append("/".join(parts[1:]))
+    if os.path.isabs(base):
+        rels.extend("/".join(parts[i:]) for i in range(1, len(parts)))
+
+    for rel in rels:
+        rel = rel.strip("/")
+        if not rel:
+            continue
+        cand = os.path.join(cwd, rel)
+        if os.path.isdir(cand):
+            try:
+                names = sorted(
+                    n for n in os.listdir(cand)
+                    if n.endswith(ext) and not n.startswith(".")
+                )[:20]
+            except OSError:
+                names = []
+            return rel, names
+    return None
+
+
+def _not_a_dir_error(path: str, cwd: str, abs_path: str) -> str:
+    """A 'not a directory' the model can act on.
+
+    Two real cases from the sweep: the model passed a *file* where a directory
+    was wanted, and it dropped an extension (`src/printer` for
+    `src/printer.ts`). A bare "not a directory" leaves it guessing.
+    """
+    if os.path.isfile(abs_path):
+        return (f"{path} is a file, not a directory. Use `read_file` to read "
+                f"it, or pass its parent directory.")
+    candidates = _path_candidates(path, cwd)
+    if candidates:
+        return (f"not a directory: {path}. These files exist though: "
+                f"{', '.join(candidates)} — use `read_file` for those.")
+    parent = os.path.dirname(path.rstrip("/"))
+    parent_abs = os.path.join(cwd, parent) if parent else cwd
+    if os.path.isdir(parent_abs):
+        try:
+            near = sorted(os.listdir(parent_abs))[:20]
+        except OSError:
+            near = []
+        if near:
+            return (f"not a directory: {path}. {parent or '.'} contains: "
+                    f"{', '.join(near)}")
+    return f"not a directory: {path}. Paths are relative to {cwd}."
 
 
 def _unescape_str(s: str) -> str:
@@ -79,10 +296,51 @@ def _collapse_double_backslash(s: str) -> str:
     return s.replace("\\\\", "\\") if "\\\\" in s else s
 
 
+# Fuzzy-match confidence tiers for a failed `old_str`. Above _FUZZY_STRONG the
+# block is almost certainly the intended one; between the two it is offered
+# with an explicit caveat.
+_FUZZY_STRONG = 0.85
+_FUZZY_WEAK = 0.6
+
+def _requested_span(offset: int, limit: Any) -> tuple[int, int]:
+    """(start, end) line range for a read. `end` is open-ended without a limit."""
+    start = max(0, int(offset or 0))
+    if isinstance(limit, int) and limit > 0:
+        return start, start + limit
+    return start, 1 << 30
+
+
+def _spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
+
+
+# Overlapping re-reads of the same region tolerated before read_file refuses.
+_MAX_OVERLAPPING_READS = 4
+
+_UNDO_STACK_CAP = 50
+# Identical cached reads tolerated before read_file refuses (1 = the first
+# repeat is served from cache, the next one errors).
+_MAX_CACHE_HITS = 2
+
+
+def _push_undo(ctx: ToolContext, abs_path: str, original: str | None) -> None:
+    """Record a reversible mutation, bounding the stack so full pre-edit file
+    contents don't accumulate for the whole process lifetime.
+
+    ``original=None`` marks a newly-created file (undo removes it).
+    """
+    ctx.undo_stack.append((abs_path, original))
+    if len(ctx.undo_stack) > _UNDO_STACK_CAP:
+        del ctx.undo_stack[: len(ctx.undo_stack) - _UNDO_STACK_CAP]
+
+
 def _invalidate_read_cache(ctx: ToolContext, abs_path: str) -> None:
     """Drop any cached reads for *abs_path* after a mutating write/edit."""
     for key in [k for k in ctx.files_read_meta if k[0] == abs_path]:
         del ctx.files_read_meta[key]
+    # Drop repeat counters too: after a real change, re-reading is legitimate.
+    for key in [k for k in ctx.read_cache_hits if k[0] == abs_path]:
+        del ctx.read_cache_hits[key]
     ctx.files_read.pop(abs_path, None)
     # files_read is keyed by relative path, so also pop relative form.
     rel_path = os.path.relpath(abs_path, ctx.working_dir)
@@ -112,15 +370,102 @@ def _collect_match_context(
     return "\n".join(out) if out else "(no match context available)"
  
  
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _symbol_hint(ctx: ToolContext, abs_path: str, old_str: str | None) -> str:
+    """Point a failed edit at the real line spans of the symbols it named.
+
+    Returns "" when there is no graph or nothing recognisable, so the caller
+    falls back to its generic advice rather than being blocked by a feature
+    that happens not to be available here.
+    """
+    try:
+        rel = os.path.relpath(abs_path, ctx.working_dir).replace(os.sep, "/")
+    except ValueError:
+        return ""
+    if rel.startswith(".."):
+        return ""
+    from squishy.tools.graph import graph_for
+
+    graph = graph_for(ctx)
+    if graph is None:
+        return ""
+    node = graph.get(rel)
+    if node is None:
+        return ""
+    wanted = set(_IDENT_RE.findall(old_str or ""))
+    children = list(graph.children(rel))
+    named = [c for c in children if c.name in wanted]
+    for child in list(children):
+        named += [m for m in graph.children(child.node_id) if m.name in wanted]
+    if named:
+        lines = "\n".join(
+            f"  {c.name}: lines {c.lineno}-{c.end_lineno}"
+            for c in sorted(named, key=lambda n: n.lineno)[:6]
+        )
+        return (
+            f" The symbols your old_str names are at these exact lines in "
+            f"{rel}:\n{lines}\n"
+            f"Read one of those ranges with read_file(offset/limit) and copy "
+            f"the text verbatim, including indentation."
+        )
+    if children:
+        lines = ", ".join(
+            f"{c.name} (L{c.lineno})"
+            for c in sorted(children, key=lambda n: n.lineno)[:12]
+        )
+        return (
+            f" Nothing in {rel} matches that text. It defines: {lines}. Read "
+            f"the one you meant with read_file(offset/limit) first."
+        )
+    return ""
+
+
+def _outline_for(ctx: ToolContext, abs_path: str) -> str:
+    """The graph's symbol map for a file, or "" when it has none.
+
+    Empty is the safe answer: a file the graph does not cover (not Python, or
+    indexed before it was written) must fall back to a real read rather than
+    being refused.
+    """
+    try:
+        rel = os.path.relpath(abs_path, ctx.working_dir).replace(os.sep, "/")
+    except ValueError:
+        return ""
+    if rel.startswith(".."):
+        return ""
+    from squishy.graph.query import file_outline
+    from squishy.tools.graph import graph_for
+
+    graph = graph_for(ctx)
+    return file_outline(graph, rel) if graph is not None else ""
+
+
 async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     path = args.get("path") or args.get("file_path") or args.get("file")
     if not isinstance(path, str):
         return ToolResult(False, error="`path` is required (string)")
-    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    abs_path, err, _scratch = _resolve_writable(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
+    corrected = ""
     if not os.path.isfile(abs_path):
-        return ToolResult(False, error=f"file not found: {path}")
+        # Reading is side-effect-free, so when exactly one candidate matches we
+        # serve it and say so, rather than spending a turn on a correction
+        # round-trip. Ambiguous or hopeless cases still error, with candidates.
+        cands = (
+            [] if os.path.isdir(abs_path)
+            else _path_candidates(path, ctx.working_dir)
+        )
+        if len(cands) == 1:
+            corrected = cands[0]
+            abs_path, err = _safe_resolve(corrected, ctx.working_dir)
+            if err:
+                return ToolResult(False, error=err)
+        else:
+            return ToolResult(
+                False, error=_not_found_error(path, ctx.working_dir, abs_path))
 
     try:
         offset = int(float(args.get("offset") or 0))
@@ -138,6 +483,23 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     cache_key = (abs_path, offset, limit)
     prior = ctx.files_read_meta.get(cache_key)
     if prior is not None:
+        # Escalate on a loop: the first repeat is answered from cache, but
+        # further identical reads return an ERROR. Serving unlimited successful
+        # cache hits let weak models spin on the same call until the generic
+        # loop detector killed the run (observed live: 8 identical reads).
+        hits = ctx.read_cache_hits.get(cache_key, 0) + 1
+        ctx.read_cache_hits[cache_key] = hits
+        if hits >= _MAX_CACHE_HITS:
+            return ToolResult(
+                False,
+                error=(
+                    f"Refused: you have already read this exact range of '{path}' "
+                    f"{hits + 1} times and the content has not changed. STOP reading. "
+                    "Use what you already have: call `edit_file` to make your change, "
+                    "`run_command` to test, `save_note` to record findings, or reply "
+                    "with a plain-text summary if the task is done."
+                ),
+            )
         return ToolResult(
             True,
             data={
@@ -156,17 +518,28 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             display=f"cache hit ({prior['returned_lines']} lines, already read)",
         )
 
-    # Hard cap: refuse after too many reads of the same path.
-    # Exempt files where edit_file just failed — the model needs fresh content
-    # for an accurate old_str.
-    path_count = ctx.files_read_count.get(abs_path, 0)
-    if path_count >= 5 and abs_path not in ctx.edit_fail_files:
+    # Hard cap: refuse circling back over content the model already has.
+    #
+    # Only *overlapping* re-reads count. Every read reaching this point is a
+    # range not served before (exact repeats returned from the cache above), so
+    # counting all of them punished paging through a large file with
+    # offset/limit — which is precisely what read_file's own description tells
+    # the model to do. That made "read_file: refused" the top tool failure in
+    # two consecutive sweeps (106, then 131).
+    #
+    # Files where edit_file just failed are exempt either way: the model needs
+    # fresh content for an accurate old_str.
+    span = _requested_span(offset, limit)
+    prior_spans = ctx.files_read_spans.get(abs_path, [])
+    redundant = sum(1 for s in prior_spans if _spans_overlap(s, span))
+    if redundant >= _MAX_OVERLAPPING_READS and abs_path not in ctx.edit_fail_files:
         return ToolResult(
             False,
             error=(
-                f"Refused: you have already read '{path}' {path_count} times. "
-                "You have the content — use `save_note` to persist key parts if needed, "
-                "then call `edit_file` with your fix. Do NOT read this file again."
+                f"Refused: you have already read these lines of '{path}' "
+                f"{redundant} times. You have the content — call `edit_file` "
+                f"with your fix, or read a different part of the file with "
+                f"offset/limit."
             ),
         )
 
@@ -180,15 +553,53 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     sliced = lines[offset : offset + limit] if limit is not None else lines[offset:]
     content = "\n".join(sliced)
 
+    # A whole-file read of something too big to return: send the outline.
+    #
+    # Gated on "too big" for a reason that was measured the hard way. A turn
+    # costs 8.5-11k prompt tokens because the whole transcript is resent, while
+    # an outline saves 0.4k on a short file and 3.7k on a long one — so an
+    # outline that forces a follow-up read is a net loss at every size.
+    # Shipping it unconditionally took cfn-lint's graph arm from 20/29/42 tool
+    # calls to 43/48/29 and cost it both its resolves. Above the output cap the
+    # body gets snipped in the middle anyway, so the follow-up read was always
+    # going to happen, and an outline beats a truncated prefix.
+    outline = ""
+    if offset == 0 and limit is None and len(content) > ctx.max_tool_output_chars:
+        outline = _outline_for(ctx, abs_path)
+    if outline:
+        ctx.files_read_count[abs_path] = ctx.files_read_count.get(abs_path, 0) + 1
+        return ToolResult(
+            True,
+            data={
+                "path": path,
+                "outline": outline,
+                "total_lines": len(lines),
+                "note": (
+                    f"{path} is {len(lines)} lines — too long to return in one "
+                    "call. This is its symbol map; read the range you need "
+                    "with offset/limit"
+                    + (
+                        ", or call explore() on a symbol."
+                        if profile_shows(ctx.tool_profile, "explore")
+                        else "."
+                    )
+                ),
+            },
+            display=f"outline ({len(lines)} lines)",
+        )
+
     ctx.files_read[path] = content
     ctx.files_read_meta[cache_key] = {
         "content": content,
         "total_lines": len(lines),
         "returned_lines": len(sliced),
     }
-    # Track total reads per path (regardless of offset/limit).
+    # Track total reads per path (regardless of offset/limit) for the advisory
+    # warning, and the concrete span served for the overlap-based hard cap.
     ctx.files_read_count[abs_path] = ctx.files_read_count.get(abs_path, 0) + 1
     path_reads = ctx.files_read_count[abs_path]
+    served = (span[0], span[0] + len(sliced)) if sliced else span
+    ctx.files_read_spans.setdefault(abs_path, []).append(served)
 
     data: dict[str, Any] = {
         "path": path,
@@ -197,6 +608,14 @@ async def _read_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         "returned_lines": len(sliced),
         "offset": offset,
     }
+    if corrected:
+        # Say what was actually read, so the model uses the right path next
+        # time instead of repeating the miss on its edit call.
+        data["path"] = corrected
+        data["note"] = (
+            f"'{path}' does not exist; read '{corrected}' instead. "
+            f"Use '{corrected}' in your next call."
+        )
     if path_reads >= 3:
         data["warning"] = (
             f"This is read #{path_reads} of '{path}'. You are reading this file "
@@ -215,9 +634,23 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     content = next((args[k] for k in ("content", "text", "data") if k in args and args[k] is not None), None)
     if not isinstance(path, str) or not isinstance(content, str):
         return ToolResult(False, error="`path` and `content` are required strings")
-    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    abs_path, err, scratch = _resolve_writable(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
+
+    if scratch:
+        # Scratch files are throwaway by definition: they never reach the diff,
+        # so the new-files-only rule, the test-file refusal and the
+        # mistyped-path check below are all irrelevant, and enforcing them
+        # would make the second draft of a repro script impossible.
+        os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return ToolResult(
+            True,
+            data={"path": path, "bytes": len(content.encode()), "scratch": True},
+            display=f"wrote {len(content.encode())} bytes to scratch",
+        )
 
     # Hard guard: write_file is for creating NEW files only. Existing files
     # must be modified with edit_file — full rewrites via write_file are the
@@ -247,19 +680,51 @@ async def _write_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             or "repro" in basename or "reproduction" in basename
         )
         if is_test_file:
+            # Refuse the location, not the technique. Reproducing the bug in a
+            # throwaway script is how the failure gets confirmed at all — on
+            # msrest-for-python-43 it is the entire difference between the
+            # reference agent (nine repro snippets, resolved) and this one
+            # (zero, sixty turns, no patch). The only real objection is that a
+            # scratch file inside the repo lands in the graded diff, and /tmp
+            # answers that. Refusing outright and saying "fix the SOURCE code
+            # instead" withdrew the tool and the technique together.
             return ToolResult(
                 False,
                 error=(
-                    f"write_file refused — creating test/reproduction files is not "
-                    f"allowed in bench mode. Fix the SOURCE code instead.\n"
-                    f"Use `edit_file` on the existing source file to apply your fix."
+                    f"write_file refused — {path} is inside the repo, so it would "
+                    "land in the graded diff.\n"
+                    "Write it under /tmp instead and run it from there:\n"
+                    f'  write_file(path="/tmp/{os.path.basename(abs_path)}", content=...)\n'
+                    '  run_command(command="python /tmp/'
+                    f'{os.path.basename(abs_path)}")\n'
+                    "The fix itself still belongs in the source file — use `edit_file` for that."
                 ),
             )
+
+    # A mistyped path here doesn't error — it silently creates a stray file
+    # (e.g. `vyper/pyproject.toml` beside the real one) and the intended file
+    # is never touched. If the name exists elsewhere, that's almost certainly
+    # the target.
+    misplaced = _path_candidates(path, ctx.working_dir)
+    if misplaced:
+        return ToolResult(
+            False,
+            error=(
+                f"write_file refused — {path} does not exist, but "
+                f"{', '.join(misplaced)} does. You probably meant that file; "
+                f"use `edit_file` on it. If you really do want a new file at "
+                f"{path}, say so by creating its directory first."
+            ),
+        )
 
     os.makedirs(os.path.dirname(abs_path) or ".", exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(content)
 
+    # Record the creation so undo_edit can remove the new file (previously
+    # only edit_file was undoable, so an undo after write_file reverted the
+    # wrong file).
+    _push_undo(ctx, abs_path, None)
     _invalidate_read_cache(ctx, abs_path)
     encoded = content.encode("utf-8")
     return ToolResult(
@@ -314,17 +779,33 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
             ),
         )
  
-    abs_path, err = _safe_resolve(path, ctx.working_dir)
+    # An empty old_str matches between every character; with replace_all it
+    # would splice new_str throughout the file (corruption), and without it the
+    # replacement is meaningless. Reject it outright.
+    if old_str == "":
+        return ToolResult(
+            False,
+            error=(
+                "old_str must not be empty. To insert text, include an exact "
+                "anchor snippet from the file in old_str and put the anchor plus "
+                "your new text in new_str. To create a new file, use write_file."
+            ),
+        )
+
+    abs_path, err, _scratch = _resolve_writable(path, ctx.working_dir)
     if err:
         return ToolResult(False, error=err)
     if not os.path.isfile(abs_path):
-        return ToolResult(False, error=f"file not found: {path}")
+        # Unlike read_file, never auto-correct here: guessing wrong would
+        # silently edit a file the model didn't ask for.
+        return ToolResult(
+            False, error=_not_found_error(path, ctx.working_dir, abs_path))
 
     with open(abs_path, encoding="utf-8", errors="replace") as f:
         text = f.read()
 
     def _save_undo() -> None:
-        ctx.undo_stack.append((abs_path, text))
+        _push_undo(ctx, abs_path, text)
 
     count = text.count(old_str)
     if count == 0:
@@ -541,8 +1022,11 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                     )
                     break
 
-        # Stage 3: fuzzy match — find a contiguous block that closely matches old_str
-        if not hint and len(old_lines_list) >= 2:
+        # Stage 3: fuzzy match — find a contiguous block that closely matches
+        # old_str. Single-line old_str is included: it is the most common shape
+        # ("return 1") and excluding it sent the most frequent failure straight
+        # to the useless "read the file first" fallback.
+        if not hint and len(old_lines_list) >= 1:
             best_ratio = 0.0
             best_start = -1
             num_old = len(old_lines_list)
@@ -554,18 +1038,35 @@ async def _edit_file(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                 if ratio > best_ratio:
                     best_ratio = ratio
                     best_start = i
-            if best_ratio >= 0.85 and best_start >= 0:
+            if best_ratio >= _FUZZY_WEAK and best_start >= 0:
                 actual_lines = file_lines[best_start : best_start + num_old]
                 actual_block = "\n".join(actual_lines)
+                # Below the strong threshold this may well be the wrong block,
+                # so say so rather than implying a confident location. Even a
+                # tentative pointer beats "read the file first", which gives
+                # the model nowhere to go.
+                lead = (
+                    " A similar block was found"
+                    if best_ratio >= _FUZZY_STRONG
+                    else " The closest block found (may not be the right one)"
+                )
                 hint = (
-                    f" A similar block was found at lines {best_start + 1}-"
+                    f"{lead} at lines {best_start + 1}-"
                     f"{best_start + num_old} ({best_ratio:.0%} match):\n"
                     f"---\n{actual_block}\n---\n"
                     f"Re-call edit_file with the exact text above as old_str."
                 )
 
         if not hint:
-            hint = " Read the file first and copy the exact text."
+            # Last resort, and the one that used to be a dead end. "Read the
+            # file first" is advice the model has usually already taken:
+            # qiskit-terra-5662's only edit attempt came at turn 73, after
+            # five reads of that same file, and it never tried again. The
+            # graph knows every symbol's exact span, so name them with their
+            # line numbers instead of sending it back to guess.
+            hint = _symbol_hint(ctx, abs_path, old_str) or (
+                " Read the file first and copy the exact text."
+            )
 
         return ToolResult(
             False,
@@ -621,7 +1122,7 @@ async def _list_directory(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if err:
         return ToolResult(False, error=err)
     if not os.path.isdir(abs_path):
-        return ToolResult(False, error=f"not a directory: {path}")
+        return ToolResult(False, error=_not_a_dir_error(path, ctx.working_dir, abs_path))
 
     entries = []
     for name in sorted(os.listdir(abs_path)):
@@ -657,15 +1158,60 @@ async def _search_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
  
     cap = 50 if ctx.permission_mode == "bench" else SEARCH_CAP
     rg = shutil.which("rg")
-    if rg:
-        return await _rg_search(rg, pattern, abs_path, glob, cap=cap)
-    return await asyncio.to_thread(_python_search, pattern, abs_path, glob, cap=cap)
+
+    async def _run(pat: str, *, force_literal: bool = False) -> ToolResult:
+        if rg:
+            return await _rg_search(rg, pat, abs_path, glob, cap=cap,
+                                    force_literal=force_literal)
+        return await asyncio.to_thread(_python_search, pat, abs_path, glob,
+                                       cap=cap, force_literal=force_literal)
+
+    res = await _run(pattern)
+
+    # A pattern can be valid regex and still not mean what the model intended:
+    # `data[0]` is a character class, so searching for the literal text
+    # `data[0]` returns nothing and the model concludes the code isn't there.
+    # When a metacharacter-bearing pattern finds nothing, retry it literally.
+    if (
+        res.success
+        and not res.data.get("count")
+        and _HAS_REGEX_META.search(pattern)
+    ):
+        literal_res = await _run(pattern, force_literal=True)
+        if literal_res.success and literal_res.data.get("count"):
+            literal_res.data["note"] = (
+                f"No regex matches for '{pattern}', but it appears literally "
+                f"in the code — showing literal matches."
+            )
+            return literal_res
+    return res
  
  
+# Characters that make a pattern "look like" a regex. Used to decide
+# whether a zero-match search is worth retrying as a literal string.
+_HAS_REGEX_META = re.compile(r"[\\\[\]().*+?{}|^$]")
+
+
+def _is_regex(pattern: str) -> bool:
+    try:
+        re.compile(pattern)
+    except re.error:
+        return False
+    return True
+
+
 async def _rg_search(
     rg: str, pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_CAP,
+    force_literal: bool = False,
 ) -> ToolResult:
-    cmd = [rg, "-n", "--no-heading", "-S", pattern, abs_path]
+    # Models routinely pass a glob (`*.py`) or a raw code snippet where a
+    # regex is expected. Searching those literally is what they meant; failing
+    # is never useful.
+    literal = force_literal or not _is_regex(pattern)
+    cmd = [rg, "-n", "--no-heading", "-S"]
+    if literal:
+        cmd.append("-F")
+    cmd += [pattern, abs_path]
     if isinstance(glob, str):
         cmd.extend(["-g", glob])
     try:
@@ -676,31 +1222,57 @@ async def _rg_search(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=SEARCH_TIMEOUT)
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=SEARCH_TIMEOUT)
         except TimeoutError:
             proc.kill()
             await proc.wait()
             return ToolResult(False, error="ripgrep timed out")
     except FileNotFoundError as e:
         return ToolResult(False, error=str(e))
+
+    # rg exits 1 for "no matches" and >=2 for a real error. Ignoring the code
+    # reported a broken search as "0 matches", so the model concluded the
+    # symbol didn't exist and moved on.
+    if proc.returncode is not None and proc.returncode >= 2:
+        msg = stderr.decode("utf-8", errors="replace").strip().splitlines()
+        return ToolResult(
+            False,
+            error=f"search failed: {msg[0] if msg else 'ripgrep error'}",
+        )
  
     matches: list[dict[str, Any]] = []
     for line in stdout.decode("utf-8", errors="replace").splitlines()[:cap]:
         parts = line.split(":", 2)
         if len(parts) == 3:
             matches.append({"file": parts[0], "line": int(parts[1]), "text": parts[2]})
+    data: dict[str, Any] = {
+        "pattern": pattern, "matches": matches, "count": len(matches),
+    }
+    if literal:
+        data["note"] = (
+            f"'{pattern}' is not a valid regex; searched for it literally."
+        )
     return ToolResult(
         True,
-        data={"pattern": pattern, "matches": matches, "count": len(matches)},
-        display=f"{len(matches)} matches",
+        data=data,
+        display=f"{len(matches)} matches" + (" (literal)" if literal else ""),
     )
  
  
-def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_CAP) -> ToolResult:
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return ToolResult(False, error=f"invalid regex: {e}")
+def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_CAP,
+                   force_literal: bool = False) -> ToolResult:
+    # Same fallback as the ripgrep path: an unparseable pattern is treated as
+    # a literal string rather than rejected.
+    literal = force_literal
+    if force_literal:
+        rx = re.compile(re.escape(pattern))
+    else:
+        try:
+            rx = re.compile(pattern)
+        except re.error:
+            literal = True
+            rx = re.compile(re.escape(pattern))
     matches: list[dict[str, Any]] = []
     for root, dirs, files in os.walk(abs_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
@@ -722,23 +1294,42 @@ def _python_search(pattern: str, abs_path: str, glob: Any, *, cap: int = SEARCH_
         if len(matches) >= cap:
             break
  
+    data: dict[str, Any] = {
+        "pattern": pattern, "matches": matches, "count": len(matches),
+    }
+    if literal:
+        data["note"] = (
+            f"'{pattern}' is not a valid regex; searched for it literally."
+        )
     return ToolResult(
         True,
-        data={"pattern": pattern, "matches": matches, "count": len(matches)},
-        display=f"{len(matches)} matches",
+        data=data,
+        display=f"{len(matches)} matches" + (" (literal)" if literal else ""),
     )
- 
- 
+
+
 read_file = Tool(
     name="read_file",
-    description="Read a file from disk. Returns its content and line count. "
-                "Use offset/limit to page through large files.",
+    description=(
+        "Read a file and return its contents with a line count. "
+        "Repeating the identical read is refused — page through a large file "
+        "with offset/limit instead."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "Relative or absolute path"},
-            "offset": {"type": "integer", "description": "Line offset (0-based)", "default": 0},
-            "limit": {"type": "integer", "description": "Max lines to return"},
+            "path": {
+                "type": "string",
+                "description": "Path relative to the working directory, e.g. 'src/app.py'.",
+            },
+            "offset": {
+                "type": "integer", "default": 0,
+                "description": "First line to return, 0-based.",
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of lines to return. Omit to read to the end.",
+            },
         },
         "required": ["path"],
     },
@@ -747,12 +1338,21 @@ read_file = Tool(
  
 write_file = Tool(
     name="write_file",
-    description="Create a new file. Refuses if the file already exists — use edit_file for existing files.",
+    description=(
+        "Create a NEW file. Refused if the path already exists — use edit_file "
+        "to change an existing file."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string", "description": "Full file content"},
+            "path": {
+                "type": "string",
+                "description": "Path for the new file, relative to the working directory.",
+            },
+            "content": {
+                "type": "string",
+                "description": "Complete contents of the file.",
+            },
         },
         "required": ["path", "content"],
     },
@@ -761,15 +1361,33 @@ write_file = Tool(
  
 edit_file = Tool(
     name="edit_file",
-    description="Replace a unique substring in a file. Use for targeted changes in existing files. "
-                "Set replace_all=true to replace every occurrence.",
+    description=(
+        "Change an existing file by replacing an exact snippet of its text. "
+        "This is the way to modify code."
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string"},
-            "old_str": {"type": "string", "description": "Exact text to find (must be unique unless replace_all=true)"},
-            "new_str": {"type": "string", "description": "Replacement text"},
-            "replace_all": {"type": "boolean", "default": False},
+            "path": {
+                "type": "string",
+                "description": "Path relative to the working directory.",
+            },
+            "old_str": {
+                "type": "string",
+                "description": (
+                    "Text to replace, copied verbatim from the file including "
+                    "indentation. Must appear exactly once unless replace_all "
+                    "is true; add surrounding lines to make it unique."
+                ),
+            },
+            "new_str": {
+                "type": "string",
+                "description": "Text to put in its place. Use \"\" to delete.",
+            },
+            "replace_all": {
+                "type": "boolean", "default": False,
+                "description": "Replace every occurrence instead of requiring a unique match.",
+            },
         },
         "required": ["path", "old_str", "new_str"],
     },
@@ -782,7 +1400,10 @@ list_directory = Tool(
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "default": "."},
+            "path": {
+                "type": "string", "default": ".",
+                "description": "Directory to list, relative to the working directory.",
+            },
             "show_hidden": {
                 "type": "boolean",
                 "default": False,
@@ -800,7 +1421,10 @@ search_files = Tool(
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "Regex"},
-            "path": {"type": "string", "default": "."},
+            "path": {
+                "type": "string", "default": ".",
+                "description": "Directory or file to search under, relative to the working directory.",
+            },
             "glob": {"type": "string", "description": "Optional filename glob (e.g. '*.py')"},
         },
         "required": ["pattern"],
@@ -856,17 +1480,11 @@ async def _show_diff(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 show_diff = Tool(
     name="show_diff",
-    description=(
-        "Show git diff of your changes. Call after editing files to verify "
-        "your changes look correct. Pass a specific path or omit for all changes."
-    ),
+    description="Show git diff of your uncommitted changes. Pass a path or omit for all.",
     parameters={
         "type": "object",
         "properties": {
-            "path": {
-                "type": "string",
-                "description": "File path to diff (omit for all changes)",
-            },
+            "path": {"type": "string", "description": "File to diff (omit for all)"},
         },
     },
     run=_show_diff,
@@ -903,7 +1521,7 @@ async def _glob_files(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if err:
         return ToolResult(False, error=err)
     if not os.path.isdir(abs_path):
-        return ToolResult(False, error=f"not a directory: {path}")
+        return ToolResult(False, error=_not_a_dir_error(path, ctx.working_dir, abs_path))
 
     try:
         matches = await asyncio.to_thread(_glob_files_sync, abs_path, pattern)
@@ -947,6 +1565,20 @@ async def _undo_edit(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         return ToolResult(False, error="Nothing to undo. No edits have been made yet.")
     abs_path, original = ctx.undo_stack.pop()
     rel_path = os.path.relpath(abs_path, ctx.working_dir)
+    if original is None:
+        # The entry records a file created by write_file — undo removes it.
+        try:
+            os.remove(abs_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            return ToolResult(False, error=f"could not remove {rel_path}: {e}")
+        _invalidate_read_cache(ctx, abs_path)
+        return ToolResult(
+            True,
+            data={"path": rel_path, "removed": True},
+            display=f"removed {rel_path} (undo of write_file)",
+        )
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(original)
     _invalidate_read_cache(ctx, abs_path)
@@ -959,11 +1591,7 @@ async def _undo_edit(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 undo_edit = Tool(
     name="undo_edit",
-    description=(
-        "Revert the most recent edit_file change. Restores the file to its "
-        "content before the last successful edit. Can be called multiple times "
-        "to undo multiple edits (LIFO order)."
-    ),
+    description="Revert the most recent edit_file/write_file change (LIFO; repeatable).",
     parameters={"type": "object", "properties": {}},
     run=_undo_edit,
 )
