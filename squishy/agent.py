@@ -161,6 +161,14 @@ class Agent:
         msg = describe_staleness(self.config.working_dir)
         if msg:
             self.display.info(msg)
+        elif self.has_index and not has_graph(self.config.working_dir):
+            # An index built before graphs existed leaves the graph tools
+            # hidden and the user with no way to notice: `describe_staleness`
+            # reports the index as fresh, because it is. Say it once.
+            self.display.info(
+                "[graph] no code graph yet — `explore`, `impact_of` and "
+                "`repo_map` are hidden. Run /init to build one."
+            )
 
     async def run(
         self, user_message: str, *, timeout: float | None = None,
@@ -722,6 +730,8 @@ class Agent:
 
                 outcome = await run_tool(self, turn, tc)
                 dispatched += 1
+                # Snapshot before the next dispatch overwrites it.
+                pressure_tags = list(self.tool_ctx.last_pressure)
                 if (
                     tc.name == "run_command"
                     and outcome.get("success")
@@ -735,6 +745,9 @@ class Agent:
                     # Truncated: enough for a harness to bucket failures by
                     # cause without carrying whole tool outputs.
                     "error": str(outcome.get("error") or "")[:300],
+                    # Which edit-pressure notices this result carried, so a
+                    # harness can tell "warned and ignored" from "never fired".
+                    "pressure": list(pressure_tags),
                 })
                 track_tool_outcome(self, st, tc, outcome, turn=turn)
 

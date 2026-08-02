@@ -527,7 +527,7 @@ async def _interactive(cfg, client, display, prompt_fn, timeout, *, resume_id: s
                 "  /mode <edits|yolo>        — switch permission mode\n"
                 "  /status                   — show current config\n"
                 "  /clear, /new              — reset session stats and clear screen\n"
-                "  /init [--no-summaries]    — build/refresh repo index\n"
+                "  /init [--no-summaries]    — build/refresh repo index + code graph\n"
                 "  /mcp [list|reload|add|remove] — manage MCP servers\n"
                 "  /session                  — show current session UUID\n"
                 "  /sessions                 — list recent sessions\n"

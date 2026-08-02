@@ -54,6 +54,13 @@ class ToolContext:
     # Commands run since the last source edit. A run of them with nothing
     # edited is an investigation that is not converging.
     probe_commands: int = 0
+    # Which pressure notices have actually been attached, and how often. A
+    # brake you cannot see in the result file is a brake you cannot tell apart
+    # from one that never fired -- and "did it fire?" was unanswerable for a
+    # 100-turn run that produced no edit.
+    pressure_notices: dict[str, int] = field(default_factory=dict)
+    # Tags attached to the most recent tool result, for the per-call event.
+    last_pressure: list[str] = field(default_factory=list)
     extra_env: dict[str, str] = field(default_factory=dict)
     # (abs_path, original_content); original_content is None when the entry
     # records a newly-created file (undo deletes it).

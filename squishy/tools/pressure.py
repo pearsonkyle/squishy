@@ -86,25 +86,36 @@ def budget_notice(used: int, budget: int) -> str:
     return template.format(used=used, budget=budget, left=left)
 
 
-def pressure_note(ctx: ToolContext) -> str:
-    """The notices this call has earned, or "" for the common case."""
+def pressure_note(ctx: ToolContext) -> tuple[str, list[str]]:
+    """``(text, tags)`` — the notices this call earned, and their names.
+
+    The tags are what makes the brakes measurable: they ride out through the
+    tool event into the bench result, so "the model was warned and ignored it"
+    and "the warning never fired" stop looking identical from the outside.
+    """
     if ctx.source_edited:
-        return ""
+        return "", []
     parts: list[str] = []
+    tags: list[str] = []
     if ctx.probe_commands >= PROBE_LIMIT:
         parts.append(_PROBES.format(n=ctx.probe_commands))
+        tags.append("probes")
     budget = budget_notice(ctx.turns_used, ctx.turn_budget)
     if budget:
         parts.append(budget)
-    return "\n".join(parts)
+        tags.append("budget")
+    return "\n".join(parts), tags
 
 
 def apply(ctx: ToolContext, name: str, result: ToolResult) -> ToolResult:
     """Record the call's outcome and attach any pressure notice to it."""
     record_outcome(ctx, name, result)
-    note = pressure_note(ctx)
+    note, tags = pressure_note(ctx)
+    ctx.last_pressure = tags
     if not note:
         return result
+    for tag in tags:
+        ctx.pressure_notices[tag] = ctx.pressure_notices.get(tag, 0) + 1
     if result.success:
         # Under its own key: appending to an existing `note`/`warning` would
         # let a read-loop warning and a budget notice overwrite each other.

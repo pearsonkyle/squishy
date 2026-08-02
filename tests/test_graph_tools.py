@@ -104,3 +104,54 @@ def test_a_truncated_graph_reads_as_absent(sample_repo: Path) -> None:
     graph_path(sample_repo).write_text("{ not json", encoding="utf-8")
     assert not has_graph(sample_repo)
     assert load_graph(sample_repo) is None
+
+
+def test_an_index_without_a_graph_says_so_once(tmp_path) -> None:
+    """The silent-upgrade case: an index built before graphs existed.
+
+    `describe_staleness` correctly reports that index as fresh, so nothing
+    else would ever mention that `explore` is missing — the user just never
+    sees the feature and has no way to find out why.
+    """
+    import io
+
+    from conftest import FakeClient
+    from rich.console import Console
+
+    from squishy.agent import Agent
+    from squishy.config import Config
+    from squishy.display import Display
+    from squishy.index import build_index, save_index
+
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    save_index(tmp_path, build_index(str(tmp_path)))
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    d = Display()
+    d.console = Console(file=io.StringIO(), width=120, force_terminal=False)
+    Agent(cfg, FakeClient(script=[]), d)  # type: ignore[arg-type]
+    assert "no code graph yet" in d.console.file.getvalue()
+
+
+def test_a_repo_with_a_graph_stays_quiet(tmp_path) -> None:
+    import io
+
+    from conftest import FakeClient
+    from rich.console import Console
+
+    from squishy.agent import Agent
+    from squishy.config import Config
+    from squishy.display import Display
+    from squishy.index import build_index, save_index
+
+    (tmp_path / "m.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+    save_index(tmp_path, build_index(str(tmp_path)))
+    build_repo_graph(tmp_path)
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    d = Display()
+    d.console = Console(file=io.StringIO(), width=120, force_terminal=False)
+    Agent(cfg, FakeClient(script=[]), d)  # type: ignore[arg-type]
+    assert "no code graph yet" not in d.console.file.getvalue()

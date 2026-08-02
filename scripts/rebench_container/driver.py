@@ -92,6 +92,10 @@ class Metrics:
         self.tool_failures = 0
         self.failure_reasons: dict[str, int] = {}
         self.commands: list[str] = []
+        # How many tool results carried each edit-pressure notice. A run that
+        # ends with no patch reads very differently depending on whether the
+        # brakes fired 50 times and were ignored or never fired at all.
+        self.pressure: dict[str, int] = {}
         # (turn, tool) so we can see *when* a tool ran, not just how often.
         self.trace: list[str] = []
         self._turn = 0
@@ -125,6 +129,8 @@ class Metrics:
                 self.tool_failures += 1
                 key = f"{name}: {_bucket(ev.get('error') or '')}"
                 self.failure_reasons[key] = self.failure_reasons.get(key, 0) + 1
+            for tag in ev.get("pressure") or ():
+                self.pressure[tag] = self.pressure.get(tag, 0) + 1
             self.trace.append(f"{self._turn}:{name}" + ("" if ok else "!"))
             # The *arguments* are the trajectory. A trace of 76 identical
             # "run_command" entries — or 40 "read_file" entries — says nothing
@@ -147,6 +153,7 @@ class Metrics:
             "tool_counts": self.tool_counts,
             "tool_failures": self.tool_failures,
             "failure_reasons": self.failure_reasons,
+            "pressure": self.pressure,
             "trace": self.trace,
             "commands": self.commands[-120:],
         }

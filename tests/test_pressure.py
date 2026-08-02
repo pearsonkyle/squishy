@@ -41,7 +41,7 @@ def test_probes_fire_after_a_run_of_commands_with_no_edit(tmp_path) -> None:
     ctx = _ctx(tmp_path)
     for _ in range(pressure.PROBE_LIMIT):
         pressure.record_outcome(ctx, "run_command", ToolResult(True))
-    assert "[probes]" in pressure.pressure_note(ctx)
+    assert "[probes]" in pressure.pressure_note(ctx)[0]
 
 
 def test_an_edit_resets_the_probe_counter(tmp_path) -> None:
@@ -52,7 +52,7 @@ def test_an_edit_resets_the_probe_counter(tmp_path) -> None:
         pressure.record_outcome(ctx, "run_command", ToolResult(True))
     pressure.record_outcome(ctx, "edit_file", ToolResult(True, data={"path": "a.py"}))
     assert ctx.probe_commands == 0
-    assert pressure.pressure_note(ctx) == ""
+    assert pressure.pressure_note(ctx)[0] == ""
 
 
 def test_a_scratch_write_does_not_count_as_the_edit(tmp_path) -> None:
@@ -65,7 +65,7 @@ def test_a_scratch_write_does_not_count_as_the_edit(tmp_path) -> None:
         ctx, "write_file", ToolResult(True, data={"path": "/tmp/r.py", "scratch": True})
     )
     assert not ctx.source_edited
-    assert "[budget]" in pressure.pressure_note(ctx)
+    assert "[budget]" in pressure.pressure_note(ctx)[0]
 
 
 def test_a_failed_edit_does_not_count_as_the_edit(tmp_path) -> None:
@@ -103,3 +103,38 @@ async def test_pressure_never_overwrites_an_existing_note(tmp_path) -> None:
     assert res.success
     assert "[budget]" in res.data["pressure"]
     assert "already read this file" in res.data["note"]
+
+
+async def test_the_notice_is_reported_on_the_tool_event(tmp_path) -> None:
+    """A brake you cannot see in the result file cannot be evaluated.
+
+    cfn-lint-3965 ran 100 turns and produced no edit. "The model was warned
+    fifty times and ignored it" and "the warning never fired" are opposite
+    diagnoses and looked identical from the outside, because nothing carried
+    the tags out of the loop.
+    """
+    from conftest import FakeClient
+
+    from squishy.agent import Agent
+    from squishy.client import CompletionResult, ToolCall
+    from squishy.config import Config
+
+    cfg = Config()
+    cfg.working_dir = str(tmp_path)
+    cfg.permission_mode = "bench"
+    cfg.tool_profile = "shell"
+    cfg.max_turns = 12
+    cfg.use_sandbox = False
+    events: list[dict] = []
+    script = [
+        CompletionResult(tool_calls=[ToolCall(id=f"c{i}", name="run_command",
+                                              args={"command": f"ls {i}"})])
+        for i in range(12)
+    ]
+    agent = Agent(cfg, FakeClient(script=script), display=None,  # type: ignore[arg-type]
+                  on_event=events.append)
+    await agent.run("fix it")
+
+    tags = {t for e in events if e.get("type") == "tool" for t in e.get("pressure", [])}
+    assert "probes" in tags
+    assert "budget" in tags

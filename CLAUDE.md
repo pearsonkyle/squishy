@@ -154,6 +154,20 @@ carries it and no tool has to remember to:
   could see it. Resets on every source edit, because re-running a reproduction
   *after* an edit is the correct move.
 
+**A scratch write is not a source edit, through any path.** `write_file` knows
+this from its `scratch` flag; the shell needs `agent_state.writes_only_scratch`,
+because the shell is how a model writes a heredoc. Getting this wrong is
+expensive and silent: `cat > /tmp/repro.py <<EOF` on turn 10 set `shell_writes`,
+which set `source_edited`, which suppressed every notice for the next ninety
+turns. Twelve container arms hit the 100-turn cap and not one ever called
+`edit_file`. Fixing it took cfn-lint-3965 from 0/2 to 2/2 patched. The harness
+*asks* for that scratch script -- rewarding the instructed action by disarming
+its own safety net is the instruct-then-block pattern inverted.
+
+The tool event carries a `pressure` list of the tags attached, and the bench
+driver totals them. Without it, "warned fifty times and ignored" and "never
+fired" are the same observation from outside.
+
 This replaced a `[system]` user message injected every sixth turn (and the
 `max_turns_without_edit` knob that drove it). Same content, but paired with
 the call that earned it -- the rule the whole loop is built on.
@@ -197,7 +211,11 @@ anyway, so the follow-up was always going to happen.
   the only thing available when Docker Hub is down. `scripts/parity/README.md`
   records the measurement that retired the OpenAI-Agents-SDK reference agent
   (`graphagent/`) — squishy resolved 9/9 against its 9/9 and 8/9, with fewer
-  tool calls than its filesystem baseline and 5-15% more tokens.
+  tool calls than its filesystem baseline and 5-15% more tokens. It also
+  records where the container run disagreed: on real instances `minimal`
+  patches 6/7 and `graph` 3/7, because given `explore` this model explores
+  rather than edits. The graph's value on real repositories is currently
+  unproven and possibly negative.
 - `--seeds N` repeats every arm. At one seed a difference between two arms is
   indistinguishable from the same arm run twice.
 - Read the `commands` field of each result record: the arguments are the

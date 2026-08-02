@@ -97,3 +97,37 @@ async def test_a_run_that_writes_is_left_alone(tmp_path):
         + [f"git diff {i}" for i in range(10)])
     assert agent._active_st.shell_writes >= 1
     assert not _pressure(result), "the model already edited; nagging it is noise"
+
+
+@pytest.mark.parametrize("cmd", [
+    # Every shape the model actually produced across three instances.
+    "cat > /tmp/repro.py <<'EOF'\nprint(1)\nEOF",
+    "python - <<'EOF'\nopen('/tmp/probe.py','w').write('x')\nEOF",
+    "cd /repo && cat > /tmp/t.yaml <<'EOF'\nx: 1\nEOF",
+    # qiskit-terra-5662 wrote scratch files this way eleven times: the target
+    # is relative, so only the `cd` says it is scratch.
+    "cd /tmp && cat > test_bug.py <<'EOF'\nprint(1)\nEOF",
+    "cd /tmp && cat > debug2.py <<'EOF'\nprint(1)\nEOF",
+    # Not a file write at all, and the most ordinary command there is.
+    "pytest -q > /dev/null",
+    "python -c 'import x' >/dev/null 2>&1",
+])
+def test_a_scratch_write_is_not_a_source_edit(cmd):
+    """The harness asks for /tmp repro scripts. Rewarding that by switching
+    off edit pressure is how twelve container arms ran to a 100-turn cap
+    without one of them ever calling edit_file.
+
+    cfn-lint-3965 turn 10 was `cat > /tmp/repro.py <<EOF`. From that call on,
+    `shell_writes` was non-zero, `source_edited` was True, and every [budget]
+    and [probes] notice was suppressed for the remaining ninety turns.
+    """
+    assert not looks_like_file_write(cmd)
+
+
+async def test_pressure_survives_a_scratch_repro_script(tmp_path):
+    """End to end: the instructed action must not disarm the harness."""
+    commands = ["cat > /tmp/sq_repro.py <<'EOF'\nprint(1)\nEOF"] + [
+        f"grep -rn thing{i} src/" for i in range(12)
+    ]
+    _agent, result = await _run(tmp_path, commands)
+    assert _pressure(result), "a /tmp script must not switch the brakes off"

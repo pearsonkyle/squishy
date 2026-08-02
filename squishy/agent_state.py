@@ -322,12 +322,71 @@ _WRITE_CMD_RE = re.compile(
 )
 
 
+# A path that is not a change to the repository: a scratch directory, or a
+# device sink. `> /dev/null` is the one that cost the most -- it appears in
+# perfectly ordinary commands (`pytest -q > /dev/null`) and counted as a
+# source edit, which silently disarmed every brake for the rest of the run.
+_SCRATCH_PATH_RE = re.compile(
+    r"(?:/tmp/|/var/folders/|\$TMPDIR/|/private/tmp/|/dev/)"
+)
+# `cd /tmp && cat > repro.py` — the target is relative, so the path alone says
+# nothing. This is how the model actually writes scratch files: eleven of
+# qiskit-terra-5662's commands took this form and every one was scored as a
+# repo edit.
+_CD_SCRATCH_RE = re.compile(
+    r"^\s*cd\s+(?:/tmp|/var/folders/\S*|/private/tmp|\$TMPDIR)\S*\s*(?:&&|;)"
+)
+# Any path that is clearly NOT scratch: a bare or relative path token used as a
+# redirect / in-place target.
+_WRITE_TARGET_RE = re.compile(
+    r"(?:(?<![0-9])>>?\s*|\bsed\b[^|;&]*-i\s*(?:''|\S*)\s+|\btee\s+(?:-a\s+)?)"
+    r"([\w./~$-]+)"
+    # `python - <<EOF ... open("/tmp/x", "w")` is how this model writes a
+    # scratch file when it wants Python rather than a heredoc.
+    r"|(?:open|write_text)\s*\(\s*['\"]([^'\"]+)['\"]"
+)
+
+
+def writes_only_scratch(command: str) -> bool:
+    """True when every file this command writes lives in a scratch directory.
+
+    This is the difference between "the model fixed the bug" and "the model
+    wrote a reproduction script", and the harness *asks* for the second one.
+    Observed on cfn-lint-3965 and qiskit-terra-5662: turn 10 runs
+    `cat > /tmp/repro.py <<EOF`, that counts as a source edit, and every edit
+    brake switches off for the remaining ninety turns. Twelve arms ran to the
+    turn cap and not one of them ever called `edit_file`.
+
+    `write_file` already had this guard via its `scratch` flag; the shell path
+    did not, and the shell is how a model writes a heredoc.
+    """
+    command = command or ""
+    targets = [
+        g for match in _WRITE_TARGET_RE.findall(command)
+        for g in (match if isinstance(match, tuple) else (match,)) if g
+    ]
+    if not targets:
+        return False
+    # Inside a `cd <scratch> &&`, a relative target is a scratch target.
+    in_scratch_cwd = bool(_CD_SCRATCH_RE.match(command))
+    return all(
+        _SCRATCH_PATH_RE.search(t)
+        or (in_scratch_cwd and not t.startswith("/"))
+        for t in targets
+    )
+
+
 def looks_like_file_write(command: str) -> bool:
-    """True if *command* plausibly modified a file on disk.
+    """True if *command* plausibly modified a file **in the repo**.
 
     Used only to decide whether the agent still needs prodding toward making
-    an edit; it never gates or blocks anything, so over-matching is cheap.
+    an edit; it never gates or blocks anything, so over-matching is cheap --
+    with one exception. Scratch writes must not match: they are the instructed
+    behavior, and counting them silently disables the pressure that exists to
+    push toward a real edit.
     """
     if not isinstance(command, str) or not command.strip():
         return False
-    return bool(_WRITE_CMD_RE.search(command))
+    if not _WRITE_CMD_RE.search(command):
+        return False
+    return not writes_only_scratch(command)

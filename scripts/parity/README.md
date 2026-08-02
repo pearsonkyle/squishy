@@ -57,11 +57,27 @@ forbidden from doing it in the same request is this codebase's recurring
 failure mode. Removing the contradiction took the arm to 21.9k with no other
 change. `tests/test_scratch_and_outline.py` holds it shut.
 
-## Caveat
+## Caveat, and what the container run said afterwards
 
-These are injected bugs in a synthetic package, not SWE-rebench instances. The
-container harness (`scripts/rebench_container/run_bench.py`) is still the real
-evaluation; it was unavailable when this ran because Docker Hub was
-unreachable and the local image cache was being reclaimed. Read this as
-"squishy's loop is not leaving anything on the table relative to the SDK",
-not as a capability score.
+These are injected bugs in a synthetic package. The container harness
+(`scripts/rebench_container/run_bench.py`) is the real evaluation, and once
+the registry came back it disagreed in one important way.
+
+On cfn-lint-3965, qiskit-terra-5662 and cliquet-203 (all gold-validated 3/3),
+100-turn cap, no empty-patch retry:
+
+| | patched | brakes fired |
+|---|---|---|
+| before the scratch-write fix | 3/12 | never — 0 `edit_file` calls in 12 runs |
+| after | 4/6 | every run |
+
+And the arm comparison inverts. Across every post-fix container run,
+`minimal` patched **6/7** and `graph` patched **3/7** — and the graph arm's
+own brake counts say why: it runs 74-85 probe notices and 43-50 budget notices
+before editing, against `minimal`'s 24-36 and 3-6. Given `explore`, this model
+explores. On a synthetic three-file package that costs nothing; on a real
+repository it spends the budget.
+
+So: the loop is fine, and the graph's value on real instances is currently
+*negative*. Treat the table above as "squishy's loop is not leaving anything
+on the table relative to the SDK" — not as evidence for the graph.
