@@ -69,7 +69,18 @@ On cfn-lint-3965, qiskit-terra-5662 and cliquet-203 (all gold-validated 3/3),
 | | patched | brakes fired |
 |---|---|---|
 | before the scratch-write fix | 3/12 | never — 0 `edit_file` calls in 12 runs |
-| after | 4/6 | every run |
+| after, `--empty-patch-retries 0` | 4/6 | every run |
+| after, shipped default (`--empty-patch-retries 1`) | **6/6** | every run |
+
+The 4/6 row deliberately disables the harness's own retry, to measure the loop
+alone. The 6/6 row is the configuration squishy actually ships: one retry, the
+default. Both matter — the first says the loop no longer suppresses its own
+brakes, the second is the number to quote.
+
+Resolve rate on that same 6/6 run was 0/6, and 0-2/12 across every sweep here.
+Patch rate is harness health; resolve rate is capability, and on these three
+instances with this model it is low and noisy. Do not let one stand in for
+the other.
 
 And the arm comparison inverts. Across every post-fix container run,
 `minimal` patched **6/7** and `graph` patched **3/7** — and the graph arm's

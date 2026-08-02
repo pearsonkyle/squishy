@@ -247,6 +247,14 @@ anyway, so the follow-up was always going to happen.
   unproven and possibly negative.
 - `--seeds N` repeats every arm. At one seed a difference between two arms is
   indistinguishable from the same arm run twice.
+- **Patch rate is harness health; resolve rate is capability.** Drive the
+  first to 100% and report the second separately. On the three gold-validated
+  instances with the shipped defaults the patch rate is 6/6; resolve rate on
+  the same runs was 0/6. A good patch rate must never stand in for
+  correctness.
+- `--empty-patch-retries 0` measures the loop alone; the shipped default is 1.
+  Quote the default, but debug with 0 — the retry hides loop bugs by brute
+  force, which is how a run with zero `edit_file` calls still looked healthy.
 - Read the `commands` field of each result record: the arguments are the
   trajectory. Forty `read_file` entries say nothing; which file and which
   range say all of it.
